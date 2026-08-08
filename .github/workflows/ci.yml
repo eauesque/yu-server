@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+
+      # This gate exists to catch a broken mirror: the two files under config/
+      # and extensions/ are read by include_str! from crates/yu-server, and
+      # Cargo's dependency graph cannot see them. If a sync ever drops them,
+      # this job is what notices.
+      - name: cargo check
+        working-directory: crates
+        run: cargo check --workspace --all-targets
+
+      - name: cargo fmt
+        working-directory: crates
+        run: cargo fmt --all --check
+
+      # Deliberately not gated on clippy: `--all-targets -- -D warnings`
+      # currently reports 4 lints in meta-extract, inherited from upstream.
+      # A gate that is red on arrival is ignored, and an ignored gate is worse
+      # than none. Run it for visibility only.
+      - name: cargo clippy (informational)
+        working-directory: crates
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets

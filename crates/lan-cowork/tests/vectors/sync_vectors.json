@@ -1,0 +1,154 @@
+{
+  "diff_cases": [
+    {
+      "label": "remote_only_fetch",
+      "local": {},
+      "remote": {
+        "remote.txt": {
+          "hash": "a",
+          "mtime": 1.0,
+          "size": 1
+        }
+      },
+      "fetch": [
+        "remote.txt"
+      ],
+      "push": []
+    },
+    {
+      "label": "local_only_push",
+      "local": {
+        "local.txt": {
+          "hash": "a",
+          "mtime": 1.0,
+          "size": 1
+        }
+      },
+      "remote": {},
+      "fetch": [],
+      "push": [
+        "local.txt"
+      ]
+    },
+    {
+      "label": "same_hash_no_action",
+      "local": {
+        "same.txt": {
+          "hash": "a",
+          "mtime": 1.0,
+          "size": 1
+        }
+      },
+      "remote": {
+        "same.txt": {
+          "hash": "a",
+          "mtime": 2.0,
+          "size": 2
+        }
+      },
+      "fetch": [],
+      "push": []
+    },
+    {
+      "label": "newer_remote_fetch",
+      "local": {
+        "changed.txt": {
+          "hash": "a",
+          "mtime": 1.0,
+          "size": 1
+        }
+      },
+      "remote": {
+        "changed.txt": {
+          "hash": "b",
+          "mtime": 2.0,
+          "size": 1
+        }
+      },
+      "fetch": [
+        "changed.txt"
+      ],
+      "push": []
+    },
+    {
+      "label": "equal_mtime_push",
+      "local": {
+        "changed.txt": {
+          "hash": "a",
+          "mtime": 2.0,
+          "size": 1
+        }
+      },
+      "remote": {
+        "changed.txt": {
+          "hash": "b",
+          "mtime": 2.0,
+          "size": 1
+        }
+      },
+      "fetch": [],
+      "push": [
+        "changed.txt"
+      ]
+    }
+  ],
+  "backup_names": [
+    {
+      "source": "a.txt",
+      "backup": "a.txt.bak"
+    },
+    {
+      "source": "a",
+      "backup": "a.bak"
+    },
+    {
+      "source": "a.tar.gz",
+      "backup": "a.tar.gz.bak"
+    },
+    {
+      "source": ".bashrc",
+      "backup": ".bashrc.bak"
+    },
+    {
+      "source": "a.",
+      "backup": "a..bak"
+    }
+  ],
+  "path_cases": [
+    {
+      "label": "normal",
+      "path": "nested/file.txt",
+      "valid": true
+    },
+    {
+      "label": "deep_missing",
+      "path": "missing/deep/file.txt",
+      "valid": true
+    },
+    {
+      "label": "converges_inside_root",
+      "path": "nonexistent/../ok.txt",
+      "valid": true
+    },
+    {
+      "label": "parent_escape",
+      "path": "../outside.txt",
+      "valid": false
+    },
+    {
+      "label": "multiple_parent_escape",
+      "path": "a/../../..",
+      "valid": false
+    },
+    {
+      "label": "absolute",
+      "path": "/tmp/outside.txt",
+      "valid": false
+    },
+    {
+      "label": "nul",
+      "path": "bad\u0000path",
+      "valid": false
+    }
+  ]
+}

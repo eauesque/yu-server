@@ -1,0 +1,388 @@
+{
+  "peers_ddl": "CREATE TABLE peers (peer_id TEXT PRIMARY KEY, name TEXT, api_host TEXT, api_port INTEGER,token TEXT, token_expires_at INTEGER, token_issued_at INTEGER,pubkey BLOB, x25519_pk BLOB,created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,last_reached_at INTEGER, last_attempted_at INTEGER)",
+  "cases": [
+    {
+      "label": "insert_new",
+      "op": "upsert",
+      "now": 1700000000,
+      "initial_rows": [],
+      "input": {
+        "peer_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "name": "node",
+        "api_host": "10.0.0.2",
+        "api_port": 8188,
+        "token": null,
+        "token_expires_at": null,
+        "token_issued_at": null,
+        "pubkey": "0101010101010101010101010101010101010101010101010101010101010101",
+        "x25519_pk": "0202020202020202020202020202020202020202020202020202020202020202"
+      },
+      "expected_rows": [
+        {
+          "peer_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "name": "node",
+          "api_host": "10.0.0.2",
+          "api_port": 8188,
+          "token": null,
+          "token_expires_at": null,
+          "token_issued_at": null,
+          "pubkey": "0101010101010101010101010101010101010101010101010101010101010101",
+          "x25519_pk": "0202020202020202020202020202020202020202020202020202020202020202",
+          "created_at": 1700000000,
+          "updated_at": 1700000000,
+          "last_reached_at": null,
+          "last_attempted_at": null
+        }
+      ]
+    },
+    {
+      "label": "token_only_update_preserves_keys",
+      "op": "upsert",
+      "now": 1700000000,
+      "initial_rows": [
+        {
+          "peer_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "name": "node",
+          "api_host": "10.0.0.2",
+          "api_port": 8188,
+          "token": null,
+          "token_expires_at": null,
+          "token_issued_at": null,
+          "pubkey": "0101010101010101010101010101010101010101010101010101010101010101",
+          "x25519_pk": "0202020202020202020202020202020202020202020202020202020202020202",
+          "created_at": 1,
+          "updated_at": 1,
+          "last_reached_at": null,
+          "last_attempted_at": null
+        }
+      ],
+      "input": {
+        "peer_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "name": "node",
+        "api_host": "10.0.0.2",
+        "api_port": 8188,
+        "token": "tok",
+        "token_expires_at": null,
+        "token_issued_at": null,
+        "pubkey": null,
+        "x25519_pk": null
+      },
+      "expected_rows": [
+        {
+          "peer_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "name": "node",
+          "api_host": "10.0.0.2",
+          "api_port": 8188,
+          "token": "tok",
+          "token_expires_at": null,
+          "token_issued_at": null,
+          "pubkey": "0101010101010101010101010101010101010101010101010101010101010101",
+          "x25519_pk": "0202020202020202020202020202020202020202020202020202020202020202",
+          "created_at": 1,
+          "updated_at": 1700000000,
+          "last_reached_at": null,
+          "last_attempted_at": null
+        }
+      ]
+    },
+    {
+      "label": "update_overwrites_present_keys",
+      "op": "upsert",
+      "now": 1700000000,
+      "initial_rows": [
+        {
+          "peer_id": "cccccccccccccccccccccccccccccccc",
+          "name": "node",
+          "api_host": "10.0.0.2",
+          "api_port": 8188,
+          "token": null,
+          "token_expires_at": null,
+          "token_issued_at": null,
+          "pubkey": "0101010101010101010101010101010101010101010101010101010101010101",
+          "x25519_pk": "0202020202020202020202020202020202020202020202020202020202020202",
+          "created_at": 5,
+          "updated_at": 5,
+          "last_reached_at": null,
+          "last_attempted_at": null
+        }
+      ],
+      "input": {
+        "peer_id": "cccccccccccccccccccccccccccccccc",
+        "name": "node",
+        "api_host": "10.0.0.2",
+        "api_port": 8188,
+        "token": null,
+        "token_expires_at": null,
+        "token_issued_at": null,
+        "pubkey": "0303030303030303030303030303030303030303030303030303030303030303",
+        "x25519_pk": "0404040404040404040404040404040404040404040404040404040404040404"
+      },
+      "expected_rows": [
+        {
+          "peer_id": "cccccccccccccccccccccccccccccccc",
+          "name": "node",
+          "api_host": "10.0.0.2",
+          "api_port": 8188,
+          "token": null,
+          "token_expires_at": null,
+          "token_issued_at": null,
+          "pubkey": "0303030303030303030303030303030303030303030303030303030303030303",
+          "x25519_pk": "0404040404040404040404040404040404040404040404040404040404040404",
+          "created_at": 5,
+          "updated_at": 1700000000,
+          "last_reached_at": null,
+          "last_attempted_at": null
+        }
+      ]
+    },
+    {
+      "label": "hydrate_prune_self",
+      "op": "load_all",
+      "hard_cutoff": 1000000000,
+      "soft_cutoff": 1699996400,
+      "now": 1700000000,
+      "local_peer_id": "ffffffffffffffffffffffffffffffff",
+      "initial_rows": [
+        {
+          "peer_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "name": "node",
+          "api_host": "10.0.0.2",
+          "api_port": 8188,
+          "token": null,
+          "token_expires_at": null,
+          "token_issued_at": null,
+          "pubkey": "0101010101010101010101010101010101010101010101010101010101010101",
+          "x25519_pk": null,
+          "last_reached_at": 1699999990,
+          "created_at": 1699999990,
+          "updated_at": 1699999990,
+          "last_attempted_at": null
+        },
+        {
+          "peer_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "name": "node",
+          "api_host": "10.0.0.2",
+          "api_port": 8188,
+          "token": null,
+          "token_expires_at": null,
+          "token_issued_at": null,
+          "pubkey": null,
+          "x25519_pk": null,
+          "last_reached_at": 1,
+          "created_at": 1,
+          "updated_at": 1,
+          "last_attempted_at": null
+        },
+        {
+          "peer_id": "cccccccccccccccccccccccccccccccc",
+          "name": "node",
+          "api_host": "10.0.0.2",
+          "api_port": 8188,
+          "token": null,
+          "token_expires_at": null,
+          "token_issued_at": null,
+          "pubkey": null,
+          "x25519_pk": null,
+          "created_at": 1,
+          "updated_at": 1,
+          "last_reached_at": null,
+          "last_attempted_at": null
+        },
+        {
+          "peer_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "name": "node",
+          "api_host": "10.0.0.2",
+          "api_port": 8188,
+          "token": null,
+          "token_expires_at": null,
+          "token_issued_at": null,
+          "pubkey": null,
+          "x25519_pk": null,
+          "created_at": 1699990000,
+          "updated_at": 1699990000,
+          "last_reached_at": null,
+          "last_attempted_at": null
+        },
+        {
+          "peer_id": "dddddddddddddddddddddddddddddddd",
+          "name": "node",
+          "api_host": "10.0.0.2",
+          "api_port": 8188,
+          "token": "t",
+          "token_expires_at": null,
+          "token_issued_at": null,
+          "pubkey": null,
+          "x25519_pk": null,
+          "last_reached_at": null,
+          "created_at": 1699999900,
+          "updated_at": 1699999900,
+          "last_attempted_at": null
+        },
+        {
+          "peer_id": "ffffffffffffffffffffffffffffffff",
+          "name": "node",
+          "api_host": "10.0.0.2",
+          "api_port": 8188,
+          "token": null,
+          "token_expires_at": null,
+          "token_issued_at": null,
+          "pubkey": null,
+          "x25519_pk": null,
+          "last_reached_at": 1699999990,
+          "created_at": 1699999990,
+          "updated_at": 1699999990,
+          "last_attempted_at": null
+        }
+      ],
+      "expected_rows": [
+        {
+          "peer_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "name": "node",
+          "api_host": "10.0.0.2",
+          "api_port": 8188,
+          "token": null,
+          "token_expires_at": null,
+          "token_issued_at": null,
+          "pubkey": "0101010101010101010101010101010101010101010101010101010101010101",
+          "x25519_pk": null,
+          "created_at": 1699999990,
+          "updated_at": 1699999990,
+          "last_reached_at": 1699999990,
+          "last_attempted_at": null
+        },
+        {
+          "peer_id": "dddddddddddddddddddddddddddddddd",
+          "name": "node",
+          "api_host": "10.0.0.2",
+          "api_port": 8188,
+          "token": "t",
+          "token_expires_at": null,
+          "token_issued_at": null,
+          "pubkey": null,
+          "x25519_pk": null,
+          "created_at": 1699999900,
+          "updated_at": 1699999900,
+          "last_reached_at": null,
+          "last_attempted_at": null
+        }
+      ],
+      "expected_memory": [
+        {
+          "peer_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "online",
+          "has_pubkey": true
+        },
+        {
+          "peer_id": "dddddddddddddddddddddddddddddddd",
+          "status": "online",
+          "has_pubkey": false
+        }
+      ]
+    },
+    {
+      "label": "remove_existing",
+      "op": "remove",
+      "target": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "initial_rows": [
+        {
+          "peer_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "name": "node",
+          "api_host": "10.0.0.2",
+          "api_port": 8188,
+          "token": null,
+          "token_expires_at": null,
+          "token_issued_at": null,
+          "pubkey": "0101010101010101010101010101010101010101010101010101010101010101",
+          "x25519_pk": null,
+          "created_at": 1,
+          "updated_at": 1,
+          "last_reached_at": null,
+          "last_attempted_at": null
+        }
+      ],
+      "expected_rows": []
+    },
+    {
+      "label": "telemetry_reached",
+      "op": "telemetry",
+      "target": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "reached": 1700000500,
+      "attempted": null,
+      "initial_rows": [
+        {
+          "peer_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "name": "node",
+          "api_host": "10.0.0.2",
+          "api_port": 8188,
+          "token": null,
+          "token_expires_at": null,
+          "token_issued_at": null,
+          "pubkey": null,
+          "x25519_pk": null,
+          "created_at": 1,
+          "updated_at": 1,
+          "last_reached_at": null,
+          "last_attempted_at": null
+        }
+      ],
+      "expected_rows": [
+        {
+          "peer_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "name": "node",
+          "api_host": "10.0.0.2",
+          "api_port": 8188,
+          "token": null,
+          "token_expires_at": null,
+          "token_issued_at": null,
+          "pubkey": null,
+          "x25519_pk": null,
+          "created_at": 1,
+          "updated_at": 1700000500,
+          "last_reached_at": 1700000500,
+          "last_attempted_at": 1700000500
+        }
+      ]
+    },
+    {
+      "label": "telemetry_attempted_only",
+      "op": "telemetry",
+      "target": "cccccccccccccccccccccccccccccccc",
+      "reached": null,
+      "attempted": 1700000600,
+      "initial_rows": [
+        {
+          "peer_id": "cccccccccccccccccccccccccccccccc",
+          "name": "node",
+          "api_host": "10.0.0.2",
+          "api_port": 8188,
+          "token": null,
+          "token_expires_at": null,
+          "token_issued_at": null,
+          "pubkey": null,
+          "x25519_pk": null,
+          "created_at": 1,
+          "updated_at": 1,
+          "last_reached_at": null,
+          "last_attempted_at": null
+        }
+      ],
+      "expected_rows": [
+        {
+          "peer_id": "cccccccccccccccccccccccccccccccc",
+          "name": "node",
+          "api_host": "10.0.0.2",
+          "api_port": 8188,
+          "token": null,
+          "token_expires_at": null,
+          "token_issued_at": null,
+          "pubkey": null,
+          "x25519_pk": null,
+          "created_at": 1,
+          "updated_at": 1700000600,
+          "last_reached_at": null,
+          "last_attempted_at": 1700000600
+        }
+      ]
+    }
+  ]
+}

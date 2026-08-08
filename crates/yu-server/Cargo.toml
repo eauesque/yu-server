@@ -1,0 +1,83 @@
+[package]
+name    = "yu-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "yu-server"
+path = "src/main.rs"
+
+[dependencies]
+lan-cowork         = { path = "../lan-cowork" }
+axum               = { workspace = true }
+tower              = { workspace = true }
+sqlx               = { workspace = true }
+tokio              = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+serde_yml          = { workspace = true }
+reqwest            = { workspace = true }
+url                = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror          = { workspace = true }
+clap               = { workspace = true }
+sha2               = { workspace = true }
+hmac               = { workspace = true }
+pbkdf2             = { workspace = true }
+scrypt             = { workspace = true }
+rand               = { workspace = true }
+tower-sessions     = { workspace = true }
+hex                = { workspace = true }
+openssl            = { workspace = true }
+base64             = { workspace = true }
+indexmap           = { workspace = true }
+urlencoding        = { workspace = true }
+tower-http         = { workspace = true }
+minijinja          = { workspace = true }
+bytes              = "1"
+chrono             = { workspace = true }
+uuid               = { version = "1", features = ["v4"] }
+futures-util       = { workspace = true }
+auth-core          = { path = "../auth-core" }
+tagdb-core         = { path = "../tagdb-core" }
+infer-core         = { workspace = true }
+scan-core          = { path = "../scan-core" }
+meta-extract       = { path = "../meta-extract" }
+xmp-core           = { path = "../xmp-core" }
+regex              = { workspace = true } # sd_nai conversion + prompt_syntax analyze patterns
+tempfile           = { workspace = true }
+tokio-util         = { version = "0.7", features = ["io"] }
+zip                = { version = "2", default-features = false, features = ["deflate"] } # /api/download/batch-zip (MIT OR Apache-2.0)
+zstd               = "0.13.3"
+async-trait        = "0.1"
+image              = { workspace = true }
+dotenvy            = { workspace = true }
+toml               = { workspace = true }
+dirs               = "5"
+notify             = { workspace = true }
+tokio-cron-scheduler = { workspace = true }
+hostname           = "0.4"
+rfd                = { version = "0.15", optional = true, features = ["xdg-portal"] }
+unicode-normalization = "0.1" # NFKC for wd_tag_dict.tag_name_normalized (MIT OR Apache-2.0)
+caseless           = "0.2" # full Unicode case folding for wd_tag_dict.tag_name_normalized (MIT OR Apache-2.0)
+roxmltree          = "0.20" # read-only XMP packet parsing for WD-Tagger XMP write (MIT OR Apache-2.0)
+half               = "2.7" # float16 vectors.db storage (MIT OR Apache-2.0)
+usearch            = "2.26.0" # native ANN index (Apache-2.0)
+socket2            = "0.6" # UDP discovery socket, AF_INET reuse-before-bind (MIT OR Apache-2.0)
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+lan-cowork = { path = "../lan-cowork", features = ["test-seams"] }
+
+[features]
+default = ["python-backend"]
+python-backend = []
+native-dialog = ["dep:rfd"]
+cuda     = ["infer-core/cuda"]
+rocm     = ["infer-core/rocm"]
+directml = ["infer-core/directml"]
+coreml   = ["infer-core/coreml"]
+openvino = ["infer-core/openvino"]

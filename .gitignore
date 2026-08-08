@@ -1,0 +1,12 @@
+# Rust build output
+target/
+
+# Runtime state and secrets. The server writes its keyring and encryption key
+# under data/ at first start — these must never be committed.
+crates/yu-server/data/
+crates/yu-server/config.json
+config.json
+
+# Editor / OS noise
+*.swp
+.DS_Store

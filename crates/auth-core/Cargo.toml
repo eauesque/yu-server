@@ -1,0 +1,9 @@
+[package]
+name = "auth-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rand   = { workspace = true }
+subtle = { workspace = true }
+hex    = { workspace = true }

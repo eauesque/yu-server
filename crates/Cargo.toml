@@ -1,0 +1,73 @@
+[workspace]
+members = [
+    "auth-core",
+    "scan-core",
+    "tagdb-core",
+    "meta-extract",
+    "yu-infer",
+    "yu-server",
+    "xmp-core",
+    "lan-cowork",
+]
+resolver = "2"
+
+[workspace.dependencies]
+# Hailo inference stack, split out to eauesque/yu-hailo-infer (public).
+# We point at the PUBLIC repo on purpose: it needs no credentials, so a fresh
+# clone or a CI runner can build without any registry/SSH setup. Development
+# happens in habe358/yu-hailo-infer (private) and is mirrored here, so a fix
+# must reach the public repo before it can be pinned below.
+# The keys stay at the historical names so `infer_core::` / `yu_infer::` in our
+# own sources keep resolving despite the upstream yu-hailo-* rename.
+# Both entries MUST share one rev: a split would build ort/ONNX Runtime twice
+# and break feature unification across yu-server and the yu-infer shim.
+infer-core         = { package = "yu-hailo-infer-core", git = "https://github.com/eauesque/yu-hailo-infer", rev = "de1d16f0f661b1b89c2fc505400d09617b49e7e7" }
+yu-infer           = { package = "yu-hailo-infer", git = "https://github.com/eauesque/yu-hailo-infer", rev = "de1d16f0f661b1b89c2fc505400d09617b49e7e7" }
+sqlx               = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros"] }
+log                = "0.4"
+libsqlite3-sys     = { version = "0.30", features = ["bundled-sqlcipher-vendored-openssl"] }
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+serde_yml          = "0.0"
+tokio              = { version = "1", features = ["full", "test-util"] }
+uuid               = { version = "1", features = ["v7", "fast-rng"] }
+thiserror          = "2"
+fastembed          = { version = "5", default-features = false, features = ["ort-download-binaries", "hf-hub"] }
+bytemuck           = "1"
+image              = "0.25"
+anyhow             = "1"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap               = { version = "4", features = ["derive", "env"] }
+insta              = "1"
+tempfile           = "3"
+libc               = "0.2"
+chrono             = { version = "0.4", features = ["serde"] }
+axum               = { version = "0.8", features = ["macros", "multipart"] }
+tower              = "0.5"
+tower-sessions     = { version = "0.15", features = ["memory-store"] }
+reqwest            = { version = "0.12", default-features = false, features = ["json", "cookies", "stream", "rustls-tls"] }
+url                = "2"
+futures-util       = "0.3"
+regex              = "1"
+fancy-regex = "0.13"
+ignore             = "0.4"
+notify             = "6"
+toml               = "0.8"
+subtle             = "2"
+sha2               = "0.10"
+hex                = "0.4"
+openssl            = "0.10"
+pbkdf2             = { version = "0.12", features = ["hmac"] }
+scrypt             = { version = "0.11", default-features = false }
+hmac               = "0.12"
+rand               = { version = "0.9", features = ["os_rng"] }
+urlencoding        = "2"
+kamadak-exif       = "0.5"
+base64             = "0.22"
+indexmap           = { version = "2", features = ["serde"] }
+tower-http         = { version = "0.6", features = ["fs"] }
+minijinja          = { version = "2", features = ["loader", "json"] }
+dotenvy            = "0.15"
+tokio-cron-scheduler = "0.13"
+quick-xml          = "0.39.4"
