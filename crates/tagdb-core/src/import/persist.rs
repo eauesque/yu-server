@@ -1,6 +1,7 @@
 use crate::import::fallback_chain::ExtractedMeta;
 use crate::import::prompt_parse::{parse_prompt_to_tags, PromptParseConfig, TemplateToken};
 use crate::TagdbError;
+use meta_extract::is_nai_source;
 use serde_json::Value;
 use sqlx::{QueryBuilder, Row, Sqlite, SqliteConnection};
 use std::collections::{BTreeMap, HashMap};
@@ -359,15 +360,7 @@ fn prompt_config_for_source(meta_source: &str, lowercase_tags: bool) -> PromptPa
         lowercase_tags,
         ..PromptParseConfig::default()
     };
-    if matches!(
-        meta_source,
-        "novelai_v4_png"
-            | "novelai_v4_webp"
-            | "novelai_v4"
-            | "novelai_png"
-            | "novelai_webp"
-            | "nai_webp"
-    ) {
+    if is_nai_source(meta_source) {
         config.prompt_syntax = "nai".to_string();
     }
     config

@@ -150,7 +150,7 @@ async fn serve_range(
     if req_headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
-        .map_or(false, |v| v == etag)
+        .is_some_and(|v| v == etag)
     {
         return StatusCode::NOT_MODIFIED.into_response();
     }

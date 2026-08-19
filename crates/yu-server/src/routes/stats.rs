@@ -394,7 +394,7 @@ async fn build_model_stats_uncached(pool: &SqlitePool) -> Result<Value, sqlx::Er
     let unknown = sqlx::query(&format!(
         "SELECT strftime('%Y-%m', datetime(f.mtime, 'unixepoch', '{TZ_MODIFIER}')) as month,
                 CASE
-                    WHEN f.meta_source IN ('novelai_v4_webp','novelai_v4_png')
+                    WHEN f.meta_source IN ('novelai_v4_webp','novelai_v4_png','novelai_v4')
                     THEN 'NovelAI Diffusion V4.5'
                     ELSE 'Unknown'
                 END as model,
@@ -1090,16 +1090,26 @@ mod tests {
 
     #[tokio::test]
     async fn stats_models_separates_template_and_novelai_fallback_models() {
-        let response = stats_models(State(test_state().await), None).await;
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO files(id, path, mtime, is_deleted, meta_source) VALUES
+               (5, '/v4.gif', 1704078000, 0, 'novelai_v4'),
+               (6, '/v3.png', 1704078000, 0, 'novelai_png')",
+        )
+        .execute(&state.db_read)
+        .await
+        .unwrap();
+
+        let response = stats_models(State(state), None).await;
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(value["timeline"]["2024-01"]["Model A"], 1);
-        assert_eq!(value["timeline"]["2024-01"]["NovelAI Diffusion V4.5"], 1);
+        assert_eq!(value["timeline"]["2024-01"]["Unknown"], 1);
+        assert_eq!(value["timeline"]["2024-01"]["NovelAI Diffusion V4.5"], 2);
         assert_eq!(value["top_models"][0]["model"], "NovelAI Diffusion V4.5");
-        assert_eq!(value["top_models"][1]["model"], "Model A");
-        assert_eq!(value["total_models"], 2);
+        assert_eq!(value["total_models"], 3);
     }
 }

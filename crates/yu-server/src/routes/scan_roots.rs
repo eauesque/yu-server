@@ -93,16 +93,7 @@ fn admin_scope_error(
 
 fn read_config(config_path: &Path) -> Result<Value, std::io::Error> {
     let text = std::fs::read_to_string(config_path)?;
-    serde_json::from_str(&text)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-}
-
-fn write_config(config_path: &Path, config: &Value) -> Result<(), std::io::Error> {
-    let tmp = config_path.with_extension("json.tmp");
-    let text = serde_json::to_string_pretty(config)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, config_path)
+    crate::config_io::parse_strict(config_path, &text)
 }
 
 #[allow(dead_code)]
@@ -176,9 +167,9 @@ async fn purge_files_under(db: &SqlitePool, root_path: &str) -> Result<u64, sqlx
 
 fn sanitize_path(raw: &str) -> String {
     let s = raw.trim();
-    if s.starts_with('~') {
+    if let Some(rest) = s.strip_prefix('~') {
         if let Some(home) = std::env::var_os("HOME") {
-            return format!("{}{}", home.to_string_lossy(), &s[1..]);
+            return format!("{}{}", home.to_string_lossy(), rest);
         }
     }
     s.to_string()
@@ -257,6 +248,7 @@ pub async fn add_scan_root(
     };
     let path = sanitize_path(&raw_path);
 
+    let _guard = state.settings_lock.lock().await;
     let mut config = match read_config(&state.config.config_path) {
         Ok(config) => config,
         Err(error) => return internal_error(error, "failed to read config"),
@@ -282,7 +274,7 @@ pub async fn add_scan_root(
     let index = roots.len() - 1;
     let roots_snapshot = json!(roots.clone());
 
-    if let Err(error) = write_config(&state.config.config_path, &config) {
+    if let Err(error) = crate::config_io::write(&state.config.config_path, &config) {
         return internal_error(error, "failed to write config");
     }
     notify_scan_roots_changed(&state);
@@ -297,6 +289,7 @@ pub async fn remove_scan_root(
     if let Some(response) = admin_scope_error(&state, auth_context.as_ref()) {
         return response;
     }
+    let _guard = state.settings_lock.lock().await;
     let mut config = match read_config(&state.config.config_path) {
         Ok(config) => config,
         Err(error) => return internal_error(error, "failed to read config"),
@@ -313,9 +306,14 @@ pub async fn remove_scan_root(
         .unwrap_or("")
         .to_string();
 
-    if let Err(error) = write_config(&state.config.config_path, &config) {
+    if let Err(error) = crate::config_io::write(&state.config.config_path, &config) {
         return internal_error(error, "failed to write config");
     }
+
+    // The read-modify-write is complete; release the global config lock before
+    // the purge, which can delete a large number of rows and would otherwise
+    // block every other config.json writer for its duration.
+    drop(_guard);
 
     let purged: u64 = if !removed_path.is_empty() {
         match purge_files_under(&state.db, &removed_path).await {
@@ -342,6 +340,7 @@ pub async fn toggle_scan_root(
     if let Some(response) = admin_scope_error(&state, auth_context.as_ref()) {
         return response;
     }
+    let _guard = state.settings_lock.lock().await;
     let mut config = match read_config(&state.config.config_path) {
         Ok(config) => config,
         Err(error) => return internal_error(error, "failed to read config"),
@@ -358,7 +357,7 @@ pub async fn toggle_scan_root(
     roots[idx]["enabled"] = json!(new_enabled);
     let roots_snapshot = json!(roots.clone());
 
-    if let Err(error) = write_config(&state.config.config_path, &config) {
+    if let Err(error) = crate::config_io::write(&state.config.config_path, &config) {
         return internal_error(error, "failed to write config");
     }
     notify_scan_roots_changed(&state);
@@ -374,6 +373,7 @@ pub async fn batch_toggle_scan_roots(
         return response;
     }
     let enable = body.enabled.unwrap_or(true);
+    let _guard = state.settings_lock.lock().await;
     let mut config = match read_config(&state.config.config_path) {
         Ok(config) => config,
         Err(error) => return internal_error(error, "failed to read config"),
@@ -384,7 +384,7 @@ pub async fn batch_toggle_scan_roots(
     }
     let roots_snapshot = json!(roots.clone());
 
-    if let Err(error) = write_config(&state.config.config_path, &config) {
+    if let Err(error) = crate::config_io::write(&state.config.config_path, &config) {
         return internal_error(error, "failed to write config");
     }
     notify_scan_roots_changed(&state);
@@ -399,6 +399,7 @@ pub async fn reorder_scan_roots(
     if let Some(response) = admin_scope_error(&state, auth_context.as_ref()) {
         return response;
     }
+    let _guard = state.settings_lock.lock().await;
     let mut config = match read_config(&state.config.config_path) {
         Ok(config) => config,
         Err(error) => return internal_error(error, "failed to read config"),
@@ -443,7 +444,7 @@ pub async fn reorder_scan_roots(
         .get("scan_roots")
         .cloned()
         .unwrap_or_else(|| json!([]));
-    if let Err(error) = write_config(&state.config.config_path, &config) {
+    if let Err(error) = crate::config_io::write(&state.config.config_path, &config) {
         return internal_error(error, "failed to write config");
     }
     notify_scan_roots_changed(&state);
@@ -459,6 +460,7 @@ pub async fn edit_scan_root(
     if let Some(response) = admin_scope_error(&state, auth_context.as_ref()) {
         return response;
     }
+    let _guard = state.settings_lock.lock().await;
     let mut config = match read_config(&state.config.config_path) {
         Ok(config) => config,
         Err(error) => return internal_error(error, "failed to read config"),
@@ -492,7 +494,7 @@ pub async fn edit_scan_root(
     }
     let updated_root = roots[idx].clone();
 
-    if let Err(error) = write_config(&state.config.config_path, &config) {
+    if let Err(error) = crate::config_io::write(&state.config.config_path, &config) {
         return internal_error(error, "failed to write config");
     }
     notify_scan_roots_changed(&state);
@@ -908,11 +910,31 @@ mod tests {
 
     #[tokio::test]
     async fn scan_roots_returns_config_roots_with_exists_and_file_count() {
+        // `exists` is a real filesystem check, so the scan root must be a
+        // directory this test owns. The shared seed's `/home/pi` rows only ever
+        // existed on the Raspberry Pi this was originally written on, which made
+        // the assertion unsatisfiable everywhere else.
         let root = test_root();
-        let config = json!({"scan_roots": [{"path": "/home/pi", "enabled": true}]});
-        let response = scan_roots(State(test_state(&root, config).await), None).await;
+        let scan_dir = root.path.join("scan-root");
+        fs::create_dir_all(scan_dir.join("nested")).unwrap();
+        let scan_path = scan_dir.to_string_lossy().to_string();
+
+        let config = json!({"scan_roots": [{"path": scan_path.clone(), "enabled": true}]});
+        let state = test_state(&root, config).await;
+        sqlx::query(
+            "INSERT INTO files(id, path, is_deleted) VALUES (10, ?, 0), (11, ?, 0), (12, ?, 1)",
+        )
+        .bind(format!("{scan_path}/a.png"))
+        .bind(format!("{scan_path}/nested/b.png"))
+        .bind(format!("{scan_path}/deleted.png"))
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+        let response = scan_roots(State(Arc::clone(&state)), None).await;
         let value = json_body(response).await;
         assert_eq!(value["roots"][0]["exists"], true);
+        // Nested counts, deleted does not.
         assert_eq!(value["roots"][0]["file_count"], 2);
         assert!(value["roots"][0]["warning"].is_null());
     }

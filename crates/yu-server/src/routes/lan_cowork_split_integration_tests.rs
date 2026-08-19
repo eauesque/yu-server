@@ -90,7 +90,7 @@ async fn client_state() -> SharedState {
     .await
     .unwrap();
     sqlx::query("INSERT INTO lan_cowork_identity (key, value) VALUES ('ed25519_seed', ?1)")
-        .bind(&(1u8..=32).collect::<Vec<_>>())
+        .bind((1u8..=32).collect::<Vec<_>>())
         .execute(&state.db)
         .await
         .unwrap();

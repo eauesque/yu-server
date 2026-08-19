@@ -13,36 +13,61 @@ use reqwest::Url;
 use serde_json::json;
 
 use crate::{
-    auth::chain::is_loopback_addr,
-    routes::{
-        sd_webui_bridge::{ext_config, sd_api_url},
-        settings::load_config_json,
-    },
+    auth::{chain::is_loopback_addr, gateway},
+    config_io::load as load_config_json,
+    routes::sd_webui_bridge::{ext_config, sd_api_url},
     state::SharedState,
 };
 
-static SD_ALLOWED: &[(&str, &str)] = &[
-    ("POST", "/sdapi/v1/txt2img"),
-    ("POST", "/sdapi/v1/img2img"),
-    ("POST", "/sdapi/v1/extra-single-image"),
-    ("POST", "/sdapi/v1/interrupt"),
-    ("GET", "/sdapi/v1/samplers"),
-    ("GET", "/sdapi/v1/sd-models"),
-    ("GET", "/sdapi/v1/loras"),
-    ("GET", "/sdapi/v1/embeddings"),
-    ("GET", "/sdapi/v1/upscalers"),
-    ("GET", "/sdapi/v1/sd-vae"),
-    ("GET", "/sdapi/v1/progress"),
-    ("GET", "/sdapi/v1/scripts"),
-    ("GET", "/sdapi/v1/script-info"),
-    ("GET", "/sdapi/v1/cmd-flags"),
-    ("GET", "/sdapi/v1/options"),
-    ("POST", "/sdapi/v1/options"),
-    ("POST", "/sdapi/v1/refresh-checkpoints"),
-    ("POST", "/sdapi/v1/refresh-vae"),
-    ("POST", "/sdapi/v1/refresh-loras"),
-    ("POST", "/sdapi/v1/reload-checkpoint"),
+/// Port of Python `core/gateway/sd_proxy.py:SD_ALLOWED_ENDPOINTS`, which is a
+/// `dict[(method, path) -> Scope]`. The scope column is load-bearing: it is what
+/// separates a query key from one that may switch the running model. An earlier
+/// port kept only the (method, path) pair, which silently turned the table into
+/// a bare allowlist and dropped the authorization mapping.
+static SD_ALLOWED: &[(&str, &str, &str)] = &[
+    ("POST", "/sdapi/v1/txt2img", gateway::SCOPE_SD_GENERATE),
+    ("POST", "/sdapi/v1/img2img", gateway::SCOPE_SD_GENERATE),
+    (
+        "POST",
+        "/sdapi/v1/extra-single-image",
+        gateway::SCOPE_SD_GENERATE,
+    ),
+    ("POST", "/sdapi/v1/interrupt", gateway::SCOPE_SD_GENERATE),
+    ("GET", "/sdapi/v1/samplers", gateway::SCOPE_SD_QUERY),
+    ("GET", "/sdapi/v1/sd-models", gateway::SCOPE_SD_QUERY),
+    ("GET", "/sdapi/v1/loras", gateway::SCOPE_SD_QUERY),
+    ("GET", "/sdapi/v1/embeddings", gateway::SCOPE_SD_QUERY),
+    ("GET", "/sdapi/v1/upscalers", gateway::SCOPE_SD_QUERY),
+    ("GET", "/sdapi/v1/sd-vae", gateway::SCOPE_SD_QUERY),
+    ("GET", "/sdapi/v1/progress", gateway::SCOPE_SD_QUERY),
+    ("GET", "/sdapi/v1/scripts", gateway::SCOPE_SD_QUERY),
+    ("GET", "/sdapi/v1/script-info", gateway::SCOPE_SD_QUERY),
+    ("GET", "/sdapi/v1/cmd-flags", gateway::SCOPE_SD_QUERY),
+    ("GET", "/sdapi/v1/options", gateway::SCOPE_SD_ADMIN),
+    ("POST", "/sdapi/v1/options", gateway::SCOPE_SD_ADMIN),
+    (
+        "POST",
+        "/sdapi/v1/refresh-checkpoints",
+        gateway::SCOPE_SD_ADMIN,
+    ),
+    ("POST", "/sdapi/v1/refresh-vae", gateway::SCOPE_SD_ADMIN),
+    ("POST", "/sdapi/v1/refresh-loras", gateway::SCOPE_SD_ADMIN),
+    (
+        "POST",
+        "/sdapi/v1/reload-checkpoint",
+        gateway::SCOPE_SD_ADMIN,
+    ),
 ];
+
+/// Python `core/gateway/sd_proxy.py:get_sd_scope`. `None` means "not on the
+/// allowlist", which the caller answers with 404 — never with an auth error, so
+/// that an unauthenticated caller cannot probe which paths exist.
+fn sd_scope_for(method: &str, path: &str) -> Option<&'static str> {
+    SD_ALLOWED
+        .iter()
+        .find(|(m, p, _)| *m == method && *p == path)
+        .map(|(_, _, scope)| *scope)
+}
 
 static REQ_STRIP: &[&str] = &[
     "authorization",
@@ -88,6 +113,14 @@ fn err_403() -> Response {
     (
         StatusCode::FORBIDDEN,
         Json(json!({"error":{"message":"Forbidden","type":"invalid_request_error","code":"forbidden"}})),
+    )
+        .into_response()
+}
+
+fn err_403_scope(needed: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({"error":{"message":"Insufficient scope","type":"invalid_request_error","code":"insufficient_scope","param":needed}})),
     )
         .into_response()
 }
@@ -248,6 +281,20 @@ pub async fn ollama_handler(
         return err_403();
     }
 
+    // L3 runs before the body is buffered: a request we are going to reject must
+    // not first cost us an unbounded upload in memory.
+    let Some(auth) = gateway::check_request(
+        &state.gateway_keys,
+        state.gateway_loopback_bypass,
+        &parts.headers,
+        &client_ip,
+    ) else {
+        return err_401();
+    };
+    if !gateway::has_scope(&auth, gateway::SCOPE_OLLAMA_PROXY) {
+        return err_403_scope(gateway::SCOPE_OLLAMA_PROXY);
+    }
+
     let body_bytes = match to_bytes(body, usize::MAX).await {
         Ok(b) => b,
         Err(_) => return err_502(),
@@ -284,7 +331,6 @@ pub async fn ollama_handler(
         Err(_) => return err_502(),
     };
 
-    // TODO(gateway-auth): OLLAMA_PROXY scope gate を追加
     stream_proxy(
         upstream_url,
         parts.method,
@@ -315,13 +361,29 @@ pub async fn sd_handler(
         return err_403();
     }
 
-    // layer 3: SD path allowlist（認証より前の独立ゲート）
+    // layer 3a: SD path allowlist. A path that is not on the table is 404 —
+    // answered before authentication so that it stays indistinguishable from a
+    // path that does not exist upstream.
     let full_path = format!("/sdapi/v1/{sub}");
-    if !SD_ALLOWED
-        .iter()
-        .any(|(m, p)| *m == parts.method.as_str() && *p == full_path)
-    {
+    let Some(scope_needed) = sd_scope_for(parts.method.as_str(), &full_path) else {
         return err_404_path();
+    };
+
+    // layer 3b: gateway key + scope. This runs before the body is buffered: a
+    // request we are going to reject must not first cost us an unbounded upload
+    // in memory. Order and bypass semantics follow `routes/gateway_sd.py:187-198`
+    // — `check_request` honours `gateway.auth.allow_loopback_bypass`, so an
+    // administrator who sets it to false really does require a key here.
+    let Some(auth) = gateway::check_request(
+        &state.gateway_keys,
+        state.gateway_loopback_bypass,
+        &parts.headers,
+        &client_ip,
+    ) else {
+        return err_401();
+    };
+    if !gateway::has_scope(&auth, scope_needed) {
+        return err_403_scope(scope_needed);
     }
 
     let body_bytes = match to_bytes(body, usize::MAX).await {
@@ -348,4 +410,452 @@ pub async fn sd_handler(
         false,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashSet, path::PathBuf, str::FromStr, sync::Arc};
+
+    use base64::Engine as _;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    use super::*;
+    use crate::{
+        auth::gateway::{SCOPE_OLLAMA_PROXY, SCOPE_SD_ADMIN, SCOPE_SD_GENERATE, SCOPE_SD_QUERY},
+        state::{AppState, Config},
+    };
+
+    /// A project root carrying its own `data/secret.key`.
+    fn temp_root(name: &str) -> (PathBuf, String) {
+        let root =
+            std::env::temp_dir().join(format!("yu-ollama-gate-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        let key = base64::engine::general_purpose::URL_SAFE.encode([31_u8; 32]);
+        std::fs::write(root.join("data").join("secret.key"), &key).unwrap();
+        (root, key)
+    }
+
+    fn seal(plaintext: &str, key: &str) -> String {
+        format!(
+            "enc:{}",
+            crate::secret_store::encrypt_for_test(plaintext, key.as_bytes())
+        )
+    }
+
+    async fn test_state(app_config: serde_json::Value, project_root: PathBuf) -> SharedState {
+        let pool = SqlitePoolOptions::new()
+            .connect_with(SqliteConnectOptions::from_str("sqlite::memory:").unwrap())
+            .await
+            .unwrap();
+        Arc::new(
+            AppState::new(
+                Config {
+                    db_path: "sqlite::memory:".to_string(),
+                    pin_hash: String::new(),
+                    valid_token: String::new(),
+                    secret: String::new(),
+                    trusted_proxy_enabled: false,
+                    pin_boss_login_ui: false,
+                    trusted_ips: HashSet::new(),
+                    trusted_peer_ips: HashSet::new(),
+                    quick_lock_enabled: true,
+                    pin_auth_enabled: false,
+                    min_pin_length: 4,
+                    python_url: String::new(),
+                    config_path: project_root.join("config.json"),
+                    project_root,
+                    app_config,
+                    cache_dir: PathBuf::from("."),
+                    server_mode: "full".to_string(),
+                    headless: false,
+                    safe_mode: false,
+                    mcp_native: false,
+                    standalone: false,
+                    infer_standalone: true,
+                    active_profile: None,
+                    python_executable: String::new(),
+                },
+                pool.clone(),
+                pool,
+                Arc::new(crate::logs::ring::LogRingBuffer::new(64)),
+            )
+            .await,
+        )
+    }
+
+    async fn call(state: SharedState, authorization: Option<&str>) -> Response {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/ollama/local/api/chat")
+            .header("host", "127.0.0.1:8000");
+        if let Some(value) = authorization {
+            builder = builder.header("authorization", value);
+        }
+        ollama_handler(
+            State(state),
+            ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 45678))),
+            Path(("local".to_string(), "api/chat".to_string())),
+            builder.body(Body::from(r#"{"model":"x"}"#)).unwrap(),
+        )
+        .await
+    }
+
+    async fn body_json(response: Response) -> serde_json::Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// No gateway backend is configured in any of these tests, so 404
+    /// `backend_not_found` is what "the request got past authentication" looks
+    /// like. 401/403 means it did not.
+    const PASSED_AUTH: StatusCode = StatusCode::NOT_FOUND;
+
+    #[tokio::test]
+    async fn ollama_without_bearer_still_works_by_default() {
+        let (root, _key) = temp_root("default");
+        let response = call(test_state(json!({}), root).await, None).await;
+        assert_eq!(response.status(), PASSED_AUTH);
+    }
+
+    #[tokio::test]
+    async fn a_dummy_bearer_is_not_verified_while_the_bypass_is_on() {
+        let (root, _key) = temp_root("dummy-bearer");
+        let response = call(
+            test_state(json!({}), root).await,
+            Some("Bearer sk-dummy-openai-client-key"),
+        )
+        .await;
+        assert_eq!(response.status(), PASSED_AUTH);
+    }
+
+    #[tokio::test]
+    async fn ollama_requires_a_key_when_loopback_bypass_is_disabled() {
+        let (root, _key) = temp_root("bypass-off");
+        let config = json!({"gateway": {"auth": {"allow_loopback_bypass": false, "api_keys": []}}});
+        let response = call(test_state(config, root).await, None).await;
+
+        // 401 rather than 404 also proves the gate runs before the backend is
+        // resolved — and therefore before the body is buffered.
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn ollama_rejects_a_key_lacking_the_proxy_scope() {
+        let (root, key) = temp_root("wrong-scope");
+        let config = json!({"gateway": {"auth": {
+            "allow_loopback_bypass": false,
+            "api_keys": [{"id": "k", "secret_enc": seal("tok", &key), "scopes": ["sd:generate"]}],
+        }}});
+        let response = call(test_state(config, root).await, Some("Bearer tok")).await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = body_json(response).await;
+        assert_eq!(body["error"]["code"], "insufficient_scope");
+        assert_eq!(body["error"]["param"], SCOPE_OLLAMA_PROXY);
+    }
+
+    #[tokio::test]
+    async fn ollama_accepts_a_key_carrying_the_proxy_scope() {
+        let (root, key) = temp_root("right-scope");
+        let config = json!({"gateway": {"auth": {
+            "allow_loopback_bypass": false,
+            "api_keys": [{"id": "k", "secret_enc": seal("tok", &key), "scopes": [SCOPE_OLLAMA_PROXY]}],
+        }}});
+        let response = call(test_state(config, root).await, Some("Bearer tok")).await;
+        assert_eq!(response.status(), PASSED_AUTH);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_key_is_rejected_when_the_bypass_is_off() {
+        let (root, key) = temp_root("wrong-key");
+        let config = json!({"gateway": {"auth": {
+            "allow_loopback_bypass": false,
+            "api_keys": [{"id": "k", "secret_enc": seal("tok", &key), "scopes": [SCOPE_OLLAMA_PROXY]}],
+        }}});
+        let response = call(test_state(config, root).await, Some("Bearer not-tok")).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_request_does_not_buffer_the_body() {
+        // This body errors the instant anyone polls it, so reaching `to_bytes`
+        // turns the response into a 502. A clean 401 is the proof that the gate
+        // ran before we spent memory on an upload we were going to refuse.
+        let (root, _key) = temp_root("unbuffered");
+        let config = json!({"gateway": {"auth": {"allow_loopback_bypass": false, "api_keys": []}}});
+        let body = Body::from_stream(futures_util::stream::once(async {
+            Err::<bytes::Bytes, std::io::Error>(std::io::Error::other("body must not be read"))
+        }));
+        let response = ollama_handler(
+            State(test_state(config, root).await),
+            ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 45678))),
+            Path(("local".to_string(), "api/chat".to_string())),
+            Request::builder()
+                .method("POST")
+                .uri("/ollama/local/api/chat")
+                .header("host", "127.0.0.1:8000")
+                .body(body)
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn non_loopback_is_still_refused_before_any_of_this() {
+        let (root, _key) = temp_root("non-loopback");
+        let response = ollama_handler(
+            State(test_state(json!({}), root).await),
+            ConnectInfo(SocketAddr::from(([192, 168, 1, 40], 45678))),
+            Path(("local".to_string(), "api/chat".to_string())),
+            Request::builder()
+                .method("POST")
+                .uri("/ollama/local/api/chat")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // --- SD proxy scope gate -------------------------------------------------
+    //
+    // Port of `routes/gateway_sd.py:179-198`. The SD table is not a flat
+    // allowlist: each (method, path) carries the scope it demands, so a key that
+    // may only query must not be able to switch the running model.
+
+    /// A project root whose `config.json` points the SD bridge at a closed port,
+    /// so "the request got past authentication" is a deterministic 502 rather
+    /// than whatever happens to listen on the default SD port on this machine.
+    fn sd_root(name: &str) -> (PathBuf, String) {
+        let (root, key) = temp_root(name);
+        std::fs::write(
+            root.join("config.json"),
+            serde_json::to_vec(&json!({
+                "extensions": {"sd-webui-bridge": {"api_url": "http://127.0.0.1:9"}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        (root, key)
+    }
+
+    async fn sd_call(
+        state: SharedState,
+        method: &str,
+        sub: &str,
+        authorization: Option<&str>,
+    ) -> Response {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(format!("/sd/sdapi/v1/{sub}"))
+            .header("host", "127.0.0.1:8000");
+        if let Some(value) = authorization {
+            builder = builder.header("authorization", value);
+        }
+        sd_handler(
+            State(state),
+            ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 45678))),
+            Path(sub.to_string()),
+            builder.body(Body::from("{}")).unwrap(),
+        )
+        .await
+    }
+
+    /// Upstream is a closed port, so 502 is what "authentication passed" looks
+    /// like here. 401/403/404 means it did not.
+    const SD_PASSED_AUTH: StatusCode = StatusCode::BAD_GATEWAY;
+
+    #[tokio::test]
+    async fn sd_without_bearer_still_works_by_default() {
+        let (root, _key) = sd_root("sd-default");
+        let response = sd_call(test_state(json!({}), root).await, "GET", "samplers", None).await;
+        assert_eq!(response.status(), SD_PASSED_AUTH);
+    }
+
+    #[tokio::test]
+    async fn sd_requires_a_key_when_loopback_bypass_is_disabled() {
+        let (root, _key) = sd_root("sd-bypass-off");
+        let config = json!({"gateway": {"auth": {"allow_loopback_bypass": false, "api_keys": []}}});
+        let response = sd_call(test_state(config, root).await, "GET", "samplers", None).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The one that grips the scope column. A key scoped `sd:query` reaches the
+    /// query paths but must be refused on `POST /sdapi/v1/options`, which
+    /// switches the running model. Flattening the table back to (method, path)
+    /// makes this test pass a request it should refuse.
+    #[tokio::test]
+    async fn sd_rejects_a_query_key_on_an_admin_path() {
+        let (root, key) = sd_root("sd-query-vs-admin");
+        let config = json!({"gateway": {"auth": {
+            "allow_loopback_bypass": false,
+            "api_keys": [{"id": "k", "secret_enc": seal("tok", &key), "scopes": [SCOPE_SD_QUERY]}],
+        }}});
+        let state = test_state(config, root).await;
+
+        let allowed = sd_call(state.clone(), "GET", "samplers", Some("Bearer tok")).await;
+        assert_eq!(allowed.status(), SD_PASSED_AUTH);
+
+        let refused = sd_call(state, "POST", "options", Some("Bearer tok")).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        let body = body_json(refused).await;
+        assert_eq!(body["error"]["code"], "insufficient_scope");
+        assert_eq!(body["error"]["param"], SCOPE_SD_ADMIN);
+    }
+
+    #[tokio::test]
+    async fn sd_accepts_a_key_carrying_the_admin_scope() {
+        let (root, key) = sd_root("sd-admin-scope");
+        let config = json!({"gateway": {"auth": {
+            "allow_loopback_bypass": false,
+            "api_keys": [{"id": "k", "secret_enc": seal("tok", &key), "scopes": [SCOPE_SD_ADMIN]}],
+        }}});
+        let response = sd_call(
+            test_state(config, root).await,
+            "POST",
+            "options",
+            Some("Bearer tok"),
+        )
+        .await;
+        assert_eq!(response.status(), SD_PASSED_AUTH);
+    }
+
+    #[tokio::test]
+    async fn sd_generate_scope_does_not_reach_query_or_admin_paths() {
+        let (root, key) = sd_root("sd-generate-scope");
+        let config = json!({"gateway": {"auth": {
+            "allow_loopback_bypass": false,
+            "api_keys": [{"id": "k", "secret_enc": seal("tok", &key), "scopes": [SCOPE_SD_GENERATE]}],
+        }}});
+        let state = test_state(config, root).await;
+
+        let allowed = sd_call(state.clone(), "POST", "txt2img", Some("Bearer tok")).await;
+        assert_eq!(allowed.status(), SD_PASSED_AUTH);
+
+        for (method, sub) in [("GET", "samplers"), ("GET", "options")] {
+            let refused = sd_call(state.clone(), method, sub, Some("Bearer tok")).await;
+            assert_eq!(
+                refused.status(),
+                StatusCode::FORBIDDEN,
+                "{method} /sdapi/v1/{sub} must not be reachable with sd:generate"
+            );
+        }
+    }
+
+    /// Order check: an unlisted path is 404 even with the bypass off and no key.
+    /// Answering 401 first would let an unauthenticated caller enumerate which
+    /// SD paths this gateway forwards. Python decides the same way
+    /// (`gateway_sd.py:183-185` runs before `check_request`).
+    #[tokio::test]
+    async fn sd_unlisted_path_is_404_before_authentication() {
+        let (root, _key) = sd_root("sd-unlisted");
+        let config = json!({"gateway": {"auth": {"allow_loopback_bypass": false, "api_keys": []}}});
+        let state = test_state(config, root).await;
+
+        let unknown = sd_call(state.clone(), "GET", "definitely-not-a-path", None).await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        // Same path, wrong method: the table is keyed by both.
+        let wrong_method = sd_call(state, "GET", "txt2img", None).await;
+        assert_eq!(wrong_method.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_sd_request_does_not_buffer_the_body() {
+        let (root, _key) = sd_root("sd-unbuffered");
+        let config = json!({"gateway": {"auth": {"allow_loopback_bypass": false, "api_keys": []}}});
+        let body = Body::from_stream(futures_util::stream::once(async {
+            Err::<bytes::Bytes, std::io::Error>(std::io::Error::other("body must not be read"))
+        }));
+        let response = sd_handler(
+            State(test_state(config, root).await),
+            ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 45678))),
+            Path("txt2img".to_string()),
+            Request::builder()
+                .method("POST")
+                .uri("/sd/sdapi/v1/txt2img")
+                .header("host", "127.0.0.1:8000")
+                .body(body)
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn sd_non_loopback_is_refused_before_any_of_this() {
+        let (root, _key) = sd_root("sd-non-loopback");
+        let response = sd_handler(
+            State(test_state(json!({}), root).await),
+            ConnectInfo(SocketAddr::from(([192, 168, 1, 40], 45678))),
+            Path("samplers".to_string()),
+            Request::builder()
+                .method("GET")
+                .uri("/sd/sdapi/v1/samplers")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The Rust table and the Python table must demand the same scope for the
+    /// same (method, path). This reads the Python source rather than a copy, so
+    /// widening one side alone fails here.
+    #[test]
+    fn the_sd_table_matches_the_python_one() {
+        let src = match std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../core/gateway/sd_proxy.py"),
+        ) {
+            Ok(s) => s,
+            // The crate is built standalone (no repo checkout around it).
+            Err(_) => return,
+        };
+        let table = src
+            .split_once("SD_ALLOWED_ENDPOINTS")
+            .and_then(|(_, rest)| rest.split_once('}'))
+            .map(|(body, _)| body.to_string())
+            .expect("SD_ALLOWED_ENDPOINTS block not found — update this test with the Python side");
+
+        let mut python: Vec<(String, String, String)> = Vec::new();
+        for line in table.lines() {
+            let Some((key, value)) = line.split_once("):") else {
+                continue;
+            };
+            let key = key.trim().trim_start_matches('(');
+            let Some((method, path)) = key.split_once(',') else {
+                continue;
+            };
+            let scope = match value.trim().trim_end_matches(',').rsplit_once('.') {
+                Some((_, name)) => name,
+                None => continue,
+            };
+            python.push((
+                method.trim().trim_matches('"').to_string(),
+                path.trim().trim_matches('"').to_string(),
+                scope.to_string(),
+            ));
+        }
+        assert_eq!(
+            python.len(),
+            SD_ALLOWED.len(),
+            "Python has {} entries, Rust has {}",
+            python.len(),
+            SD_ALLOWED.len()
+        );
+
+        for (method, path, py_scope) in python {
+            let rust_scope = sd_scope_for(&method, &path)
+                .unwrap_or_else(|| panic!("{method} {path} is missing from the Rust table"));
+            let expected = match py_scope.as_str() {
+                "SD_GENERATE" => SCOPE_SD_GENERATE,
+                "SD_QUERY" => SCOPE_SD_QUERY,
+                "SD_ADMIN" => SCOPE_SD_ADMIN,
+                other => panic!("unmapped Python scope {other} for {method} {path}"),
+            };
+            assert_eq!(rust_scope, expected, "scope differs for {method} {path}");
+        }
+    }
 }

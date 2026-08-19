@@ -291,7 +291,7 @@ fn is_video_path(path: &str) -> bool {
 /// `None` (falls back to the default HEF) rather than constructing a path
 /// that can never exist -- the caller-facing model list is validated at
 /// the API layer.
-fn hailo_yolo_hef_path(model_name: &str) -> Option<String> {
+pub(crate) fn hailo_yolo_hef_path(model_name: &str) -> Option<String> {
     let info = crate::routes::hailo_model_download::YOLO_MODELS.get(model_name)?;
     if model_name == "yolov8n" && std::env::var_os("HAILO_HEF_DIR").is_none() {
         return None;

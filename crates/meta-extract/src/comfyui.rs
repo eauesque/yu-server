@@ -100,7 +100,7 @@ fn find_clip_texts(obj: &Value) -> (Vec<String>, Vec<String>) {
     let mut negatives = Vec::new();
 
     // Find KSampler* nodes, trace positive/negative inputs
-    for (_id, node) in &nodes_by_id {
+    for node in nodes_by_id.values() {
         let class = node
             .get("class_type")
             .and_then(|v| v.as_str())
@@ -132,7 +132,7 @@ fn find_clip_texts(obj: &Value) -> (Vec<String>, Vec<String>) {
 
     // Fallback: classify all CLIPTextEncode nodes by title
     if positives.is_empty() && negatives.is_empty() {
-        for (_id, node) in &nodes_by_id {
+        for node in nodes_by_id.values() {
             if let Some(text) = extract_clip_text(node) {
                 let title = node
                     .get("_meta")

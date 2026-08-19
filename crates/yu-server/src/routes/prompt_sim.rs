@@ -270,7 +270,7 @@ pub async fn sweep_axes(
             .as_bool()
             .unwrap_or(false)
     };
-    if axis_dirs.is_empty() && !(include_wc && !wildcard_dirs.is_empty()) {
+    if axis_dirs.is_empty() && (!include_wc || wildcard_dirs.is_empty()) {
         return Json(json!({"axes": {}, "sources": {}, "axis_dirs": axis_dirs, "include_wildcard_dirs": include_wc, "wildcard_dirs": wildcard_dirs})).into_response();
     }
     let (axes, sources) = core::load_sweep_axes(&axis_dirs, include_wc, &wildcard_dirs);

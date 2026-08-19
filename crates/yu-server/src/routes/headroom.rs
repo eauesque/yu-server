@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::auth::{scope::require_admin_scope, AuthContext};
-use crate::routes::settings::{load_config_json, validate_base_url, write_config_json};
+use crate::config_io::{load as load_config_json, validate_base_url, write as write_config_json};
 use crate::state::SharedState;
 
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8787";

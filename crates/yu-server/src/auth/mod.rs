@@ -1,6 +1,7 @@
 pub mod apikey;
 pub mod chain;
 pub mod client_ip;
+pub mod gateway;
 pub mod lock;
 pub mod middleware;
 pub mod pin;

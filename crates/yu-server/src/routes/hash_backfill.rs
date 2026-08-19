@@ -168,7 +168,7 @@ async fn run_worker(state: SharedState, token: CancellationToken) {
 
         send_sse(
             &hub,
-            "HASH_BACKFILL_PROGRESS",
+            "hash_backfill.progress",
             json!({
                 "computed": bs.computed,
                 "done_this_run": bs.computed - base,
@@ -181,7 +181,7 @@ async fn run_worker(state: SharedState, token: CancellationToken) {
     let cancelled = token.is_cancelled();
     send_sse(
         &hub,
-        "HASH_BACKFILL_COMPLETE",
+        "hash_backfill.complete",
         json!({ "computed": bs.computed, "cancelled": cancelled }),
     );
     jm.finish(JOB_ID, Some(json!({ "computed": bs.computed })), None);

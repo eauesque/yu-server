@@ -49,7 +49,7 @@ pub async fn proxy(State(state): State<SharedState>, request: Request<Body>) -> 
     let is_sse = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map_or(false, |ct| ct.starts_with("text/event-stream"));
+        .is_some_and(|ct| ct.starts_with("text/event-stream"));
     let stream = upstream.bytes_stream();
 
     let mut response = Response::builder().status(status);

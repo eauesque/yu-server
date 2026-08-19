@@ -7,11 +7,18 @@ members = [
     "yu-infer",
     "yu-server",
     "xmp-core",
-    "lan-cowork",
 ]
 resolver = "2"
 
 [workspace.dependencies]
+# LAN Cowork, split out to eauesque/yu-lan-cowork (public) on 2026-08-11.
+# Same reasoning as the Hailo entries below: we point at the PUBLIC repo so a
+# fresh clone or a CI runner builds with no credentials. Development happens in
+# habe358/yu-lan-cowork (private) and is mirrored there, so a fix must reach the
+# public repo before it can be pinned here.
+# The crate's own tests carry the wire-format vectors; the generators under
+# scripts/gen_*_vectors.py write into the lan-cowork checkout (YU_LAN_COWORK).
+lan-cowork         = { git = "https://github.com/eauesque/yu-lan-cowork", rev = "af9239adf86799c1be062a264e3153cb2bd5298d" }
 # Hailo inference stack, split out to eauesque/yu-hailo-infer (public).
 # We point at the PUBLIC repo on purpose: it needs no credentials, so a fresh
 # clone or a CI runner can build without any registry/SSH setup. Development
@@ -21,8 +28,8 @@ resolver = "2"
 # own sources keep resolving despite the upstream yu-hailo-* rename.
 # Both entries MUST share one rev: a split would build ort/ONNX Runtime twice
 # and break feature unification across yu-server and the yu-infer shim.
-infer-core         = { package = "yu-hailo-infer-core", git = "https://github.com/eauesque/yu-hailo-infer", rev = "de1d16f0f661b1b89c2fc505400d09617b49e7e7" }
-yu-infer           = { package = "yu-hailo-infer", git = "https://github.com/eauesque/yu-hailo-infer", rev = "de1d16f0f661b1b89c2fc505400d09617b49e7e7" }
+infer-core         = { package = "yu-hailo-infer-core", git = "https://github.com/eauesque/yu-hailo-infer", rev = "891c73dc24e3f146fbaaa068bbebb80979a3c399" }
+yu-infer           = { package = "yu-hailo-infer", git = "https://github.com/eauesque/yu-hailo-infer", rev = "891c73dc24e3f146fbaaa068bbebb80979a3c399" }
 sqlx               = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros"] }
 log                = "0.4"
 libsqlite3-sys     = { version = "0.30", features = ["bundled-sqlcipher-vendored-openssl"] }

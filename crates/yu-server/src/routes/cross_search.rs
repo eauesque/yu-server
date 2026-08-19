@@ -16,10 +16,9 @@ use sqlx::Row;
 
 use crate::{
     auth::{scope::require_admin_scope, AuthContext},
+    ext_config,
     state::SharedState,
 };
-
-use super::ext_config;
 
 const EXT_NAME: &str = "builtin-cross-search";
 const ROOTS_KEY: &str = "txt_scan_roots";
@@ -65,10 +64,41 @@ fn launcher() -> Arc<dyn FileLauncher> {
 }
 
 #[cfg(test)]
-fn set_launcher_for_test(test_launcher: Arc<dyn FileLauncher>) -> Arc<dyn FileLauncher> {
+static LAUNCHER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Swap in a test launcher, holding a process-wide lock until the guard drops.
+///
+/// `FILE_LAUNCHER` is global, so two tests swapping it concurrently observe each
+/// other's mock. The guard serialises the whole swap-use-restore window and puts the
+/// previous launcher back even if the test panics.
+#[cfg(test)]
+struct LauncherGuard {
+    previous: Option<Arc<dyn FileLauncher>>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for LauncherGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            let lock = FILE_LAUNCHER.get_or_init(|| RwLock::new(Arc::new(SystemFileLauncher)));
+            let mut guard = lock.write().unwrap_or_else(|e| e.into_inner());
+            *guard = previous;
+        }
+    }
+}
+
+#[cfg(test)]
+fn set_launcher_for_test(test_launcher: Arc<dyn FileLauncher>) -> LauncherGuard {
+    let _lock = LAUNCHER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let lock = FILE_LAUNCHER.get_or_init(|| RwLock::new(Arc::new(SystemFileLauncher)));
-    let mut guard = lock.write().expect("launcher lock");
-    std::mem::replace(&mut *guard, test_launcher)
+    let mut guard = lock.write().unwrap_or_else(|e| e.into_inner());
+    let previous = std::mem::replace(&mut *guard, test_launcher);
+    drop(guard);
+    LauncherGuard {
+        previous: Some(previous),
+        _lock,
+    }
 }
 
 fn api_error(message: &str, status: StatusCode) -> Response {
@@ -775,6 +805,7 @@ pub async fn save_scan_roots(
             clean.push(normalized);
         }
     }
+    let _guard = state.settings_lock.lock().await;
     if let Err(error) = ext_config::save_extension_value(
         &state.config.config_path,
         EXT_NAME,
@@ -803,6 +834,7 @@ pub async fn delete_scan_root(
     if let Some(response) = admin_scope_error(&state, auth_context.as_ref()) {
         return response;
     }
+    let _guard = state.settings_lock.lock().await;
     let (mut roots, _) = match configured_roots(&state) {
         Ok(result) => result,
         Err(error) => return internal_error(error, "failed to read cross scan roots"),
@@ -1108,7 +1140,7 @@ mod tests {
         .await
         .unwrap();
         let mock = Arc::new(MockLauncher::default());
-        let old = set_launcher_for_test(mock.clone());
+        let _launcher_guard = set_launcher_for_test(mock.clone());
 
         let response = open_file(
             State(state),
@@ -1117,7 +1149,6 @@ mod tests {
         )
         .await;
 
-        let _ = set_launcher_for_test(old);
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(json_body(response).await, json!({"success": true}));
         assert_eq!(mock.opened.lock().unwrap().as_slice(), &[file_path]);
@@ -1137,7 +1168,7 @@ mod tests {
         let state = test_state(config_path).await;
         ensure_tables(&state).await.unwrap();
         let mock = Arc::new(MockLauncher::default());
-        let old = set_launcher_for_test(mock.clone());
+        let _launcher_guard = set_launcher_for_test(mock.clone());
 
         let response = open_file(
             State(state),
@@ -1146,7 +1177,6 @@ mod tests {
         )
         .await;
 
-        let _ = set_launcher_for_test(old);
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             json_body(response).await,

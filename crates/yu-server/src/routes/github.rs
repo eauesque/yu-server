@@ -16,11 +16,9 @@ use sqlx::Row;
 
 use crate::{
     auth::{scope::require_admin_scope, AuthContext},
-    secret_store,
+    ext_config, secret_store,
     state::SharedState,
 };
-
-use super::ext_config;
 
 const USER_AGENT: &str = "YU-AI-Manager-GitHub-Integration/1.0";
 const API_VERSION: &str = "2022-11-28";
@@ -121,7 +119,7 @@ fn load_config(state: &SharedState) -> Result<Value, std::io::Error> {
 }
 
 fn save_config(state: &SharedState, config: &Value) -> Result<(), std::io::Error> {
-    ext_config::write_config(&state.config.config_path, config)
+    crate::config_io::write(&state.config.config_path, config)
 }
 
 fn get_token_from_section(sec: &Value, label: &str, project_root: &std::path::Path) -> String {
@@ -254,6 +252,7 @@ pub async fn add_account(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let _guard = state.settings_lock.lock().await;
     let mut config = match load_config(&state) {
         Ok(config) => config,
         Err(error) => return internal_error(error, "failed to read github config"),
@@ -302,6 +301,7 @@ pub async fn update_account(
         Ok(data) => data,
         Err(response) => return response,
     };
+    let _guard = state.settings_lock.lock().await;
     let mut config = match load_config(&state) {
         Ok(config) => config,
         Err(error) => return internal_error(error, "failed to read github config"),
@@ -353,6 +353,7 @@ pub async fn remove_account(
     if let Some(response) = admin_scope_error(&state, auth_context.as_ref()) {
         return response;
     }
+    let _guard = state.settings_lock.lock().await;
     let mut config = match load_config(&state) {
         Ok(config) => config,
         Err(error) => return internal_error(error, "failed to read github config"),
@@ -1479,6 +1480,7 @@ pub async fn save_triage_prompts(
         .unwrap_or("")
         .trim()
         .to_string();
+    let _guard = state.settings_lock.lock().await;
     let mut config = match load_config(&state) {
         Ok(config) => config,
         Err(error) => return internal_error(error, "failed to read github config"),
@@ -1568,6 +1570,7 @@ pub async fn save_queue_config(
         Ok(data) => data,
         Err(response) => return response,
     };
+    let _guard = state.settings_lock.lock().await;
     let mut config = match load_config(&state) {
         Ok(config) => config,
         Err(error) => return internal_error(error, "failed to read github config"),
@@ -1736,6 +1739,10 @@ mod tests {
         .await
         .unwrap();
         Arc::new(AppState {
+            effective_port: 5000,
+            gateway_keys: Vec::new(),
+            gateway_loopback_bypass: true,
+            settings_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             config: Config {
                 db_path: "sqlite::memory:".to_string(),
                 pin_hash: String::new(),
@@ -1768,7 +1775,7 @@ mod tests {
             vectors_db: pool.clone(),
             vectors_db_read: pool,
             clip_index: std::sync::Arc::new(
-                crate::routes::clip_index::ClipIndex::new_default(&std::env::temp_dir())
+                crate::routes::clip_index::ClipIndex::new_default(std::env::temp_dir())
                     .expect("clip index test default"),
             ),
             clip_indexer: std::sync::Arc::new(crate::routes::clip_indexer::ClipIndexer::new()),
@@ -1795,6 +1802,7 @@ mod tests {
             infer_client: None,
             infer_child: None,
             scan_manager: std::sync::OnceLock::new(),
+            hailo_yolo_stream: None,
             stats_basic_cache: crate::state::TtlCache::new(crate::state::STATS_CACHE_TTL),
             stats_models_cache: crate::state::TtlCache::new(crate::state::STATS_CACHE_TTL),
             checkpoints_cache: crate::state::TtlCache::new(crate::state::STATS_CACHE_TTL),

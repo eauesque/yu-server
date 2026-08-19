@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use sqlx::{Row, SqlitePool};
 use tokio_util::sync::CancellationToken;
 
+use crate::config_io::{load as load_config_json, write as write_config_json};
 use crate::{
     auth::{scope::require_admin_scope, AuthContext},
     state::SharedState,
@@ -41,22 +42,6 @@ fn admin_scope_error(
     auth_context: Option<&Extension<AuthContext>>,
 ) -> Option<Response> {
     require_admin_scope(state.config.pin_auth_enabled, auth_context.map(|c| &c.0))
-}
-
-fn load_config_json(config_path: &Path) -> Value {
-    for path in [
-        config_path.to_path_buf(),
-        PathBuf::from("config.json"),
-        PathBuf::from("tagdb_config.json"),
-    ] {
-        if path.exists() {
-            return std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-                .unwrap_or_else(|| json!({"scan_roots": []}));
-        }
-    }
-    json!({"scan_roots": []})
 }
 
 fn hailo_config(config: &Value) -> Value {
@@ -308,9 +293,7 @@ pub async fn config_update(
     }
     let saved = Value::Object(ht.clone());
 
-    if let Err(error) =
-        crate::routes::settings::write_config_json(&state.config.config_path, &config)
-    {
+    if let Err(error) = write_config_json(&state.config.config_path, &config) {
         return internal_error(error, "failed to save Hailo Tagger config");
     }
 

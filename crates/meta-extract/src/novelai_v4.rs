@@ -35,9 +35,12 @@ pub fn parse_novelai_v4(chunks: &PngTextChunks) -> Option<MetaResult> {
     None
 }
 
-fn try_direct_v4(
-    data: &Value,
-) -> Option<(Option<String>, Option<String>, HashMap<String, String>)> {
+/// Positive caption, negative caption, and the per-character caption map that
+/// the NovelAI v4 payload carries. Named so the tuple does not trip
+/// `clippy::type_complexity` at every function that returns it.
+type V4Captions = (Option<String>, Option<String>, HashMap<String, String>);
+
+fn try_direct_v4(data: &Value) -> Option<V4Captions> {
     if data.get("v4_prompt").is_none() && data.get("v4_negative_prompt").is_none() {
         return None;
     }

@@ -57,7 +57,7 @@ fn resolve_ipc_dir(name: &str) -> PathBuf {
     #[cfg(unix)]
     {
         let uid = get_uid();
-        return std::env::temp_dir().join(format!("{}-{}", name, uid));
+        std::env::temp_dir().join(format!("{}-{}", name, uid))
     }
 
     #[cfg(not(unix))]
@@ -128,7 +128,7 @@ pub fn is_process_alive(pid: u32) -> bool {
             return true;
         }
         let err = std::io::Error::last_os_error();
-        return err.raw_os_error() == Some(libc::EPERM);
+        err.raw_os_error() == Some(libc::EPERM)
     }
 
     #[cfg(windows)]
@@ -183,7 +183,7 @@ pub fn signal_stop(paths: &WorkerIpcPaths) -> bool {
             let e = std::io::Error::last_os_error();
             tracing::warn!("signal_stop: kill({pid}) failed: {e}");
         }
-        return ret == 0;
+        ret == 0
     }
 
     #[cfg(windows)]

@@ -144,7 +144,7 @@ pub fn parse_params(
     if body
         .get("image_base64")
         .and_then(Value::as_str)
-        .map_or(false, |s| !s.is_empty())
+        .is_some_and(|s| !s.is_empty())
     {
         return Err(api_err(
             "img2img (image_base64) is not yet supported",
@@ -483,7 +483,7 @@ pub async fn check_bnk_node(state: &SharedState) -> bool {
         &api_key,
     )
     .await
-    .map(|d| d.as_object().map_or(false, |o| !o.is_empty()))
+    .map(|d| d.as_object().is_some_and(|o| !o.is_empty()))
     .unwrap_or(false)
 }
 

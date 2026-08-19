@@ -544,13 +544,9 @@ async fn native_import_one(pool: &SqlitePool, path_str: &str) -> Result<i64, Str
 
     let extracted = fallback_chain::extract_regular_metadata(p);
     if extracted.meta_source == "unknown" {
-        // Bridge-generated images always carry embedded generation params;
-        // "unknown" here means the Rust fallback_chain port couldn't
-        // recognize this file's format/metadata, not that the file
-        // genuinely lacks metadata. Treat it as a tier-1 failure so the
-        // caller retries via Python delegation (full parser parity) rather
-        // than silently committing an empty result with a "confirmed
-        // processed" parser_version.
+        // Do not commit an unrecognized result with a "confirmed processed"
+        // parser_version. The caller tries Python when configured; standalone
+        // mode falls through to a bare sentinel row for a future rescan.
         return Err("fallback_chain returned meta_source=unknown".to_string());
     }
     let (width, height) = fallback_chain::extract_resolution(

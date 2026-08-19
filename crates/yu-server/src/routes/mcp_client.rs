@@ -26,6 +26,7 @@ use serde_json::{json, Value};
 
 use super::tools_fs::is_local;
 use crate::auth::{scope::require_admin_scope, AuthContext};
+use crate::config_io::{load as load_config_json, write as write_config_json};
 use crate::secret_store;
 use crate::state::SharedState;
 
@@ -62,31 +63,6 @@ fn api_ok(payload: Value) -> Json<Value> {
 
 fn api_err(message: &str, status: StatusCode) -> Response {
     (status, Json(json!({"ok": false, "error": message}))).into_response()
-}
-
-fn load_config_json(config_path: &std::path::Path) -> Value {
-    std::fs::read_to_string(config_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_else(|| json!({}))
-}
-
-fn write_config_json(config_path: &std::path::Path, config: &Value) -> std::io::Result<()> {
-    let parent = config_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(
-        ".mcp_client_cfg_{}.tmp",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-    ));
-    let text = serde_json::to_string_pretty(config)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&tmp, format!("{text}\n"))?;
-    std::fs::rename(&tmp, config_path)
 }
 
 fn raw_connections(state: &SharedState) -> Vec<Value> {

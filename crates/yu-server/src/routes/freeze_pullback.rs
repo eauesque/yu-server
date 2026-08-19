@@ -511,7 +511,7 @@ pub async fn generate(
     let hub = state.sse_hub.clone();
 
     tokio::spawn(async move {
-        send_sse(&hub, "FPB_START", json!({"job_id": JOB_ID}));
+        send_sse(&hub, "fpb.start", json!({"job_id": JOB_ID}));
         match render_video(params, jm.clone(), hub.clone(), cancel).await {
             Ok(path) => {
                 let fname = path
@@ -522,13 +522,13 @@ pub async fn generate(
                 jm.finish(JOB_ID, Some(json!({"filename": fname})), None);
                 send_sse(
                     &hub,
-                    "FPB_COMPLETE",
+                    "fpb.complete",
                     json!({"job_id": JOB_ID, "filename": fname}),
                 );
             }
             Err(e) => {
                 jm.finish(JOB_ID, None, Some(e.clone()));
-                send_sse(&hub, "FPB_ERROR", json!({"job_id": JOB_ID, "error": e}));
+                send_sse(&hub, "fpb.error", json!({"job_id": JOB_ID, "error": e}));
             }
         }
     });

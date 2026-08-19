@@ -34,6 +34,12 @@ pub async fn get_file_row(pool: &SqlitePool, path: &str) -> Result<Option<FileRo
     Ok(row)
 }
 
+/// Inserts or updates a file record.
+///
+/// The sole production caller, the watcher, does not parse files and always passes
+/// `meta_source: None`; overwriting it would discard existing analysis results. This
+/// matches Python's BUG-58 fix in `scanner_regular.py`. A `Some` value still updates
+/// the source, but `None` therefore cannot be used to deliberately clear it.
 pub async fn upsert_file(pool: &SqlitePool, p: UpsertFileParams<'_>) -> Result<i64, TagdbError> {
     let is_zip = p.is_zip_member as i64;
     let row: (i64,) = sqlx::query_as(
@@ -44,7 +50,7 @@ pub async fn upsert_file(pool: &SqlitePool, p: UpsertFileParams<'_>) -> Result<i
            mtime          = excluded.mtime,
            size           = excluded.size,
            hash           = COALESCE(excluded.hash, files.hash),
-           meta_source    = excluded.meta_source,
+           meta_source    = COALESCE(excluded.meta_source, files.meta_source),
            is_deleted     = 0,
            is_zip_member  = excluded.is_zip_member,
            parser_version = excluded.parser_version,
@@ -204,5 +210,69 @@ mod tests {
         .unwrap();
         let row = get_file_row(&pool, "/img/c.png").await.unwrap().unwrap();
         assert_eq!(row.hash.as_deref(), Some("abc"));
+    }
+
+    #[tokio::test]
+    async fn test_upsert_preserves_existing_meta_source_when_null_and_updates_non_null_value() {
+        let (_f, pool) = pool_with_files_table().await;
+        upsert_file(
+            &pool,
+            UpsertFileParams {
+                meta_source: Some("novelai"),
+                ..params("/img/meta.png")
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE files SET parser_version = 0 WHERE path = ?")
+            .bind("/img/meta.png")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        upsert_file(
+            &pool,
+            UpsertFileParams {
+                mtime: 2000,
+                size: 1024,
+                meta_source: None,
+                ..params("/img/meta.png")
+            },
+        )
+        .await
+        .unwrap();
+        let row: (Option<String>, i64, i64, i64) = sqlx::query_as(
+            "SELECT meta_source, mtime, size, parser_version FROM files WHERE path = ?",
+        )
+        .bind("/img/meta.png")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row,
+            (
+                Some("novelai".into()),
+                2000,
+                1024,
+                CURRENT_PARSER_VERSION as i64,
+            )
+        );
+
+        upsert_file(
+            &pool,
+            UpsertFileParams {
+                meta_source: Some("stable-diffusion"),
+                ..params("/img/meta.png")
+            },
+        )
+        .await
+        .unwrap();
+        let meta_source: (Option<String>,) =
+            sqlx::query_as("SELECT meta_source FROM files WHERE path = ?")
+                .bind("/img/meta.png")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(meta_source.0.as_deref(), Some("stable-diffusion"));
     }
 }

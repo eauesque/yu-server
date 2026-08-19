@@ -48,7 +48,10 @@ pub fn verify_key(config_path: &Path, bearer_token: &str) -> Option<KeyInfo> {
         return None;
     }
     let raw = fs::read_to_string(config_path).ok()?;
-    let config = serde_json::from_str::<ConfigFile>(&raw).ok()?;
+    // Goes through config_io so a `config.toml` deployment authenticates API
+    // keys instead of silently seeing an empty key list.
+    let config: ConfigFile =
+        serde_json::from_value(crate::config_io::parse(config_path, &raw)?).ok()?;
     let digest = Sha256::digest(bearer_token.as_bytes());
     let digest_hex = hex::encode(digest);
     for key in config.api_keys {
@@ -197,5 +200,32 @@ mod tests {
 
         assert!(key_has_scope(&key, "read"));
         assert!(!key_has_scope(&key, "admin"));
+    }
+
+    /// `main.rs` hands routes a `config.toml` path whenever that file exists.
+    /// Parsing it as JSON left the key list empty, so every Bearer key was
+    /// rejected on such deployments.
+    #[test]
+    fn verify_key_reads_a_toml_config() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("yu-server-apikey-{suffix}.toml"));
+        let hash = hex::encode(Sha256::digest(raw_key().as_bytes()));
+        fs::write(
+            &path,
+            format!(
+                "[[api_keys]]\nid = \"ak_test\"\nkey_hash = \"{hash}\"\n\
+                 key_prefix = \"sk_0123456\"\nlabel = \"Test key\"\n\
+                 created_at = 1\nscopes = [\"admin\"]\n"
+            ),
+        )
+        .unwrap();
+
+        let info = verify_key(&path, &raw_key()).expect("TOML config must authenticate");
+        assert_eq!(info.id, "ak_test");
+        assert_eq!(info.scopes, Some(vec!["admin".to_string()]));
+        let _ = fs::remove_file(path);
     }
 }

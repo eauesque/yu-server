@@ -451,7 +451,7 @@ fn hailo_hef_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("hailo_models"))
 }
 
-fn is_hailo_hef_available(model_name: &str) -> bool {
+pub(crate) fn is_hailo_hef_available(model_name: &str) -> bool {
     let Some(filename) = hailo_model_filename(model_name) else {
         return false;
     };
@@ -1397,7 +1397,8 @@ pub async fn analysis_servers_discovered_register(
         .trim()
         .to_string();
     let config_path = state.config.config_path.clone();
-    let mut config = crate::routes::settings::load_config_json(&config_path);
+    let _guard = state.settings_lock.lock().await;
+    let mut config = crate::config_io::load(&config_path);
     let servers = config
         .get("ai_servers")
         .and_then(Value::as_array)
@@ -1430,8 +1431,8 @@ pub async fn analysis_servers_discovered_register(
                     .into_response();
             }
             let host_label = base_url
-                .splitn(2, "://")
-                .nth(1)
+                .split_once("://")
+                .map(|x| x.1)
                 .unwrap_or(&base_url)
                 .to_string();
             let name = data
@@ -1476,8 +1477,8 @@ pub async fn analysis_servers_discovered_register(
                     .into_response();
             }
             let host_label = base_url
-                .splitn(2, "://")
-                .nth(1)
+                .split_once("://")
+                .map(|x| x.1)
                 .unwrap_or(&base_url)
                 .to_string();
             let name = data
@@ -1574,9 +1575,7 @@ pub async fn analysis_servers_discovered_register(
         {
             let new_ignored: Vec<Value> = ignored
                 .into_iter()
-                .filter(|v| {
-                    v.as_str().map(|u| normalize_base_url_simple(u)) != Some(base_url.clone())
-                })
+                .filter(|v| v.as_str().map(normalize_base_url_simple) != Some(base_url.clone()))
                 .collect();
             if new_ignored.is_empty() {
                 config
@@ -1588,7 +1587,7 @@ pub async fn analysis_servers_discovered_register(
         }
     }
 
-    crate::routes::settings::write_config_json(&config_path, &config);
+    crate::config_io::write(&config_path, &config);
     Json(json!({"success": true, "server": entry_json})).into_response()
 }
 
@@ -1696,7 +1695,8 @@ pub async fn analysis_servers_migrate(
     _body: axum::body::Bytes,
 ) -> axum::response::Response {
     let config_path = state.config.config_path.clone();
-    let mut config = crate::routes::settings::load_config_json(&config_path);
+    let _guard = state.settings_lock.lock().await;
+    let mut config = crate::config_io::load(&config_path);
     let has_servers = config
         .get("ai_servers")
         .and_then(Value::as_array)
@@ -1830,7 +1830,7 @@ pub async fn analysis_servers_migrate(
     if let Some(flo) = ai.get("fallback_local_only") {
         config["ai_servers_fallback_local_only"] = flo.clone();
     }
-    crate::routes::settings::write_config_json(&config_path, &config);
+    crate::config_io::write(&config_path, &config);
     Json(json!({"success": true, "servers": servers, "migrated": migrated})).into_response()
 }
 
@@ -1878,7 +1878,8 @@ pub async fn analysis_servers_discovered_match_post(
             .into_response();
     }
     let config_path = state.config.config_path.clone();
-    let mut config = crate::routes::settings::load_config_json(&config_path);
+    let _guard = state.settings_lock.lock().await;
+    let mut config = crate::config_io::load(&config_path);
     let servers = config
         .get("ai_servers")
         .and_then(Value::as_array)
@@ -1916,7 +1917,7 @@ pub async fn analysis_servers_discovered_match_post(
         json!({"server_id": matched_id, "provider": provider, "matched_at": now}),
     );
     config["ai_servers_discovery_matches"] = Value::Object(matches_map);
-    crate::routes::settings::write_config_json(&config_path, &config);
+    crate::config_io::write(&config_path, &config);
     Json(json!({"success": true, "server_id": matched_id, "server_name": matched_name}))
         .into_response()
 }
@@ -1937,7 +1938,8 @@ pub async fn analysis_servers_discovered_match_delete(
             .into_response();
     }
     let config_path = state.config.config_path.clone();
-    let mut config = crate::routes::settings::load_config_json(&config_path);
+    let _guard = state.settings_lock.lock().await;
+    let mut config = crate::config_io::load(&config_path);
     let mut matches_map = config
         .get("ai_servers_discovery_matches")
         .and_then(Value::as_object)
@@ -1954,7 +1956,7 @@ pub async fn analysis_servers_discovered_match_delete(
     } else {
         config["ai_servers_discovery_matches"] = Value::Object(matches_map);
     }
-    crate::routes::settings::write_config_json(&config_path, &config);
+    crate::config_io::write(&config_path, &config);
     Json(json!({"success": true})).into_response()
 }
 
@@ -1983,7 +1985,8 @@ pub async fn analysis_servers_discovered_ignore_post(
             .into_response();
     }
     let config_path = state.config.config_path.clone();
-    let mut config = crate::routes::settings::load_config_json(&config_path);
+    let _guard = state.settings_lock.lock().await;
+    let mut config = crate::config_io::load(&config_path);
     let mut ignored: std::collections::BTreeSet<String> = config
         .get("ai_servers_discovery_ignored")
         .and_then(Value::as_array)
@@ -1996,7 +1999,7 @@ pub async fn analysis_servers_discovered_ignore_post(
     ignored.insert(base_url);
     config["ai_servers_discovery_ignored"] =
         Value::Array(ignored.into_iter().map(Value::String).collect());
-    crate::routes::settings::write_config_json(&config_path, &config);
+    crate::config_io::write(&config_path, &config);
     Json(json!({"success": true})).into_response()
 }
 
@@ -2016,7 +2019,8 @@ pub async fn analysis_servers_discovered_ignore_delete(
             .into_response();
     }
     let config_path = state.config.config_path.clone();
-    let mut config = crate::routes::settings::load_config_json(&config_path);
+    let _guard = state.settings_lock.lock().await;
+    let mut config = crate::config_io::load(&config_path);
     let mut ignored: std::collections::BTreeSet<String> = config
         .get("ai_servers_discovery_ignored")
         .and_then(Value::as_array)
@@ -2038,7 +2042,7 @@ pub async fn analysis_servers_discovered_ignore_delete(
         config["ai_servers_discovery_ignored"] =
             Value::Array(ignored.into_iter().map(Value::String).collect());
     }
-    crate::routes::settings::write_config_json(&config_path, &config);
+    crate::config_io::write(&config_path, &config);
     Json(json!({"success": true})).into_response()
 }
 
@@ -2147,7 +2151,7 @@ pub async fn analysis_config_get(
     {
         return r;
     }
-    let config = crate::routes::settings::load_config_json(&state.config.config_path);
+    let config = crate::config_io::load(&state.config.config_path);
     let mut ai = config.get("ai_analysis").cloned().unwrap_or(json!({}));
 
     for key in ["api_key", "openai_api_key", "openai_compat_api_key"] {
@@ -2200,8 +2204,9 @@ pub async fn analysis_config_post(
     };
     let config_path = state.config.config_path.clone();
     let project_root = state.config.project_root.clone();
+    let _guard = state.settings_lock.lock().await;
     let result = tokio::task::spawn_blocking(move || {
-        let mut config = crate::routes::settings::load_config_json(&config_path);
+        let mut config = crate::config_io::load(&config_path);
         if !config["ai_analysis"].is_object() {
             config["ai_analysis"] = json!({});
         }
@@ -2236,7 +2241,7 @@ pub async fn analysis_config_post(
             };
             config["ai_analysis"][key] = stored;
         }
-        crate::routes::settings::write_config_json(&config_path, &config)
+        crate::config_io::write(&config_path, &config)
     })
     .await;
 

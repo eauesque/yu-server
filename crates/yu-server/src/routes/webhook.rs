@@ -17,11 +17,9 @@ use sqlx::Row;
 
 use crate::{
     auth::{scope::require_admin_scope, AuthContext},
-    secret_store,
+    ext_config, secret_store,
     state::SharedState,
 };
-
-use super::ext_config;
 
 fn api_success(payload: Value, status: StatusCode) -> Response {
     let mut body = match payload {
@@ -263,6 +261,7 @@ pub async fn create_webhook(
     if validate_webhook_url(url).is_err() {
         return api_error("Invalid webhook configuration", StatusCode::BAD_REQUEST);
     }
+    let _guard = state.settings_lock.lock().await;
     let mut config = match ext_config::read_config(&state.config.config_path) {
         Ok(config) => config,
         Err(error) => return internal_error(error, "failed to read webhook config"),
@@ -286,7 +285,7 @@ pub async fn create_webhook(
         "created_at": now,
     });
     config_array_mut(&mut config, "webhooks").push(entry.clone());
-    if let Err(error) = ext_config::write_config(&state.config.config_path, &config) {
+    if let Err(error) = crate::config_io::write(&state.config.config_path, &config) {
         return internal_error(error, "failed to write webhook config");
     }
     notify_webhooks_changed(&state);
@@ -327,6 +326,7 @@ pub async fn update_webhook(
             return api_error("Invalid webhook update", StatusCode::BAD_REQUEST);
         }
     }
+    let _guard = state.settings_lock.lock().await;
     let mut config = match ext_config::read_config(&state.config.config_path) {
         Ok(config) => config,
         Err(error) => return internal_error(error, "failed to read webhook config"),
@@ -344,7 +344,7 @@ pub async fn update_webhook(
         }
     }
     let updated = hooks[idx].clone();
-    if let Err(error) = ext_config::write_config(&state.config.config_path, &config) {
+    if let Err(error) = crate::config_io::write(&state.config.config_path, &config) {
         return internal_error(error, "failed to write webhook config");
     }
     notify_webhooks_changed(&state);
@@ -359,6 +359,7 @@ pub async fn delete_webhook(
     if let Some(r) = admin_scope_error(&state, auth_context.as_ref()) {
         return r;
     }
+    let _guard = state.settings_lock.lock().await;
     let mut config = match ext_config::read_config(&state.config.config_path) {
         Ok(config) => config,
         Err(error) => return internal_error(error, "failed to read webhook config"),
@@ -369,7 +370,7 @@ pub async fn delete_webhook(
     if hooks.len() == before {
         return api_error("Webhook not found", StatusCode::NOT_FOUND);
     }
-    if let Err(error) = ext_config::write_config(&state.config.config_path, &config) {
+    if let Err(error) = crate::config_io::write(&state.config.config_path, &config) {
         return internal_error(error, "failed to write webhook config");
     }
     notify_webhooks_changed(&state);
@@ -459,12 +460,13 @@ pub async fn create_inbound_webhook(
         "active": true,
         "created_at": now,
     });
+    let _guard = state.settings_lock.lock().await;
     let mut config = match ext_config::read_config(&state.config.config_path) {
         Ok(config) => config,
         Err(error) => return internal_error(error, "failed to read inbound webhook config"),
     };
     config_array_mut(&mut config, "inbound_webhooks").push(entry.clone());
-    if let Err(error) = ext_config::write_config(&state.config.config_path, &config) {
+    if let Err(error) = crate::config_io::write(&state.config.config_path, &config) {
         return internal_error(error, "failed to write inbound webhook config");
     }
     notify_webhooks_changed(&state);
@@ -500,6 +502,7 @@ pub async fn update_inbound_webhook(
     if let Some(r) = admin_scope_error(&state, auth_context.as_ref()) {
         return r;
     }
+    let _guard = state.settings_lock.lock().await;
     let mut config = match ext_config::read_config(&state.config.config_path) {
         Ok(config) => config,
         Err(error) => return internal_error(error, "failed to read inbound webhook config"),
@@ -517,7 +520,7 @@ pub async fn update_inbound_webhook(
         }
     }
     let updated = hooks[idx].clone();
-    if let Err(error) = ext_config::write_config(&state.config.config_path, &config) {
+    if let Err(error) = crate::config_io::write(&state.config.config_path, &config) {
         return internal_error(error, "failed to write inbound webhook config");
     }
     notify_webhooks_changed(&state);
@@ -532,6 +535,7 @@ pub async fn delete_inbound_webhook(
     if let Some(r) = admin_scope_error(&state, auth_context.as_ref()) {
         return r;
     }
+    let _guard = state.settings_lock.lock().await;
     let mut config = match ext_config::read_config(&state.config.config_path) {
         Ok(config) => config,
         Err(error) => return internal_error(error, "failed to read inbound webhook config"),
@@ -542,7 +546,7 @@ pub async fn delete_inbound_webhook(
     if hooks.len() == before {
         return api_error("Inbound webhook not found", StatusCode::NOT_FOUND);
     }
-    if let Err(error) = ext_config::write_config(&state.config.config_path, &config) {
+    if let Err(error) = crate::config_io::write(&state.config.config_path, &config) {
         return internal_error(error, "failed to write inbound webhook config");
     }
     notify_webhooks_changed(&state);
@@ -598,6 +602,10 @@ mod tests {
             .await
             .unwrap();
         let state = Arc::new(AppState {
+            effective_port: 5000,
+            gateway_keys: Vec::new(),
+            gateway_loopback_bypass: true,
+            settings_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             config: Config {
                 db_path: "sqlite::memory:".to_string(),
                 pin_hash: String::new(),
@@ -630,7 +638,7 @@ mod tests {
             vectors_db: pool.clone(),
             vectors_db_read: pool,
             clip_index: std::sync::Arc::new(
-                crate::routes::clip_index::ClipIndex::new_default(&std::env::temp_dir())
+                crate::routes::clip_index::ClipIndex::new_default(std::env::temp_dir())
                     .expect("clip index test default"),
             ),
             clip_indexer: std::sync::Arc::new(crate::routes::clip_indexer::ClipIndexer::new()),
@@ -657,6 +665,7 @@ mod tests {
             infer_client: None,
             infer_child: None,
             scan_manager: std::sync::OnceLock::new(),
+            hailo_yolo_stream: None,
             stats_basic_cache: crate::state::TtlCache::new(crate::state::STATS_CACHE_TTL),
             stats_models_cache: crate::state::TtlCache::new(crate::state::STATS_CACHE_TTL),
             checkpoints_cache: crate::state::TtlCache::new(crate::state::STATS_CACHE_TTL),
@@ -782,10 +791,7 @@ mod tests {
         let result = validate_webhook_url_with_resolver(
             "http://127.0.0.1/hook",
             &MockResolver {
-                result: Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "should not resolve",
-                )),
+                result: Err(std::io::Error::other("should not resolve")),
             },
         );
         std::env::remove_var("ALLOW_LOOPBACK_WEBHOOK");

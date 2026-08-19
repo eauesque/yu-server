@@ -82,6 +82,55 @@ pub(crate) fn encrypt_for_test(plaintext: &str, fernet_key: &[u8]) -> String {
     encrypt_fernet_for_test(plaintext, fernet_key)
 }
 
+/// Mask the secret-bearing parts of a URL while keeping it recognisable.
+///
+/// `mask_secret` is wrong for URLs: the URL is the only human-readable handle a
+/// stream source has, so masking it whole makes several cameras indistinguishable
+/// in the UI. Only userinfo, query values and the fragment can carry credentials;
+/// scheme, host, port and path cannot.
+///
+/// Anything that does not parse as a URL is returned unchanged when it cannot
+/// hold a credential (`0`, `/dev/video0`), and falls back to `mask_secret`
+/// otherwise.
+pub fn mask_url(raw: &str) -> String {
+    // `user:pass@host` parses as scheme `user:` with an opaque path, so parsing alone
+    // is not enough — without an authority there is no userinfo to strip and the
+    // password would survive untouched.
+    let parsed = url::Url::parse(raw).ok().filter(url::Url::has_authority);
+    let Some(mut url) = parsed else {
+        // No delimiter, no credential. A bare device index or path is not a secret.
+        if !raw.contains([':', '@', '?', '#']) {
+            return raw.to_string();
+        }
+        return mask_secret(raw);
+    };
+
+    if !url.username().is_empty() || url.password().is_some() {
+        // Mask the username too: `http://<token>@host/` puts the whole credential there.
+        if url.set_username("***").is_err() || url.set_password(None).is_err() {
+            return mask_secret(raw);
+        }
+    }
+
+    if let Some(query) = url.query() {
+        let masked: Vec<String> = url
+            .query_pairs()
+            .map(|(key, _)| format!("{}=***", urlencoding::encode(&key)))
+            .collect();
+        if query.is_empty() {
+            url.set_query(Some(""));
+        } else {
+            url.set_query(Some(&masked.join("&")));
+        }
+    }
+
+    if url.fragment().is_some() {
+        url.set_fragment(Some("***"));
+    }
+
+    url.to_string()
+}
+
 pub fn data_dir(project_root: &Path) -> PathBuf {
     std::env::var_os("TAGDB_DATA_DIR")
         .map(PathBuf::from)
@@ -285,7 +334,7 @@ fn validate_export_data(data: &serde_json::Value) -> Option<String> {
     if data["version"].as_u64() != Some(EXPORT_VERSION as u64) {
         return Some(format!("未対応のバージョンです: {}", data["version"]));
     }
-    if data["iterations"].as_u64().map_or(true, |v| v < 1) {
+    if data["iterations"].as_u64().is_none_or(|v| v < 1) {
         return Some("iterations が不正です".to_string());
     }
     None
@@ -505,6 +554,64 @@ mod tests {
     }
 
     #[test]
+    fn mask_url_golden_vectors() {
+        // Pinned so a `url` crate upgrade cannot silently change what we disclose.
+        let cases: &[(&str, &str)] = &[
+            // userinfo: the username is masked too, it can be the whole credential
+            (
+                "rtsp://user:pass@cam.local/live",
+                "rtsp://***@cam.local/live",
+            ),
+            (
+                "http://tokenonly@cam.local/live",
+                "http://***@cam.local/live",
+            ),
+            ("rtsp://user:@cam.local/live", "rtsp://***@cam.local/live"),
+            // query values go, keys stay
+            (
+                "rtsp://cam.local/live?token=abc123",
+                "rtsp://cam.local/live?token=***",
+            ),
+            ("https://h/p?a=&b=1", "https://h/p?a=***&b=***"),
+            ("https://h/p?a=1&a=2", "https://h/p?a=***&a=***"),
+            ("https://h/p?a%20b=1", "https://h/p?a%20b=***"),
+            // fragment can carry an access token
+            ("https://h/cb#access_token=xyz", "https://h/cb#***"),
+            // nothing secret to remove
+            ("http://127.0.0.1:8080/hook", "http://127.0.0.1:8080/hook"),
+            ("https://h/p?", "https://h/p?"),
+            // not a URL, cannot hold a credential
+            ("0", "0"),
+            ("/dev/video0", "/dev/video0"),
+            ("", ""),
+            // not a URL but holds a delimiter: fall back to a full mask
+            ("://:@?", "****"),
+            ("user:pass@host", "u****t"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(&mask_url(input), expected, "mask_url({input:?})");
+        }
+    }
+
+    #[test]
+    fn mask_url_keeps_no_credential_substring() {
+        let secrets = ["camera-password", "abc123", "tokenonly"];
+        let inputs = [
+            "rtsp://camera-user:camera-password@example.test/live?t=abc123",
+            "http://tokenonly@example.test/live",
+        ];
+        for input in inputs {
+            let masked = mask_url(input);
+            for secret in secrets {
+                assert!(
+                    !masked.contains(secret),
+                    "mask_url({input:?}) leaked {secret:?}: {masked}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn decrypt_plaintext_passthrough() {
         assert_eq!(decrypt("plain", Path::new(".")), "plain");
         assert_eq!(decrypt("", Path::new(".")), "");
@@ -577,7 +684,16 @@ mod tests {
             .join("secret_store");
         let encrypted = encrypt("rust-to-python-secret", &root);
 
-        assert!(encrypted.starts_with("enc:v2:k_20260610b7a1daa4:"));
+        // Read the id from the fixture rather than pinning it, so regenerating
+        // with `scripts/internal/gen_secret_store_fixture.py` does not break this.
+        let tokens: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("tokens.json")).unwrap())
+                .unwrap();
+        let key_id = tokens.get("key_id").and_then(Value::as_str).unwrap();
+        assert!(
+            encrypted.starts_with(&format!("enc:v2:{key_id}:")),
+            "encrypted={encrypted}"
+        );
         assert_eq!(decrypt(&encrypted, &root), "rust-to-python-secret");
     }
 

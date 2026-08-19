@@ -6,11 +6,34 @@
     unused_mut,
     unused_variables
 )]
+// Structurally accepted clippy lints (2026-08-11 決定). These are not deferred
+// work: each was evaluated and kept. Everything else in this crate is expected
+// to be clippy-clean, so a new warning here is a real finding.
+//
+// - result_large_err: 8 sites, all `Result<T, Response>`. axum's `Response`
+//   exceeds the 128-byte threshold by construction. This is the crate-wide
+//   idiom for early-return inside handlers; boxing the error would break every
+//   `?` at the call sites and buy nothing — the value is returned, not stored.
+// - await_holding_lock: 7 sites, all inside `#[cfg(test)]`. They hold a
+//   process-global seam lock (`ENV_MUTATION_TEST_LOCK`, the hailo registry
+//   guards) across await to serialize env mutation while tests run in parallel
+//   threads. Same call as `crates/lan-cowork/src/lib.rs` made for its own seam
+//   lock; the lint cannot reach production code here.
+// - too_many_arguments / type_complexity: handler signatures are dictated by
+//   axum extractors; splitting them would hide the wiring rather than simplify it.
+#![allow(
+    clippy::result_large_err,
+    clippy::await_holding_lock,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 
 mod analysis_engines;
 mod approval_gate;
 mod auth;
+mod config_io;
 mod csrf;
+mod ext_config;
 mod frontend;
 mod groups_index;
 mod infer_auth;
@@ -362,11 +385,13 @@ fn load_env_file_override(path: &Path) {
 /// so seeding config.toml on top of an existing config.json would make `load_config`
 /// silently prefer the fresh, empty config.toml and orphan all settings already saved
 /// in config.json (split-brain config).
+/// Keep config.json before config.toml below: the guard relies on JSON being seeded first;
+/// reversing that order lets both files be created on a fresh install.
 fn seed_example_files(dir: &Path) {
     for (src_name, dst_name) in [
         ("launch-args.txt.example", "launch-args.txt"),
-        ("config.toml.example", "config.toml"),
         ("config.json.example", "config.json"),
+        ("config.toml.example", "config.toml"),
     ] {
         let src = dir.join(src_name);
         let dst = dir.join(dst_name);
@@ -689,7 +714,7 @@ async fn main() {
     // Deliberate asymmetry: server_cfg keeps pre-profile host/port/LAN/PIN settings,
     // while native_daemon uses merged config to match configured_peer_name later.
     let native_daemon_config =
-        crate::routes::ext_config::extension_value(&app_config, "builtin-lan-cowork", "enabled")
+        crate::ext_config::extension_value(&app_config, "builtin-lan-cowork", "enabled")
             .and_then(|value| value.as_bool());
     let native_daemon_env = std::env::var_os("YU_LAN_COWORK_NATIVE_DAEMON")
         .map(|_| env_truthy("YU_LAN_COWORK_NATIVE_DAEMON"));
@@ -906,13 +931,14 @@ async fn main() {
             infer_client,
             infer_child,
         )
-        .await,
+        .await
+        .with_effective_port(effective_port),
     );
     // LAN-Cowork-owned state, decoupled from `AppState`/`SharedState`. Owns
-    // the peer-registry/fleet-manager/settings-lock `Arc`s directly (they are
-    // no longer fields on `AppState`) and hands the SAME instances to
-    // `LanCoworkState::new` — see that function's doc comment and the S3
-    // decoupling plan's §6 warnings on `OnceLock`/mutex identity splitting.
+    // the peer-registry/fleet-manager `Arc`s directly and shares AppState's
+    // settings lock because both crates write the same config.json. Hands the
+    // SAME instances to `LanCoworkState::new` — see that function's doc comment
+    // and the S3 decoupling plan's §6 warnings on identity splitting.
     // Built here (before the peer-registry/fleet-manager/pairing-sweeper
     // wiring below) because those call sites now take `&LanCoworkState`;
     // `peer_registry`'s `OnceLock` is shared by `Arc`, so `lc_state
@@ -920,7 +946,7 @@ async fn main() {
     // clone of it) is held.
     let lc_peer_registry = Arc::new(std::sync::OnceLock::new());
     let lc_fleet_manager = Arc::new(routes::lan_cowork_fleet_manager::FleetManager::new());
-    let lc_settings_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let lc_settings_lock = Arc::clone(&shared.settings_lock);
     let lc_state = routes::lan_cowork_host::LanCoworkState::new(
         &shared,
         Arc::clone(&lc_peer_registry),
@@ -2715,60 +2741,11 @@ async fn main() {
             "/ext/hailo-yolo/api/detect/clear",
             post(routes::hailo_yolo_detect::detect_clear_handler),
         )
-        .route(
-            "/ext/hailo-yolo/api/stream/sources",
-            get(routes::auto_stubs::hailo_yolo_stream_sources_get)
-                .post(routes::auto_stubs::hailo_yolo_stream_sources_post),
-        )
-        .route(
-            "/ext/hailo-yolo/api/stream/rules",
-            get(routes::auto_stubs::hailo_yolo_stream_rules_get)
-                .post(routes::auto_stubs::hailo_yolo_stream_rules_post),
-        )
-        .route(
-            "/ext/hailo-yolo/api/stream/status",
-            get(routes::auto_stubs::hailo_yolo_stream_status),
-        )
+        // T9 cutover: all fifteen stream contracts are served by the native router.
+        .merge(routes::hailo_yolo_stream::handlers::routes())
         .route(
             "/ext/hailo-yolo/api/detect/results/{file_id}",
             get(routes::hailo_yolo_detect::detect_results_handler),
-        )
-        .route(
-            "/ext/hailo-yolo/api/stream/sources/{source_id}/start",
-            post(routes::auto_stubs::hailo_yolo_stream_source_start),
-        )
-        .route(
-            "/ext/hailo-yolo/api/stream/sources/{source_id}/stop",
-            post(routes::auto_stubs::hailo_yolo_stream_source_stop),
-        )
-        .route(
-            "/ext/hailo-yolo/api/stream/sources/{source_id}",
-            axum::routing::delete(routes::auto_stubs::hailo_yolo_stream_source_delete),
-        )
-        .route(
-            "/ext/hailo-yolo/api/stream/sources/{source_id}/test",
-            post(routes::auto_stubs::hailo_yolo_stream_source_test),
-        )
-        .route(
-            "/ext/hailo-yolo/api/stream/devices",
-            get(routes::auto_stubs::hailo_yolo_stream_devices),
-        )
-        .route(
-            "/ext/hailo-yolo/api/stream/{source_id}/mjpeg",
-            get(routes::auto_stubs::hailo_yolo_stream_mjpeg),
-        )
-        .route(
-            "/ext/hailo-yolo/api/stream/recordings",
-            get(routes::auto_stubs::hailo_yolo_stream_recordings),
-        )
-        .route(
-            "/ext/hailo-yolo/api/stream/snapshot/{filename}",
-            get(routes::auto_stubs::hailo_yolo_stream_snapshot),
-        )
-        .route(
-            "/ext/hailo-yolo/api/stream/rules/{rule_id}",
-            axum::routing::put(routes::auto_stubs::hailo_yolo_stream_rule_update)
-                .delete(routes::auto_stubs::hailo_yolo_stream_rule_delete),
         )
         .route(
             "/ext/hailo-genai/api/s2t/transcribe",
@@ -3251,6 +3228,9 @@ async fn main() {
     )
     .with_graceful_shutdown(async move {
         wait_shutdown_signal().await;
+        if let Some(stream) = &shutdown_state.hailo_yolo_stream {
+            stream.shutdown().await;
+        }
         if let Some(infer_child) = &shutdown_state.infer_child {
             match infer_child.lock() {
                 Ok(mut child) => infer_manager::terminate_child(&mut child),
@@ -3306,6 +3286,35 @@ mod tests {
         assert!(super::is_loopback_host("localhost"));
         assert!(!super::is_loopback_host("0.0.0.0"));
         assert!(!super::is_loopback_host("192.168.1.2"));
+    }
+
+    #[test]
+    fn seed_example_files_prefers_json_and_preserves_existing_toml() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("launch-args.txt.example"),
+            "--standalone\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("config.toml.example"),
+            "[server]\nport = 5000\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("config.json.example"), "{}\n").unwrap();
+
+        super::seed_example_files(root.path());
+
+        assert!(root.path().join("config.json").exists());
+        assert!(!root.path().join("config.toml").exists());
+
+        let existing = "[server]\nport = 1234\n";
+        std::fs::write(root.path().join("config.toml"), existing).unwrap();
+        super::seed_example_files(root.path());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("config.toml")).unwrap(),
+            existing
+        );
     }
 
     #[tokio::test]

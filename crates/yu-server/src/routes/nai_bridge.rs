@@ -1,6 +1,3 @@
-use std::io::Read;
-use std::path::Path;
-
 use axum::{
     extract::{Extension, Multipart, State},
     http::StatusCode,
@@ -11,7 +8,9 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::io::Read;
 
+use crate::config_io::{load as load_config_json, write as write_config_json};
 use crate::{
     auth::scope::{require_admin_scope, AuthContext},
     secret_store,
@@ -48,42 +47,6 @@ static NOISE_SCHEDULES: &[(&str, &str)] = &[
 
 static IMAGE_FORMATS: &[&str] = &["png", "webp", "jpg"];
 static SAVE_NAMING_OPTIONS: &[&str] = &["daily_folder", "flat", "by_model"];
-
-// ── config helpers ────────────────────────────────────────────────────────────
-
-fn load_config_json(config_path: &Path) -> Value {
-    for path in [
-        config_path.to_path_buf(),
-        std::path::PathBuf::from("config.json"),
-        std::path::PathBuf::from("tagdb_config.json"),
-    ] {
-        if path.exists() {
-            return std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|raw| serde_json::from_str(&raw).ok())
-                .unwrap_or_else(|| json!({}));
-        }
-    }
-    json!({})
-}
-
-fn write_config_json(config_path: &Path, config: &Value) -> Result<(), std::io::Error> {
-    let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(
-        ".nai_cfg_{}_{}.tmp",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-    ));
-    let text = serde_json::to_string_pretty(config)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&tmp, format!("{text}\n"))?;
-    std::fs::rename(&tmp, config_path)?;
-    Ok(())
-}
 
 fn ext_config(state: &SharedState) -> Value {
     let full = load_config_json(&state.config.config_path);
@@ -124,16 +87,20 @@ fn mask_secret(s: &str) -> String {
 
 // ── response helpers ──────────────────────────────────────────────────────────
 
+// Matches Python's api_success(payload): `{"ok": True, "error": None, "data": None}`
+// updated with the payload dict — so payload keys win, including `data` itself.
+// The base must be inserted first for that to hold; the sibling helper in
+// `sd_webui_bridge.rs` does the same.
 fn api_ok(data: Value) -> Json<Value> {
     let mut body = serde_json::Map::new();
+    body.insert("ok".to_string(), json!(true));
+    body.insert("error".to_string(), json!(null));
+    body.insert("data".to_string(), json!(null));
     if let Some(obj) = data.as_object() {
         for (k, v) in obj {
             body.insert(k.clone(), v.clone());
         }
     }
-    body.insert("ok".to_string(), json!(true));
-    body.insert("error".to_string(), json!(null));
-    body.insert("data".to_string(), json!(null));
     Json(Value::Object(body))
 }
 
@@ -878,7 +845,7 @@ async fn save_batch(
 
     let sweep_meta = body_json
         .get("sweep_meta")
-        .and_then(|v| crate::routes::sweep_common::validate_sweep_meta(v));
+        .and_then(crate::routes::sweep_common::validate_sweep_meta);
 
     let images: Vec<String> = body_json
         .get("images")
@@ -1243,6 +1210,10 @@ mod tests {
             .await
             .unwrap();
         Arc::new(AppState {
+            effective_port: 5000,
+            gateway_keys: Vec::new(),
+            gateway_loopback_bypass: true,
+            settings_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             config: Config {
                 db_path: "sqlite::memory:".to_string(),
                 pin_hash: String::new(),
@@ -1275,7 +1246,7 @@ mod tests {
             vectors_db: pool.clone(),
             vectors_db_read: pool,
             clip_index: std::sync::Arc::new(
-                crate::routes::clip_index::ClipIndex::new_default(&std::env::temp_dir())
+                crate::routes::clip_index::ClipIndex::new_default(std::env::temp_dir())
                     .expect("clip index test default"),
             ),
             clip_indexer: std::sync::Arc::new(crate::routes::clip_indexer::ClipIndexer::new()),
@@ -1302,6 +1273,7 @@ mod tests {
             infer_client: None,
             infer_child: None,
             scan_manager: std::sync::OnceLock::new(),
+            hailo_yolo_stream: None,
             stats_basic_cache: crate::state::TtlCache::new(crate::state::STATS_CACHE_TTL),
             stats_models_cache: crate::state::TtlCache::new(crate::state::STATS_CACHE_TTL),
             checkpoints_cache: crate::state::TtlCache::new(crate::state::STATS_CACHE_TTL),
@@ -1520,7 +1492,7 @@ mod tests {
         let state = test_state(&root).await;
         let (status, body) = get_json(test_app(state, None), "/ext/nai-bridge/info").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["data"]["bridge_id"], json!("nai"));
+        assert_eq!(body["bridge_id"], json!("nai"));
     }
 
     #[tokio::test]
@@ -1529,7 +1501,7 @@ mod tests {
         let state = test_state(&root).await;
         let (status, body) = get_json(test_app(state, None), "/ext/nai-bridge/api/models").await;
         assert_eq!(status, StatusCode::OK);
-        let models = body["data"]["models"].as_array().unwrap();
+        let models = body["models"].as_array().unwrap();
         assert_eq!(models.len(), 4);
         assert_eq!(models[0]["id"], json!("nai-diffusion-4-5-full"));
     }
@@ -1540,7 +1512,7 @@ mod tests {
         let state = test_state(&root).await;
         let (status, body) = get_json(test_app(state, None), "/ext/nai-bridge/api/samplers").await;
         assert_eq!(status, StatusCode::OK);
-        let samplers = body["data"]["samplers"].as_array().unwrap();
+        let samplers = body["samplers"].as_array().unwrap();
         assert_eq!(samplers.len(), 6);
         assert_eq!(samplers[0]["id"], json!("k_euler_ancestral"));
     }
@@ -1552,7 +1524,7 @@ mod tests {
         let (status, body) =
             get_json(test_app(state, None), "/ext/nai-bridge/api/noise-schedules").await;
         assert_eq!(status, StatusCode::OK);
-        let ns = body["data"]["noise_schedules"].as_array().unwrap();
+        let ns = body["noise_schedules"].as_array().unwrap();
         assert_eq!(ns.len(), 4);
         assert_eq!(ns[0]["id"], json!("karras"));
     }
@@ -1589,12 +1561,12 @@ mod tests {
         let state = test_state(&root).await;
         let (status, body) = get_json(test_app(state, admin()), "/ext/nai-bridge/api/config").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["data"]["api_token"], json!(""));
-        assert_eq!(
-            body["data"]["default_model"],
-            json!("nai-diffusion-4-5-full")
-        );
-        assert_eq!(body["data"]["default_image_format"], json!("png"));
+        // `api_ok` merges the payload at the top level (Python `api_success`
+        // shape); `data` stays null unless a handler puts one there.
+        assert_eq!(body["data"], json!(null));
+        assert_eq!(body["api_token"], json!(""));
+        assert_eq!(body["default_model"], json!("nai-diffusion-4-5-full"));
+        assert_eq!(body["default_image_format"], json!("png"));
     }
 
     #[tokio::test]

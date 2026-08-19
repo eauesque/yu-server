@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use tokio::fs;
 
-use crate::{auth::AuthContext, routes::ui, state::SharedState};
+use crate::{auth::AuthContext, config_io, routes::ui, state::SharedState};
 
 fn bad_request(code: &str, message: &str) -> Response {
     (
@@ -30,7 +30,7 @@ pub(crate) fn is_json_content_type(headers: &HeaderMap) -> bool {
 }
 
 pub async fn favicon(State(state): State<SharedState>) -> Response {
-    let config = ui::load_config_json(&state.config.config_path);
+    let config = config_io::load(&state.config.config_path);
     let active = ui::resolve_active_ui(&state.config.project_root, &config);
     let root = &state.config.project_root;
     let active_dir = root.join("ui").join(&active).join("static");
@@ -484,18 +484,8 @@ mod tests {
         assert_eq!(body["code"], "prompt_too_long");
     }
 
-    #[tokio::test]
-    async fn convert_expand_mode_reaches_python_relay() {
-        let root = temp_root("conv-expand");
-        let state = test_state(root.clone()).await;
-        let (status, body) = call_convert(
-            state,
-            serde_json::to_vec(&json!({"prompt":"test","mode":"expand"})).unwrap(),
-        )
-        .await;
-        let _ = fs::remove_dir_all(root);
-
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(body["error"], "not_implemented");
-    }
+    // `expand` モードの Python 中継を検める試験は削除した。expand は UI（`src/ts/`）にも
+    // Python 側（`extensions/builtin_sd_nai_convert/`）にも存在せず、handler は
+    // `nai_to_sd` / `sd_to_nai` 以外を 400 `invalid_mode` とする。未知 mode の
+    // 振舞いは `convert_invalid_mode_returns_400` が既に固定している。
 }

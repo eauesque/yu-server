@@ -211,8 +211,7 @@ pub async fn agent_journal(
         .get("limit")
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(50)
-        .min(200)
-        .max(1);
+        .clamp(1, 200);
     let offset = params
         .get("offset")
         .and_then(|s| s.parse::<i64>().ok())
@@ -268,8 +267,7 @@ pub async fn agent_undoable(
         .get("limit")
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(50)
-        .min(200)
-        .max(1);
+        .clamp(1, 200);
 
     match undoable_actions(&state.db_read, &session_id, limit).await {
         Ok(items) => {

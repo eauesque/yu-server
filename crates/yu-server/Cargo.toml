@@ -8,7 +8,7 @@ name = "yu-server"
 path = "src/main.rs"
 
 [dependencies]
-lan-cowork         = { path = "../lan-cowork" }
+lan-cowork         = { workspace = true }
 axum               = { workspace = true }
 tower              = { workspace = true }
 sqlx               = { workspace = true }
@@ -52,6 +52,7 @@ zip                = { version = "2", default-features = false, features = ["def
 zstd               = "0.13.3"
 async-trait        = "0.1"
 image              = { workspace = true }
+font8x8             = "0.3" # tiny bitmap labels for MJPEG overlays (MIT)
 dotenvy            = { workspace = true }
 toml               = { workspace = true }
 dirs               = "5"
@@ -69,8 +70,17 @@ socket2            = "0.6" # UDP discovery socket, AF_INET reuse-before-bind (MI
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
-lan-cowork = { path = "../lan-cowork", features = ["test-seams"] }
+lan-cowork = { workspace = true, features = ["test-seams"] }
 
 [features]
 default = ["python-backend"]

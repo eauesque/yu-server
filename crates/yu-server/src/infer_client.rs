@@ -216,12 +216,15 @@ impl InferClient {
     /// to re-stream to its own client. `messages` is an ordered chat history
     /// (`[{"role": ..., "content": ...}, ...]`) — yu-infer's LLM streaming
     /// endpoint is per-request stateless, so the full conversation must be
-    /// resent on every turn.
+    /// resent on every turn. `tools` is a list of OpenAI-function-style tool
+    /// definitions, forwarded to HailoRT's native `write(messages, tools)` so
+    /// the model's own chat template renders them (empty means no tools).
     #[allow(clippy::too_many_arguments)]
     pub async fn llm_generate_stream(
         &self,
         hef_path: Option<String>,
         messages: Vec<serde_json::Value>,
+        tools: Vec<serde_json::Value>,
         timeout_ms: Option<u32>,
         temperature: Option<f32>,
         top_p: Option<f32>,
@@ -238,6 +241,7 @@ impl InferClient {
             .json(&json!({
                 "hef_path": hef_path,
                 "messages": messages,
+                "tools": tools,
                 "timeout_ms": timeout_ms,
                 "temperature": temperature,
                 "top_p": top_p,

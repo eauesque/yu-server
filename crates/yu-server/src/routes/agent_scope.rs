@@ -340,7 +340,7 @@ mod tests {
         let o = load_overrides(&cfg);
         assert_eq!(o.get("foo_tool"), Some(&LEVEL_APPROVE));
         assert_eq!(o.get("bar_tool"), Some(&LEVEL_NOTIFY));
-        assert!(o.get("bad_tool").is_none()); // invalid level name ignored
+        assert!(!o.contains_key("bad_tool")); // invalid level name ignored
     }
 
     #[test]

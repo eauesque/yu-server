@@ -145,6 +145,13 @@ pub fn resolve_native_daemon(
 
 pub struct AppState {
     pub config: Config,
+    /// Actual listener port after CLI/environment overrides.
+    pub effective_port: u16,
+    /// Serializes read-modify-write operations on `config.json`.
+    ///
+    /// yu-server handlers and the lan-cowork crate share this same `Arc`. Because
+    /// both write the same `config.json`, they must use a single lock.
+    pub settings_lock: Arc<tokio::sync::Mutex<()>>,
     pub db: SqlitePool,
     pub db_read: SqlitePool,
     /// Write pool for Python-compatible `vectors.db`, stored next to `tags.db`.
@@ -156,6 +163,12 @@ pub struct AppState {
     /// Background job state for native CLIP image indexing.
     pub clip_indexer: Arc<crate::routes::clip_indexer::ClipIndexer>,
     pub inference_client: reqwest::Client,
+    /// Gateway API keys (`gateway.auth.api_keys`), decrypted once at startup.
+    /// Separate from the app's own `api_keys`; see [`crate::auth::gateway`].
+    /// Adding or revoking a gateway key requires a restart.
+    pub gateway_keys: Vec<crate::auth::gateway::GatewayKey>,
+    /// `gateway.auth.allow_loopback_bypass` (default true).
+    pub gateway_loopback_bypass: bool,
     pub python_client: reqwest::Client,
     pub quick_lock: QuickLock,
     pub rate_limiter: PinRateLimiter,
@@ -183,6 +196,8 @@ pub struct AppState {
     pub infer_client: Option<crate::infer_client::InferClient>,
     pub infer_child: Option<std::sync::Mutex<std::process::Child>>,
     pub scan_manager: std::sync::OnceLock<Arc<crate::scan_manager::ScanManager>>,
+    /// Native stream owners are initialized before the Python-forwarded routes are served.
+    pub hailo_yolo_stream: Option<Arc<crate::routes::hailo_yolo_stream::registry::StreamState>>,
     /// TTL caches for expensive read-side aggregation endpoints, to avoid
     /// re-running heavy GROUP BY queries while concurrent writes (e.g. the
     /// NAI bridge image-generation pipeline) hold the DB busy.
@@ -242,6 +257,75 @@ impl AppState {
         infer_client: Option<crate::infer_client::InferClient>,
         infer_child: Option<std::sync::Mutex<std::process::Child>>,
     ) -> Self {
+        let inference_client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("failed to build inference proxy client");
+        let sse_hub = Arc::new(SseHub::new());
+        let stream_path = config
+            .project_root
+            .join("extensions/builtin_hailo_yolo_detect/data/stream_config.json");
+        let writer = crate::routes::hailo_yolo_stream::config::ConfigWriterTask::spawn(
+            stream_path,
+            config.project_root.clone(),
+        );
+        let mut stream_settings = config
+            .app_config
+            .pointer("/extensions/builtin-hailo-yolo-detect")
+            .cloned()
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(scan_roots) = config.app_config.get("scan_roots") {
+            stream_settings
+                .as_object_mut()
+                .expect("stream settings were initialized as an object")
+                .insert("scan_roots".to_string(), scan_roots.clone());
+        }
+        let stream_migration_needed = writer.migration_needed;
+        let stream_config_tx = writer.tx.clone();
+        let stream_state = Arc::new(
+            crate::routes::hailo_yolo_stream::registry::StreamState::new_with_snapshot_infer_and_actions(
+                writer.restored.sources.clone(),
+                stream_settings,
+                writer.tx,
+                writer.snapshot,
+                infer_client.clone(),
+                crate::routes::hailo_yolo_stream::actions::ActionExecutor::spawn(
+                    config.project_root.clone(),
+                    inference_client.clone(),
+                    Arc::clone(&sse_hub),
+                ),
+            ),
+        );
+        if stream_migration_needed {
+            // The stream config still holds secrets in the clear. One no-op write
+            // rewrites it through the secret store; a config that is never edited
+            // again would otherwise stay plaintext forever.
+            tokio::spawn(async move {
+                let (reply, done) = tokio::sync::oneshot::channel();
+                if stream_config_tx
+                    .send(
+                        crate::routes::hailo_yolo_stream::registry::ConfigCommand::PersistSnapshot {
+                            reply,
+                        },
+                    )
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                match done.await {
+                    Ok(Ok(())) => {
+                        tracing::info!("migrated stream config secrets to the secret store")
+                    }
+                    // The plaintext is already on disk, so a failed rewrite exposes
+                    // nothing new. Retried on the next start.
+                    _ => tracing::warn!(
+                        "could not migrate stream config secrets; will retry on next start"
+                    ),
+                }
+            });
+        }
         let groups_index_cache = GroupsIndexCache::new(config.cache_dir.clone());
         let template_dir = config.project_root.join("ui/default/templates");
         let mut template_dirs: Vec<std::path::PathBuf> = vec![template_dir];
@@ -265,18 +349,22 @@ impl AppState {
             crate::routes::clip_index::ClipIndex::new_default(&config.cache_dir)
                 .expect("default CLIP index model name is safe"),
         );
+        let gateway_auth = crate::auth::gateway::auth_config(&config.app_config);
+        let gateway_loopback_bypass = crate::auth::gateway::loopback_bypass_enabled(&gateway_auth);
+        let gateway_keys = crate::auth::gateway::load_keys(&gateway_auth, &config.project_root);
         Self {
             config,
+            effective_port: 5000,
+            settings_lock: Arc::new(tokio::sync::Mutex::new(())),
             db,
             db_read,
             vectors_db,
             vectors_db_read,
             clip_index,
             clip_indexer: Arc::new(crate::routes::clip_indexer::ClipIndexer::new()),
-            inference_client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .expect("failed to build inference proxy client"),
+            inference_client,
+            gateway_keys,
+            gateway_loopback_bypass,
             python_client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
@@ -286,7 +374,7 @@ impl AppState {
             groups_index_cache,
             proxy_hits: Mutex::new(HashMap::new()),
             fleet_log_stream_connections: Mutex::new(HashMap::new()),
-            sse_hub: Arc::new(SseHub::new()),
+            sse_hub,
             log_ring,
             mcp_sessions: Arc::new(McpSessionStore::new(
                 std::env::var("YU_MCP_MAX_SESSIONS")
@@ -317,11 +405,17 @@ impl AppState {
             infer_client,
             infer_child,
             scan_manager: std::sync::OnceLock::new(),
+            hailo_yolo_stream: Some(stream_state),
             stats_basic_cache: TtlCache::new(STATS_CACHE_TTL),
             stats_models_cache: TtlCache::new(STATS_CACHE_TTL),
             checkpoints_cache: TtlCache::new(STATS_CACHE_TTL),
             clip_runtime_cache: TtlCache::new(CLIP_RUNTIME_CACHE_TTL),
         }
+    }
+
+    pub fn with_effective_port(mut self, effective_port: u16) -> Self {
+        self.effective_port = effective_port;
+        self
     }
 }
 

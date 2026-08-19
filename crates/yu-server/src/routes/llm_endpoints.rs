@@ -69,15 +69,14 @@ const WRITE_TOOLS: &[&str] = &[
 /// GET /api/llm/agent/capabilities
 pub async fn agent_capabilities(State(state): State<SharedState>) -> Response {
     let llm_hef = {
-        let p = std::env::var_os("HAILO_LLM_HEF")
+        std::env::var_os("HAILO_LLM_HEF")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
                 let home = std::env::var_os("HOME")
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|| std::path::PathBuf::from("/home/pi"));
                 home.join("hailo_models").join("Llama3.2-1B-Instruct.hef")
-            });
-        p
+            })
     };
     let hailo_available = llm_hef.exists();
     let available_models: Vec<&str> = if hailo_available {
@@ -161,7 +160,8 @@ pub async fn delete_endpoint(
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("config.json");
-    let mut config = crate::routes::settings::load_config_json(&config_path);
+    let _guard = state.settings_lock.lock().await;
+    let mut config = crate::config_io::load(&config_path);
     let endpoints = config
         .get_mut("llm_endpoints")
         .and_then(|v| v.as_object_mut());
@@ -182,7 +182,7 @@ pub async fn delete_endpoint(
             map.remove(&category);
         }
     }
-    if let Err(e) = crate::routes::settings::write_config_json(&config_path, &config) {
+    if let Err(e) = crate::config_io::write(&config_path, &config) {
         tracing::error!("delete_endpoint write error: {e}");
         return Json(json!({"ok": false, "error": "write failed", "data": null})).into_response();
     }
@@ -256,7 +256,8 @@ pub async fn update_llm_endpoints(
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("config.json");
-    let mut config = crate::routes::settings::load_config_json(&config_path);
+    let _guard = state.settings_lock.lock().await;
+    let mut config = crate::config_io::load(&config_path);
     let stored_key = if raw_key.is_empty() || raw_key.contains("****") {
         config
             .get("llm_endpoints")
@@ -280,7 +281,7 @@ pub async fn update_llm_endpoints(
             json!({"base_url": base_url, "model": model, "api_key": stored_key, "timeout": timeout}),
         );
     }
-    if let Err(e) = crate::routes::settings::write_config_json(&config_path, &config) {
+    if let Err(e) = crate::config_io::write(&config_path, &config) {
         tracing::error!("update_llm_endpoints write error: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,

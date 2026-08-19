@@ -181,7 +181,7 @@ pub async fn dnd_inbox(
                 roots.iter().find_map(|r| {
                     r.as_str()
                         .or_else(|| r["path"].as_str())
-                        .map(|p| std::path::PathBuf::from(p))
+                        .map(std::path::PathBuf::from)
                 })
             })
             .filter(|p| p.is_dir())
@@ -309,7 +309,7 @@ pub async fn register_path(
     }
 
     let cfg = read_config_json(s.config.config_path.to_str().unwrap_or(""));
-    let scan_roots = super::ext_config::global_scan_roots(&cfg);
+    let scan_roots = crate::ext_config::global_scan_roots(&cfg);
     let canonical_roots: Vec<_> = scan_roots
         .iter()
         .filter_map(|root| Path::new(root).canonicalize().ok())

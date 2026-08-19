@@ -41,8 +41,7 @@ pub fn parse_a1111_text(raw: &str) -> MetaResult {
     };
 
     // Split rest into negative / params
-    let (negative_opt, params_str) = if rest.starts_with("Negative prompt:") {
-        let after = &rest["Negative prompt:".len()..];
+    let (negative_opt, params_str) = if let Some(after) = rest.strip_prefix("Negative prompt:") {
         if let Some(pos) = after.find("\nSteps:") {
             (
                 Some(after[..pos].trim().to_string()),

@@ -1,7 +1,11 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -27,11 +31,27 @@ use crate::routes::wd_infer::{call_wd_infer, call_wd_infer_temp_frame, WdInferOu
 use crate::routes::wd_tagger_infer::{sanitize_model_id, NSFW_TAG_SET};
 use crate::routes::wd_tagger_write::{write_wd_tags, write_wd_tags_for_retag};
 use crate::routes::wd_tagger_xmp::write_wd_xmp;
+use crate::routes::{
+    search::{fetch_matching_ids, table_exists, SearchParams, SearchQueryRaw},
+    wd_tagger_batch::{
+        filter_active_in_order, query_backfill_targets, run_batch_worker_with_tagger,
+        WD_TAGGER_JOB_ID,
+    },
+};
+use futures_util::FutureExt;
+use futures_util::StreamExt;
+use reqwest::{header::LOCATION, StatusCode as ReqwestStatusCode, Url};
 
 pub(crate) const ACTIVE_MODEL_KEY: &str = "wd_active_model_id";
 const LEGACY_DEFAULT_FILES: [&str; 2] = ["model.onnx", "selected_tags.csv"];
 const DEFAULT_MODEL: &str = "SmilingWolf/wd-swinv2-tagger-v3";
 const PROFILE_JSON_MAX_BYTES: usize = 1024 * 1024;
+const HF_MAX_DOWNLOAD_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const HF_CHUNK_BYTES: usize = 256 * 1024;
+const HF_MAX_REDIRECTS: usize = 5;
+const HF_USER_AGENT: &str = "yu-ai-manager/1.0";
+const HF_HOSTS: [&str; 2] = ["huggingface.co", "hf.co"];
+static HF_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn api_result(payload: Value) -> Response {
     let mut body = match payload {
@@ -688,18 +708,7 @@ fn read_config_file(config_path: &Path) -> Result<Value, std::io::Error> {
         return Ok(json!({}));
     }
     let text = fs::read_to_string(config_path)?;
-    serde_json::from_str(&text)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-}
-
-fn write_config_file(config_path: &Path, config: &Value) -> Result<(), std::io::Error> {
-    let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
-    let tmp = config_path.with_extension("json.tmp");
-    let text = serde_json::to_string_pretty(config)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    fs::write(&tmp, format!("{text}\n"))?;
-    fs::rename(&tmp, config_path)
+    crate::config_io::parse_strict(config_path, &text)
 }
 
 fn validated_wd_config_patch(body: &Value) -> Result<Map<String, Value>, Response> {
@@ -1172,6 +1181,7 @@ pub async fn config_save(
             Err(error) => return internal_error(error, "failed to validate WD config model"),
         }
     }
+    let _guard = state.settings_lock.lock().await;
     let mut config = match read_config_file(&state.config.config_path) {
         Ok(config) => config,
         Err(error) => return internal_error(error, "failed to read config"),
@@ -1186,9 +1196,12 @@ pub async fn config_save(
     for (key, value) in patch {
         wd.insert(key, value);
     }
-    if let Err(error) = write_config_file(&state.config.config_path, &config) {
+    if let Err(error) = crate::config_io::write(&state.config.config_path, &config) {
         return internal_error(error, "failed to write config");
     }
+    // The read-modify-write is complete; release the global config lock before
+    // touching the database.
+    drop(_guard);
     if body.get("model").is_some() {
         if let Err(error) = set_active_model_id(&state.db, model_id.as_deref()).await {
             return internal_error(error, "failed to sync active WD model");
@@ -1964,6 +1977,323 @@ pub async fn tag_file(
     fwd_post_wt(&state, &format!("/api/wd-tagger/tag/{file_id}"), body).await
 }
 
+#[derive(Debug)]
+enum HfError {
+    Ssrf(String),
+    Request(String),
+    TooLarge(String),
+    Path(String),
+}
+
+impl std::fmt::Display for HfError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ssrf(message)
+            | Self::Request(message)
+            | Self::TooLarge(message)
+            | Self::Path(message) => f.write_str(message),
+        }
+    }
+}
+
+fn hf_path_encode(value: &str) -> String {
+    value.bytes().fold(String::new(), |mut output, byte| {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+            output.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            write!(output, "%{byte:02X}").expect("writing to String cannot fail");
+        }
+        output
+    })
+}
+
+fn build_hf_url(profile: &Value, file_name: &str) -> Result<Url, HfError> {
+    let model_id = profile
+        .get("model_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HfError::Request("profile missing model_id".into()))?;
+    let rel_path = match profile
+        .get("hf_subdir")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        Some(subdir) => format!("{subdir}/{file_name}"),
+        None => file_name.to_string(),
+    };
+    Url::parse(&format!(
+        "https://huggingface.co/{}/resolve/main/{}",
+        hf_path_encode(model_id),
+        hf_path_encode(&rel_path)
+    ))
+    .map_err(|error| HfError::Request(format!("invalid HuggingFace URL: {error}")))
+}
+
+fn validate_hf_url(url: &Url) -> Result<(), HfError> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(HfError::Ssrf("only http/https URLs are allowed".into()));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        // Url::host_str excludes userinfo, so the host allowlist also rejects it;
+        // retain this explicit check to document and enforce the security intent.
+        return Err(HfError::Ssrf("URL userinfo is not allowed".into()));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| HfError::Ssrf("URL missing hostname".into()))?;
+    if !HF_HOSTS
+        .iter()
+        .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")))
+    {
+        return Err(HfError::Ssrf(format!(
+            "host is not an allowed HuggingFace host: {host}"
+        )));
+    }
+    Ok(())
+}
+
+type HfClientFuture = Pin<Box<dyn Future<Output = Result<reqwest::Client, HfError>> + Send>>;
+type HfResponseFuture = Pin<Box<dyn Future<Output = Result<reqwest::Response, HfError>> + Send>>;
+
+async fn hf_request_with_client(
+    method: reqwest::Method,
+    initial_url: Url,
+    timeout: Duration,
+    client_for: &(dyn Fn(&Url, Duration) -> HfClientFuture + Send + Sync),
+) -> Result<reqwest::Response, HfError> {
+    let mut url = initial_url;
+    for redirect_count in 0..=HF_MAX_REDIRECTS {
+        validate_hf_url(&url)?;
+        let client = client_for(&url, timeout).await?;
+        let response = client
+            .request(method.clone(), url.clone())
+            .header(reqwest::header::USER_AGENT, HF_USER_AGENT)
+            .send()
+            .await
+            .map_err(|error| HfError::Request(error.to_string()))?;
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+        if redirect_count == HF_MAX_REDIRECTS {
+            return Err(HfError::Ssrf(format!(
+                "too many redirects (>{HF_MAX_REDIRECTS})"
+            )));
+        }
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .ok_or_else(|| HfError::Request("redirect without Location".into()))?
+            .to_str()
+            .map_err(|_| HfError::Request("invalid redirect Location".into()))?;
+        url = url
+            .join(location)
+            .map_err(|error| HfError::Request(format!("invalid redirect Location: {error}")))?;
+    }
+    unreachable!("redirect loop is bounded")
+}
+
+async fn hf_request(
+    method: reqwest::Method,
+    initial_url: Url,
+    timeout: Duration,
+) -> Result<reqwest::Response, HfError> {
+    hf_request_with_client(method, initial_url, timeout, &|url, timeout| {
+        let url = url.to_string();
+        Box::pin(async move {
+            crate::analysis_engines::http_client::build_pinned_client(&url, false, timeout)
+                .await
+                .map_err(|error| HfError::Ssrf(error.to_string()))
+        })
+    })
+    .await
+}
+
+fn secure_model_path(base: &Path, name: &str) -> Result<PathBuf, HfError> {
+    // Python accepts profile file names verbatim; native downloads additionally
+    // canonicalize every created directory so profile JSON cannot escape cache.
+    fs::create_dir_all(base).map_err(|error| HfError::Path(error.to_string()))?;
+    let root = base
+        .canonicalize()
+        .map_err(|error| HfError::Path(error.to_string()))?;
+    let relative = Path::new(name);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(HfError::Path("unsafe model file name".into()));
+    }
+    let mut parent = root.clone();
+    let components = relative.components().collect::<Vec<_>>();
+    for component in &components[..components.len() - 1] {
+        let std::path::Component::Normal(part) = component else {
+            unreachable!()
+        };
+        parent.push(part);
+        fs::create_dir_all(&parent).map_err(|error| HfError::Path(error.to_string()))?;
+        parent = parent
+            .canonicalize()
+            .map_err(|error| HfError::Path(error.to_string()))?;
+        if !parent.starts_with(&root) {
+            return Err(HfError::Path("model path escapes cache directory".into()));
+        }
+    }
+    let std::path::Component::Normal(file) = components.last().expect("nonempty path") else {
+        unreachable!()
+    };
+    let destination = parent.join(file);
+    if !destination
+        .parent()
+        .is_some_and(|path| path.starts_with(&root))
+    {
+        return Err(HfError::Path("model path escapes cache directory".into()));
+    }
+    Ok(destination)
+}
+
+fn profile_model_dir(state: &SharedState, profile: &Value) -> Result<PathBuf, HfError> {
+    let model_id = profile
+        .get("model_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HfError::Request("profile missing model_id".into()))?;
+    let mut base = state
+        .config
+        .project_root
+        .join("cache/wd_tagger")
+        .join(model_id.replace('/', "_"));
+    if let Some(subdir) = profile
+        .get("hf_subdir")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        let marker = secure_model_path(&base, &format!("{subdir}/.wd-tagger-dir"))?;
+        base = marker
+            .parent()
+            .expect("secure path has parent")
+            .to_path_buf();
+    }
+    Ok(base)
+}
+
+fn hf_content_length_allowed(content_length: Option<u64>) -> bool {
+    content_length.is_none_or(|length| length <= HF_MAX_DOWNLOAD_BYTES)
+}
+
+fn hf_declared_content_length(response: &reqwest::Response) -> Option<u64> {
+    // Python reads Content-Length; reqwest's body size hint is 0 for a constructed
+    // response, so read the header to match Python and keep this guard testable.
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn profile_test_status(code: &str) -> StatusCode {
+    match code {
+        "timeout" => StatusCode::REQUEST_TIMEOUT,
+        "ssrf_blocked" | "hf_unavailable" => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::BAD_REQUEST,
+    }
+}
+
+fn profile_test_error(message: &str, code: &str, extra: Value) -> Response {
+    api_error_extra(message, profile_test_status(code), code, extra)
+}
+
+fn hf_temporary_path(destination: &Path) -> PathBuf {
+    // Cached files are trusted by existence only, so unique temporary names
+    // prevent concurrent writers from persisting a corrupt cached model.
+    destination.with_file_name(format!(
+        "{}.{}.{}.tmp",
+        destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("download"),
+        std::process::id(),
+        HF_TEMP_SEQ.fetch_add(1, Ordering::Relaxed),
+    ))
+}
+
+async fn download_hf_file(
+    state: &SharedState,
+    profile: &Value,
+    file_name: &str,
+    timeout: Duration,
+) -> Result<Value, HfError> {
+    download_hf_file_with_request(
+        state,
+        profile,
+        file_name,
+        timeout,
+        &|method, url, timeout| Box::pin(hf_request(method, url, timeout)),
+    )
+    .await
+}
+
+async fn download_hf_file_with_request(
+    state: &SharedState,
+    profile: &Value,
+    file_name: &str,
+    timeout: Duration,
+    request: &(dyn Fn(reqwest::Method, Url, Duration) -> HfResponseFuture + Send + Sync),
+) -> Result<Value, HfError> {
+    let base = profile_model_dir(state, profile)?;
+    let destination = secure_model_path(&base, file_name)?;
+    if destination.exists() {
+        return Ok(
+            json!({"name": file_name, "status": "cached", "size": fs::metadata(destination).map_err(|error| HfError::Path(error.to_string()))?.len()}),
+        );
+    }
+    let response = request(
+        reqwest::Method::GET,
+        build_hf_url(profile, file_name)?,
+        timeout,
+    )
+    .await?;
+    if !response.status().is_success() {
+        return Err(HfError::Request(format!(
+            "hf returned {} for {file_name}",
+            response.status()
+        )));
+    }
+    if !hf_content_length_allowed(hf_declared_content_length(&response)) {
+        return Err(HfError::TooLarge(format!(
+            "{file_name} exceeds max download size"
+        )));
+    }
+    let temporary = hf_temporary_path(&destination);
+    let mut output = tokio::fs::File::create(&temporary)
+        .await
+        .map_err(|error| HfError::Path(error.to_string()))?;
+    let mut stream = response.bytes_stream();
+    let mut size = 0_u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| HfError::Request(error.to_string()))?;
+        size = size.saturating_add(chunk.len() as u64);
+        if size > HF_MAX_DOWNLOAD_BYTES {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(HfError::TooLarge(format!(
+                "{file_name} exceeds max download size"
+            )));
+        }
+        for part in chunk.chunks(HF_CHUNK_BYTES) {
+            tokio::io::AsyncWriteExt::write_all(&mut output, part)
+                .await
+                .map_err(|error| HfError::Path(error.to_string()))?;
+        }
+    }
+    tokio::io::AsyncWriteExt::flush(&mut output)
+        .await
+        .map_err(|error| HfError::Path(error.to_string()))?;
+    drop(output);
+    tokio::fs::rename(&temporary, &destination)
+        .await
+        .map_err(|error| HfError::Path(error.to_string()))?;
+    Ok(json!({"name": file_name, "status": "downloaded", "size": size}))
+}
+
 /// POST /api/wd-tagger/model/download
 pub async fn model_download(
     State(state): State<SharedState>,
@@ -1973,10 +2303,109 @@ pub async fn model_download(
     if let Some(r) = admin_scope_error(&state, auth.as_ref()) {
         return r;
     }
-    fwd_post_wt(&state, "/api/wd-tagger/model/download", body).await
+    let Ok(request) = serde_json::from_slice::<Value>(&body) else {
+        return api_error_code("Invalid JSON body", StatusCode::BAD_REQUEST, "invalid_json");
+    };
+    let profile_id = request.get("profile_id").and_then(Value::as_str);
+    let legacy_id = request
+        .get("model_id")
+        .or_else(|| request.get("repo"))
+        .and_then(Value::as_str);
+    let Some(requested_id) = profile_id.or(legacy_id) else {
+        return api_error_code(
+            "profile_id required (model_id legacy bridge also accepted)",
+            StatusCode::BAD_REQUEST,
+            "missing_id",
+        );
+    };
+    let profiles = load_full_profiles(&state.config.project_root);
+    let (profile, deprecated) = if let Some(id) = profile_id {
+        let Some((profile, _, _)) = profiles.get(id) else {
+            return api_error_extra(
+                &format!("Unknown profile_id: {id:?}"),
+                StatusCode::NOT_FOUND,
+                "profile_not_found",
+                json!({"profile_id": id}),
+            );
+        };
+        (profile, false)
+    } else {
+        let matches = profiles
+            .values()
+            .filter_map(|(profile, _, _)| {
+                (profile.get("model_id").and_then(Value::as_str) == Some(requested_id))
+                    .then_some(profile)
+            })
+            .collect::<Vec<_>>();
+        match matches.len() {
+            0 => return api_error_extra(&format!("Unknown model_id: {requested_id:?}"), StatusCode::NOT_FOUND, "profile_not_found", json!({"profile_id": requested_id})),
+            1 => (matches[0], true),
+            count => return api_error_extra(&format!("Ambiguous model_id {requested_id:?}: {count} profiles match. Use profile_id instead."), StatusCode::BAD_REQUEST, "ambiguous_model_id", json!({"profile_id": requested_id, "matches": matches.iter().filter_map(|profile| profile.get("id")).collect::<Vec<_>>() })),
+        }
+    };
+    let Some(files) = profile.get("files").and_then(Value::as_array) else {
+        return api_error_code(
+            "profile files invalid",
+            StatusCode::BAD_REQUEST,
+            "download_failed",
+        );
+    };
+    let mut downloaded = Vec::new();
+    let mut skipped_optional = Vec::new();
+    let mut failed_optional = Vec::new();
+    for spec in files {
+        let Some(name) = spec.get("name").and_then(Value::as_str) else {
+            return api_error_code(
+                "profile file invalid",
+                StatusCode::BAD_REQUEST,
+                "download_failed",
+            );
+        };
+        let required = spec
+            .get("required")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        match download_hf_file(&state, profile, name, Duration::from_secs(30)).await {
+            Ok(result) => downloaded.push(result["name"].clone()),
+            Err(HfError::Request(message)) if !required && message.contains("404") => {
+                skipped_optional.push(json!([name, "404"]))
+            }
+            Err(HfError::Request(message))
+                if !required && (message.contains("403") || message.contains("410")) =>
+            {
+                failed_optional.push(json!([name, message]))
+            }
+            Err(error) => {
+                return api_error_code(
+                    &format!("Model download failed: {error}"),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "download_failed",
+                )
+            }
+        }
+    }
+    let mut response = api_result(
+        json!({"profile_id": profile.get("id"), "cache_dir": profile_model_dir(&state, profile).ok().map(|path| path.to_string_lossy().to_string()), "downloaded": downloaded, "skipped_optional": skipped_optional, "failed_optional": failed_optional}),
+    );
+    if deprecated {
+        let headers = response.headers_mut();
+        headers.insert(
+            "Deprecation",
+            reqwest::header::HeaderValue::from_static("true"),
+        );
+        headers.insert(
+            "Sunset",
+            reqwest::header::HeaderValue::from_static("v4.196.0"),
+        );
+        let warning = format!("299 - \"model_id={requested_id:?} is deprecated; use profile_id. Removed in v4.196.0.\"");
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(&warning) {
+            headers.insert("Warning", value);
+        }
+    }
+    response
 }
 
-/// POST /api/wd-tagger/profiles/{id}/test
+/// POST /api/wd-tagger/profiles/{id}/test. This endpoint downloads required files, not only HEADs them.
 pub async fn profile_test(
     State(state): State<SharedState>,
     auth: Option<Extension<AuthContext>>,
@@ -1986,7 +2415,148 @@ pub async fn profile_test(
     if let Some(r) = admin_scope_error(&state, auth.as_ref()) {
         return r;
     }
-    fwd_post_wt(&state, &format!("/api/wd-tagger/profiles/{id}/test"), body).await
+    if !valid_profile_id(&id) {
+        return api_error_code("invalid id", StatusCode::BAD_REQUEST, "invalid_id");
+    }
+    let profiles = load_full_profiles(&state.config.project_root);
+    let Some((profile, _, _)) = profiles.get(&id) else {
+        return api_error_code("not found", StatusCode::NOT_FOUND, "not_found");
+    };
+    let Some(files) = profile.get("files").and_then(Value::as_array) else {
+        return api_error_code(
+            "profile files invalid",
+            StatusCode::BAD_REQUEST,
+            "required_missing",
+        );
+    };
+    let started = Instant::now();
+    let mut output = Vec::new();
+    for spec in files {
+        let Some(name) = spec.get("name").and_then(Value::as_str) else {
+            return api_error_code(
+                "profile file invalid",
+                StatusCode::BAD_REQUEST,
+                "required_missing",
+            );
+        };
+        let required = spec
+            .get("required")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let remaining = Duration::from_secs(60).checked_sub(started.elapsed());
+        let Some(remaining) = remaining else {
+            return profile_test_error(
+                "profile test timed out",
+                "timeout",
+                json!({"files": output}),
+            );
+        };
+        let timeout = remaining.clamp(Duration::from_secs(1), Duration::from_secs(30));
+        let head = hf_request(
+            reqwest::Method::HEAD,
+            match build_hf_url(profile, name) {
+                Ok(url) => url,
+                Err(HfError::Ssrf(detail)) => {
+                    return profile_test_error(
+                        "SSRF blocked",
+                        "ssrf_blocked",
+                        json!({"files": output, "detail": detail}),
+                    )
+                }
+                Err(error) => {
+                    return api_error_extra(
+                        "required file missing",
+                        StatusCode::BAD_REQUEST,
+                        "required_missing",
+                        json!({"files": output, "detail": error.to_string()}),
+                    )
+                }
+            },
+            timeout,
+        )
+        .await;
+        let response = match head {
+            Ok(response) => response,
+            Err(HfError::Ssrf(detail)) => {
+                return profile_test_error(
+                    "SSRF blocked",
+                    "ssrf_blocked",
+                    json!({"files": output, "detail": detail}),
+                )
+            }
+            Err(error) if required => {
+                return api_error_extra(
+                    "required file missing",
+                    StatusCode::BAD_REQUEST,
+                    "required_missing",
+                    json!({"files": output, "detail": format!("HEAD failed for {name}: {error}")}),
+                )
+            }
+            Err(_) => {
+                output.push(json!({"name": name, "status": "skipped_optional", "size": null}));
+                continue;
+            }
+        };
+        let status = response.status();
+        let size = response.content_length();
+        if status == ReqwestStatusCode::NOT_FOUND || status.is_client_error() {
+            if required {
+                return api_error_extra(
+                    "required file missing",
+                    StatusCode::BAD_REQUEST,
+                    "required_missing",
+                    json!({"files": output, "detail": format!("hf returned {status} for {name}")}),
+                );
+            }
+            output.push(json!({"name": name, "status": "skipped_optional", "size": size}));
+            continue;
+        }
+        if status.is_server_error() {
+            return profile_test_error(
+                "HuggingFace unavailable",
+                "hf_unavailable",
+                json!({"files": output, "detail": format!("hf {status} for {name}")}),
+            );
+        }
+        if required {
+            let remaining = Duration::from_secs(60).checked_sub(started.elapsed());
+            let Some(remaining) = remaining else {
+                return profile_test_error(
+                    "profile test timed out",
+                    "timeout",
+                    json!({"files": output}),
+                );
+            };
+            match download_hf_file(
+                &state,
+                profile,
+                name,
+                remaining.clamp(Duration::from_secs(1), Duration::from_secs(30)),
+            )
+            .await
+            {
+                Ok(file) => output.push(file),
+                Err(HfError::Ssrf(detail)) => {
+                    return profile_test_error(
+                        "SSRF blocked",
+                        "ssrf_blocked",
+                        json!({"files": output, "detail": detail}),
+                    )
+                }
+                Err(error) => {
+                    return api_error_extra(
+                        "required file missing",
+                        StatusCode::BAD_REQUEST,
+                        "required_missing",
+                        json!({"files": output, "detail": error.to_string()}),
+                    )
+                }
+            }
+        } else {
+            output.push(json!({"name": name, "status": "available", "size": size}));
+        }
+    }
+    api_result(json!({"files": output}))
 }
 
 /// POST /api/wd-tagger/retag/single
@@ -2084,92 +2654,135 @@ pub async fn retag_single(
         );
     };
     let profile_id = profile["id"].as_str().unwrap_or(model_input);
-    let path: String =
-        match sqlx::query_scalar("SELECT path FROM files WHERE id = ? AND is_deleted = 0")
-            .bind(file_id)
-            .fetch_optional(&state.db_read)
-            .await
-        {
-            Ok(Some(path)) => path,
-            Ok(None) => {
-                return api_error_code(
-                    "File not found or deleted",
-                    StatusCode::NOT_FOUND,
-                    "file_not_found",
-                )
-            }
-            Err(error) => return internal_error(error, "wd retag file lookup failed"),
-        };
-    if !is_native_image_format(&path)
-        || profile["adapter_family"].as_str() != Some("wd")
+    if profile["adapter_family"].as_str() != Some("wd")
         || profile["backend"].as_str() != Some("onnx")
         || !profile["hf_subdir"].is_null()
         || (state.infer_client.is_none() && state.config.infer_standalone)
     {
         return fwd_post_wt(&state, "/api/wd-tagger/retag/single", body).await;
     }
+    let model_cache_id = sanitize_model_id(profile["model_id"].as_str().unwrap_or(profile_id));
+    match retag_file_native_core(
+        &state,
+        file_id,
+        &model_cache_id,
+        general_thr,
+        character_thr,
+        overwrite,
+        set_active,
+    )
+    .await
+    {
+        TagOutcome::Tagged(mut body) => {
+            body["elapsed_ms"] =
+                json!((start.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0);
+            api_result(json!({"data": body}))
+        }
+        TagOutcome::Fallback => fwd_post_wt(&state, "/api/wd-tagger/retag/single", body).await,
+        TagOutcome::Rejected(body) => {
+            (rejected_status_from_body(&body), Json(body)).into_response()
+        }
+        TagOutcome::Fatal(reason) => fatal_reason_to_response(reason),
+        TagOutcome::Skipped(body) => api_result(json!({"data": body})),
+    }
+}
+
+async fn retag_file_native_core(
+    state: &SharedState,
+    file_id: i64,
+    model_id: &str,
+    general_thr: f32,
+    character_thr: f32,
+    overwrite: bool,
+    set_active: bool,
+) -> TagOutcome {
+    let path: String = match sqlx::query_scalar(
+        "SELECT path FROM files WHERE id = ? AND is_deleted = 0",
+    )
+    .bind(file_id)
+    .fetch_optional(&state.db_read)
+    .await
+    {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            return TagOutcome::Rejected(
+                json!({"ok": false, "error": "File not found or deleted", "code": "file_not_found"}),
+            )
+        }
+        Err(error) => {
+            tracing::error!(?error, "wd retag file lookup failed");
+            return TagOutcome::Rejected(json!({"ok": false, "error": "internal_server_error"}));
+        }
+    };
+    if !is_native_image_format(&path) {
+        return TagOutcome::Fallback;
+    }
     if !Path::new(&path).exists() {
-        return api_error_code(
-            "File not found on disk",
-            StatusCode::BAD_REQUEST,
-            "file_missing",
+        return TagOutcome::Rejected(
+            json!({"ok": false, "error": "File not found on disk", "code": "file_missing"}),
         );
     }
-    let model_cache_id = sanitize_model_id(profile["model_id"].as_str().unwrap_or(profile_id));
     let result = match call_wd_infer(
-        &state,
+        state,
         Path::new(&path),
-        &model_cache_id,
+        model_id,
         general_thr,
         character_thr,
     )
     .await
     {
         WdInferOutcome::Success(result) => result,
-        WdInferOutcome::PathRejected => {
-            return fwd_post_wt(&state, "/api/wd-tagger/retag/single", body).await
-        }
+        WdInferOutcome::PathRejected => return TagOutcome::Fallback,
         WdInferOutcome::ModelNotDownloaded => {
-            return fatal_reason_to_response(FatalReason::ModelNotDownloaded)
+            return TagOutcome::Fatal(FatalReason::ModelNotDownloaded)
         }
         WdInferOutcome::BackendError(error) => {
-            return fatal_reason_to_response(FatalReason::BackendError(error))
+            return TagOutcome::Fatal(FatalReason::BackendError(error))
         }
         WdInferOutcome::Unreachable(error) => {
-            return fatal_reason_to_response(FatalReason::Unreachable(error))
+            return TagOutcome::Fatal(FatalReason::Unreachable(error))
         }
     };
-    let nsfw = read_config_json(&state)["extensions"]["builtin-wd-tagger"]["nsfw_filter"]
-        .as_bool()
-        .unwrap_or(false);
-    let tags = filter_and_dedupe_tags(&result.tags, nsfw);
+    let tags = filter_and_dedupe_tags(
+        &result.tags,
+        read_config_json(state)["extensions"]["builtin-wd-tagger"]["nsfw_filter"]
+            .as_bool()
+            .unwrap_or(false),
+    );
     let inserted = match write_wd_tags_for_retag(
         &state.db,
         file_id,
-        &model_cache_id,
+        model_id,
         &tags,
         overwrite,
-        set_active.then_some(model_cache_id.as_str()),
+        set_active.then_some(model_id),
     )
     .await
     {
         Ok(value) => value,
-        Err(error) => return internal_error(error, "wd retag write failed"),
+        Err(error) => {
+            tracing::error!(?error, "wd retag write failed");
+            return TagOutcome::Rejected(json!({"ok": false, "error": "internal_server_error"}));
+        }
     };
-    let tag_names: Vec<String> = tags.iter().map(|(tag, _, _)| tag.clone()).collect();
-    if read_config_json(&state)["extensions"]["builtin-wd-tagger"]["write_xmp"]
+    if read_config_json(state)["extensions"]["builtin-wd-tagger"]["write_xmp"]
         .as_bool()
         .unwrap_or(true)
     {
         write_wd_xmp(
             Path::new(&path),
-            &tag_names,
-            &model_cache_id,
+            &tags
+                .iter()
+                .map(|(tag, _, _)| tag.clone())
+                .collect::<Vec<_>>(),
+            model_id,
             general_thr,
             character_thr,
         );
     }
-    Json(json!({"ok": true, "error": null, "data": {"file_id": file_id, "model_id": model_cache_id, "tags": tags.iter().map(|(tag, confidence, category)| json!({"tag": tag, "confidence": confidence, "category": category})).collect::<Vec<_>>(), "rating": result.rating, "elapsed_ms": (start.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0, "inserted": inserted}})).into_response()
+    TagOutcome::Tagged(
+        json!({"file_id": file_id, "model_id": model_id, "tags": tags.iter().map(|(tag, confidence, category)| json!({"tag": tag, "confidence": confidence, "category": category})).collect::<Vec<_>>(), "rating": result.rating, "inserted": inserted}),
+    )
 }
 
 /// POST /api/wd-tagger/retag/batch
@@ -2181,7 +2794,7 @@ pub async fn retag_batch(
     if let Some(r) = admin_scope_error(&state, auth.as_ref()) {
         return r;
     }
-    fwd_post_wt(&state, "/api/wd-tagger/retag/batch", body).await
+    retag_async(state, body, "batch").await
 }
 
 /// POST /api/wd-tagger/retag/backfill
@@ -2193,7 +2806,7 @@ pub async fn retag_backfill(
     if let Some(r) = admin_scope_error(&state, auth.as_ref()) {
         return r;
     }
-    fwd_post_wt(&state, "/api/wd-tagger/retag/backfill", body).await
+    retag_async(state, body, "backfill").await
 }
 
 /// POST /api/wd-tagger/retag/query
@@ -2205,7 +2818,7 @@ pub async fn retag_query(
     if let Some(r) = admin_scope_error(&state, auth.as_ref()) {
         return r;
     }
-    fwd_post_wt(&state, "/api/wd-tagger/retag/query", body).await
+    retag_async(state, body, "query").await
 }
 
 /// POST /api/wd-tagger/retag/cancel
@@ -2217,7 +2830,331 @@ pub async fn retag_cancel(
     if let Some(r) = admin_scope_error(&state, auth.as_ref()) {
         return r;
     }
-    fwd_post_wt(&state, "/api/wd-tagger/retag/cancel", body).await
+    if state.job_manager.cancel_job(WD_TAGGER_JOB_ID) {
+        api_result(json!({"data": {"status": "cancelling"}}))
+    } else {
+        api_error_code(
+            "No running retag job",
+            StatusCode::NOT_FOUND,
+            "job_not_running",
+        )
+    }
+}
+
+/// Rust query retag intentionally uses every condition match, unlike the former
+/// Python route which retagged one paginated search response.
+async fn retag_async(state: SharedState, body: Bytes, scope: &'static str) -> Response {
+    let Ok(payload) = serde_json::from_slice::<Value>(&body) else {
+        return api_error_code(
+            "invalid JSON body",
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+        );
+    };
+    let Some(payload) = payload.as_object() else {
+        return api_error_code(
+            "request body must be a JSON object",
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+        );
+    };
+    let Some(model_input) = payload
+        .get("model_id")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+    else {
+        return api_error_code(
+            "model_id required",
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+        );
+    };
+    let thresholds = match payload.get("thresholds") {
+        None => None,
+        Some(Value::Object(v)) => Some(v),
+        Some(_) => {
+            return api_error_code(
+                "thresholds must be an object",
+                StatusCode::BAD_REQUEST,
+                "invalid_input",
+            )
+        }
+    };
+    let threshold = |name, default| match thresholds.and_then(|v| v.get(name)) {
+        None => Ok(default),
+        Some(value) => value
+            .as_f64()
+            .map(|v| v as f32)
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+            .ok_or_else(|| {
+                api_error_code(
+                    "threshold must be a number between 0 and 1",
+                    StatusCode::BAD_REQUEST,
+                    "invalid_input",
+                )
+            }),
+    };
+    let (general_thr, character_thr) =
+        match (threshold("general", 0.35), threshold("character", 0.85)) {
+            (Ok(general), Ok(character)) => (general, character),
+            (Err(response), _) | (_, Err(response)) => return response,
+        };
+    let _batch_size = match payload
+        .get("batch_size")
+        .map(Value::as_i64)
+        .unwrap_or(Some(8))
+    {
+        Some(value @ 1..=64) => value as usize,
+        _ => {
+            return api_error_code(
+                "batch_size must be between 1 and 64",
+                StatusCode::BAD_REQUEST,
+                "invalid_input",
+            )
+        }
+    };
+    let limit = match payload.get("limit").map(Value::as_i64).unwrap_or(Some(0)) {
+        Some(value @ 0..=1_000_000) => value,
+        _ => {
+            return api_error_code(
+                "limit must be between 0 and 1000000",
+                StatusCode::BAD_REQUEST,
+                "invalid_input",
+            )
+        }
+    };
+    let set_active = match payload.get("set_active") {
+        None => true,
+        Some(v) => match v.as_bool() {
+            Some(v) => v,
+            None => {
+                return api_error_code(
+                    "set_active must be a boolean",
+                    StatusCode::BAD_REQUEST,
+                    "invalid_input",
+                )
+            }
+        },
+    };
+    let overwrite = match payload.get("overwrite_same_model") {
+        None => true,
+        Some(v) => match v.as_bool() {
+            Some(v) => v,
+            None => {
+                return api_error_code(
+                    "overwrite_same_model must be a boolean",
+                    StatusCode::BAD_REQUEST,
+                    "invalid_input",
+                )
+            }
+        },
+    };
+    let profiles = load_full_profiles(&state.config.project_root);
+    let Some((profile, _, _)) = profiles.get(model_input).or_else(|| {
+        profiles
+            .values()
+            .find(|(p, _, _)| p["model_id"].as_str() == Some(model_input))
+    }) else {
+        return api_error_code(
+            "model_id not found",
+            StatusCode::NOT_FOUND,
+            "model_not_found",
+        );
+    };
+    if profile["adapter_family"].as_str() != Some("wd")
+        || profile["backend"].as_str() != Some("onnx")
+        || !profile["hf_subdir"].is_null()
+    {
+        return api_error_code(
+            "model is not supported by native retag",
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+        );
+    }
+    let model_id = sanitize_model_id(profile["model_id"].as_str().unwrap_or(model_input));
+    if let Err(error) = sqlx::query("INSERT OR IGNORE INTO wd_model_dict(model) VALUES (?)")
+        .bind(&model_id)
+        .execute(&state.db)
+        .await
+    {
+        return internal_error(error, "wd retag model setup failed");
+    }
+    let model_db_id = match sqlx::query_scalar("SELECT id FROM wd_model_dict WHERE model = ?")
+        .bind(&model_id)
+        .fetch_one(&state.db_read)
+        .await
+    {
+        Ok(id) => id,
+        Err(error) => return internal_error(error, "wd retag model lookup failed"),
+    };
+    let targets = match scope {
+        "batch" => {
+            let Some(values) = payload.get("file_ids").and_then(Value::as_array) else {
+                return api_error_code(
+                    "file_ids must be a list",
+                    StatusCode::BAD_REQUEST,
+                    "invalid_input",
+                );
+            };
+            if values.len() > 500 {
+                return api_error_code(
+                    "file_ids max 500",
+                    StatusCode::BAD_REQUEST,
+                    "batch_too_large",
+                );
+            }
+            let Some(ids) = values.iter().map(Value::as_i64).collect::<Option<Vec<_>>>() else {
+                return api_error_code(
+                    "file_ids must be a list",
+                    StatusCode::BAD_REQUEST,
+                    "invalid_input",
+                );
+            };
+            let ids = filter_active_in_order(&state.db_read, &ids).await;
+            if limit > 0 {
+                ids.into_iter().take(limit as usize).collect()
+            } else {
+                ids
+            }
+        }
+        "backfill" => {
+            let scan_root = match payload.get("scan_root") {
+                None => "",
+                Some(Value::String(v)) => v,
+                Some(_) => {
+                    return api_error_code(
+                        "scan_root must be a string",
+                        StatusCode::BAD_REQUEST,
+                        "invalid_input",
+                    )
+                }
+            };
+            let force = match payload.get("force") {
+                None => false,
+                Some(v) => match v.as_bool() {
+                    Some(v) => v,
+                    None => {
+                        return api_error_code(
+                            "force must be a boolean",
+                            StatusCode::BAD_REQUEST,
+                            "invalid_input",
+                        )
+                    }
+                },
+            };
+            query_backfill_targets(&state, scan_root, limit, force, Some(model_db_id)).await
+        }
+        "query" => {
+            let Some(params) = payload.get("query_params").filter(|v| v.is_object()) else {
+                return api_error_code(
+                    "query_params must be an object",
+                    StatusCode::BAD_REQUEST,
+                    "invalid_input",
+                );
+            };
+            let raw: SearchQueryRaw =
+                match serde_json::from_value(normalize_search_query_params(params)) {
+                    Ok(raw) => raw,
+                    Err(_) => {
+                        return api_error_code(
+                            "query_params invalid",
+                            StatusCode::BAD_REQUEST,
+                            "invalid_input",
+                        )
+                    }
+                };
+            let mut search_params = SearchParams::from(raw);
+            let mut ids: Vec<i64> = if !table_exists(&state.db_read, "files").await.unwrap_or(false)
+            {
+                Vec::new()
+            } else {
+                if search_params.also_path
+                    && !table_exists(&state.db_read, "files_path_fts")
+                        .await
+                        .unwrap_or(false)
+                {
+                    search_params.also_path = false;
+                }
+                match fetch_matching_ids(&state.db_read, &search_params).await {
+                    Ok(Some(ids)) => ids.into_iter().collect(),
+                    Ok(None) => Vec::new(),
+                    Err(error) => return internal_error(error, "wd retag query lookup failed"),
+                }
+            };
+            ids.sort_unstable();
+            let ids = filter_active_in_order(&state.db_read, &ids).await;
+            if limit > 0 {
+                ids.into_iter().take(limit as usize).collect()
+            } else {
+                ids
+            }
+        }
+        _ => unreachable!(),
+    };
+    if targets.is_empty() {
+        return api_result(
+            json!({"data": {"started": false, "reason": "no_targets", "scope": scope}}),
+        );
+    }
+    let Some(cancel) = state
+        .job_manager
+        .start_if_idle(WD_TAGGER_JOB_ID, "WD-Tagger retag")
+    else {
+        return api_error_code(
+            "WD-Tagger retag job already running",
+            StatusCode::CONFLICT,
+            "job_running",
+        );
+    };
+    state.job_manager.set_phase(WD_TAGGER_JOB_ID, "running");
+    let worker_state = state.clone();
+    tokio::spawn(async move {
+        // Python chunks by batch_size because one adapter inference handles a whole chunk and cannot be interrupted mid-chunk. Rust infers one file at a time, so chunking would only delay cancellation; the token is checked before every file. batch_size is validated for API compatibility but has no effect here.
+        run_batch_worker_with_tagger(
+            worker_state,
+            WD_TAGGER_JOB_ID.to_string(),
+            targets,
+            overwrite,
+            cancel,
+            move |state, file_id, overwrite| {
+                let model_id = model_id.clone();
+                Box::pin(async move {
+                    retag_file_native_core(
+                        state,
+                        file_id,
+                        &model_id,
+                        general_thr,
+                        character_thr,
+                        overwrite,
+                        set_active,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+    });
+    api_result(json!({"data": {"started": true, "job_id": WD_TAGGER_JOB_ID}}))
+}
+
+fn normalize_search_query_params(params: &Value) -> Value {
+    let Value::Object(params) = params else {
+        return Value::Object(Map::new());
+    };
+    Value::Object(
+        params
+            .iter()
+            .filter_map(|(key, value)| {
+                let value = match value {
+                    Value::String(value) => Some(Value::String(value.clone())),
+                    Value::Number(value) => Some(Value::String(value.to_string())),
+                    Value::Bool(value) => Some(Value::String(value.to_string())),
+                    Value::Null | Value::Array(_) | Value::Object(_) => None,
+                }?;
+                Some((key.clone(), value))
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -2228,15 +3165,222 @@ pub(crate) mod tests {
         fs,
         path::{Path, PathBuf},
         str::FromStr,
-        sync::Arc,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use axum::{body::to_bytes, extract::Path as AxumPath, extract::State, http::StatusCode};
+    use axum::{
+        body::to_bytes,
+        extract::{Path as AxumPath, State},
+        http::{header, StatusCode},
+        routing::get,
+        Router,
+    };
     use serde_json::{json, Value};
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
+    use super::{build_hf_url, secure_model_path, validate_hf_url, HfError};
     use crate::state::{AppState, Config, SharedState};
+
+    async fn hf_stub_client(
+        router: Router,
+    ) -> Option<(reqwest::Client, String, tokio::task::JoinHandle<()>)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
+        let address = listener.local_addr().ok()?;
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve("huggingface.co", address)
+            .build()
+            .ok()?;
+        Some((
+            client,
+            format!("http://huggingface.co:{}/", address.port()),
+            server,
+        ))
+    }
+
+    #[tokio::test]
+    async fn hf_redirects_revalidate_each_hop_and_stop_at_limit() {
+        let Some((client, base, server)) = hf_stub_client(Router::new().route(
+            "/",
+            get(|| async {
+                (
+                    StatusCode::FOUND,
+                    [(header::LOCATION, "http://127.0.0.1/private")],
+                )
+            }),
+        ))
+        .await
+        else {
+            return;
+        };
+        let result = hf_request_with_client(
+            reqwest::Method::GET,
+            reqwest::Url::parse(&base).unwrap(),
+            Duration::from_secs(1),
+            &move |_, _| Box::pin(std::future::ready(Ok(client.clone()))),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(HfError::Ssrf(message)) if message.contains("allowed HuggingFace host"))
+        );
+        server.abort();
+
+        let hops = Arc::new(AtomicUsize::new(0));
+        let state = hops.clone();
+        let Some((client, base, server)) = hf_stub_client(Router::new().route(
+            "/",
+            get(move || {
+                let state = state.clone();
+                async move {
+                    state.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::FOUND, [(header::LOCATION, "/")])
+                }
+            }),
+        ))
+        .await
+        else {
+            return;
+        };
+        let result = hf_request_with_client(
+            reqwest::Method::GET,
+            reqwest::Url::parse(&base).unwrap(),
+            Duration::from_secs(1),
+            &move |_, _| Box::pin(std::future::ready(Ok(client.clone()))),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(HfError::Ssrf(message)) if message.contains("too many redirects"))
+        );
+        assert_eq!(hops.load(Ordering::SeqCst), HF_MAX_REDIRECTS + 1);
+        server.abort();
+    }
+
+    #[test]
+    fn hf_content_length_limit_rejects_eight_gib_excess() {
+        assert!(!hf_content_length_allowed(Some(HF_MAX_DOWNLOAD_BYTES + 1)));
+        assert!(hf_content_length_allowed(Some(HF_MAX_DOWNLOAD_BYTES)));
+    }
+
+    #[test]
+    fn hf_temporary_paths_are_unique_per_download() {
+        let destination = Path::new("/tmp/model.onnx");
+        assert_ne!(
+            hf_temporary_path(destination),
+            hf_temporary_path(destination)
+        );
+    }
+
+    #[test]
+    fn profile_test_status_mapping_and_response_use_same_mapper() {
+        assert_eq!(profile_test_status("timeout"), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(profile_test_status("ssrf_blocked"), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            profile_test_status("hf_unavailable"),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            profile_test_status("required_missing"),
+            StatusCode::BAD_REQUEST
+        );
+        let response = profile_test_error("profile test timed out", "timeout", json!({}));
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn hf_download_uses_cached_file_without_http() {
+        let dirs = test_dirs();
+        let state = test_state(&dirs, json!({})).await;
+        let profile = json!({"id":"cached", "model_id":"cached/model"});
+        let cache = dirs.root.join("cache/wd_tagger/cached_model");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("model.onnx"), b"cached").unwrap();
+        let result = download_hf_file(&state, &profile, "model.onnx", Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            json!({"name":"model.onnx", "status":"cached", "size":6})
+        );
+    }
+
+    #[tokio::test]
+    async fn hf_download_rejects_oversized_content_length_through_download_seam() {
+        let dirs = test_dirs();
+        let state = test_state(&dirs, json!({})).await;
+        let profile = json!({"id":"oversized", "model_id":"oversized/model"});
+        let result = download_hf_file_with_request(
+            &state,
+            &profile,
+            "model.onnx",
+            Duration::from_secs(1),
+            &|_, _, _| {
+                Box::pin(async {
+                    let fake = axum::http::Response::builder()
+                        .status(200)
+                        .header(axum::http::header::CONTENT_LENGTH, "9000000000")
+                        .body(reqwest::Body::from(Vec::new()))
+                        .unwrap();
+                    Ok(reqwest::Response::from(fake))
+                })
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(HfError::TooLarge(_))));
+    }
+
+    #[test]
+    fn hf_url_guard_rejects_spoofs_and_accepts_exact_hosts() {
+        for url in [
+            "file:///etc/passwd",
+            "https://huggingface.co@169.254.169.254/x",
+            "https://evil-huggingface.co/x",
+            "https://huggingface.co.evil.com/x",
+        ] {
+            assert!(
+                matches!(
+                    validate_hf_url(&reqwest::Url::parse(url).unwrap()),
+                    Err(HfError::Ssrf(_))
+                ),
+                "{url}"
+            );
+        }
+        for url in [
+            "https://huggingface.co/x",
+            "https://hf.co/x",
+            "https://cdn-lfs.huggingface.co/x",
+        ] {
+            assert!(
+                validate_hf_url(&reqwest::Url::parse(url).unwrap()).is_ok(),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn hf_url_keeps_slashes_and_path_guard_rejects_escape() {
+        let url = build_hf_url(
+            &json!({"model_id":"org/model", "hf_subdir":"v1"}),
+            "../model file.onnx",
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://huggingface.co/org/model/resolve/main/model%20file.onnx"
+        );
+        let root = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            secure_model_path(root.path(), "../../etc/passwd"),
+            Err(HfError::Path(_))
+        ));
+    }
 
     pub(crate) struct TestDirs {
         pub(crate) root: PathBuf,
@@ -2427,6 +3571,185 @@ pub(crate) mod tests {
                 retag_single(State(state.clone()), None, Bytes::copy_from_slice(body)).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
+    }
+
+    #[tokio::test]
+    async fn retag_async_validates_input_and_shared_job_exclusion() {
+        let dirs = test_dirs();
+        write_profile(
+            &dirs
+                .root
+                .join("extensions/builtin_wd_tagger/core_impl/profiles/a.json"),
+            "profile-a",
+            "A",
+            "model-a",
+        );
+        let state = test_state(&dirs, json!({})).await;
+        for body in [
+            br#"{"model_id":"","file_ids":[]}"#.as_slice(),
+            br#"{"model_id":"profile-a","file_ids":{},"batch_size":8}"#,
+            br#"{"model_id":"profile-a","file_ids":[],"batch_size":0}"#,
+            br#"{"model_id":"profile-a","file_ids":[],"batch_size":65}"#,
+            br#"{"model_id":"profile-a","file_ids":[],"thresholds":false}"#,
+        ] {
+            assert_eq!(
+                retag_batch(State(state.clone()), None, Bytes::copy_from_slice(body))
+                    .await
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let file_ids: Vec<i64> = (0..=500).collect();
+        assert_eq!(
+            retag_batch(
+                State(state.clone()),
+                None,
+                Bytes::from(json!({"model_id":"profile-a","file_ids":file_ids}).to_string())
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        state.job_manager.start(WD_TAGGER_JOB_ID, "WD-Tagger batch");
+        let response = retag_batch(
+            State(state),
+            None,
+            Bytes::from_static(br#"{"model_id":"profile-a","file_ids":[1]}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(json_body(response).await["code"], "job_running");
+    }
+
+    #[tokio::test]
+    async fn retag_cancel_uses_shared_wd_tagger_job() {
+        let dirs = test_dirs();
+        let state = test_state(&dirs, json!({})).await;
+        state.job_manager.start(WD_TAGGER_JOB_ID, "WD-Tagger batch");
+        let response = retag_cancel(State(state.clone()), None, Bytes::new()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["data"]["status"], "cancelling");
+        let idle_state = test_state(&dirs, json!({})).await;
+        let response = retag_cancel(State(idle_state), None, Bytes::new()).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json_body(response).await["code"], "job_not_running");
+    }
+
+    #[tokio::test]
+    async fn retag_query_normalizes_json_scalar_params_and_empty_query_has_no_targets() {
+        let dirs = test_dirs();
+        write_profile(
+            &dirs
+                .root
+                .join("extensions/builtin_wd_tagger/core_impl/profiles/a.json"),
+            "profile-a",
+            "A",
+            "model-a",
+        );
+        let state = test_state(&dirs, json!({})).await;
+        sqlx::raw_sql("CREATE TABLE favorites (file_id INTEGER NOT NULL, collection_id INTEGER); CREATE TABLE tags (id INTEGER PRIMARY KEY, tag TEXT); CREATE TABLE file_tags (file_id INTEGER NOT NULL, tag_id INTEGER NOT NULL);")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let response = retag_query(
+            State(state.clone()),
+            None,
+            Bytes::from(
+                json!({"model_id":"profile-a","query_params":{"q":"no-match","also_path":true,"limit":50,"fav_only":true}})
+                    .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["data"]["reason"], "no_targets");
+        sqlx::query("DROP TABLE files")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let response = retag_query(
+            State(state.clone()),
+            None,
+            Bytes::from_static(
+                br#"{"model_id":"profile-a","query_params":{"q":"no-match","also_path":true}}"#,
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["data"]["reason"], "no_targets");
+        let response = retag_query(
+            State(state),
+            None,
+            Bytes::from_static(br#"{"model_id":"profile-a","query_params":{}}"#),
+        )
+        .await;
+        assert_eq!(
+            json_body(response).await["data"],
+            json!({"started":false,"reason":"no_targets","scope":"query"})
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_targets_use_requested_model_while_batch_keeps_configured_model() {
+        let dirs = test_dirs();
+        let state = test_state(&dirs, json!({})).await;
+        sqlx::query("UPDATE files SET is_deleted = 1")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        for id in [501_i64, 502] {
+            sqlx::query("INSERT INTO files(id, path, is_deleted) VALUES (?, ?, 0)")
+                .bind(id)
+                .bind(format!("/img/{id}.png"))
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO wd_model_dict(model) VALUES ('SmilingWolf_wd-swinv2-tagger-v3')",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+        let configured_model_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM wd_model_dict WHERE model = 'SmilingWolf_wd-swinv2-tagger-v3'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO file_wd_tags(file_id, tag_id, category_id, model_id, confidence_milli) VALUES (501, 1, 1, 2, 900), (?, 1, 1, ?, 900)")
+            .bind(502).bind(configured_model_id)
+            .execute(&state.db).await.unwrap();
+        let requested =
+            crate::routes::wd_tagger_batch::query_backfill_targets(&state, "", 0, false, Some(2))
+                .await;
+        assert_eq!(requested, vec![502]);
+        let configured =
+            crate::routes::wd_tagger_batch::query_backfill_targets(&state, "", 0, false, None)
+                .await;
+        assert_eq!(configured, vec![501]);
+    }
+
+    #[tokio::test]
+    async fn retag_start_blocks_native_batch_start() {
+        let dirs = test_dirs();
+        let state = test_state(&dirs, json!({})).await;
+        state.job_manager.start(WD_TAGGER_JOB_ID, "WD-Tagger retag");
+        let result = crate::routes::wd_tagger_batch::start_batch_job(
+            state.clone(),
+            crate::routes::wd_tagger_batch::BatchRequest {
+                file_ids: Some(vec![1]),
+                scan_root: None,
+                limit: 1,
+                force: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            crate::routes::wd_tagger_batch::StartResult::AlreadyRunning
+        ));
+        state.job_manager.cancel_job(WD_TAGGER_JOB_ID);
     }
 
     #[tokio::test]

@@ -706,11 +706,14 @@ mod tests {
         assert_eq!(set_value["ok"], true);
         assert_eq!(set_value["data"]["succeeded"], 2);
 
+        // `q` filters by file **path**, not by the note value — Python-compatible
+        // semantics, documented at `notes_data`'s LEFT JOIN. `/tmp/a.png` is the
+        // file carrying the note set above.
         let notes_value = json_body(
             notes_data(
                 State(Arc::clone(&state)),
                 None,
-                Query(HashMap::from([("q".to_string(), "first".to_string())])),
+                Query(HashMap::from([("q".to_string(), "a.png".to_string())])),
             )
             .await,
         )

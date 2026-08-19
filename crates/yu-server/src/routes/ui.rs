@@ -9,6 +9,7 @@ use axum::{
 };
 use serde_json::{json, Value};
 
+use crate::config_io::load as load_config_json;
 use crate::{
     auth::{scope::require_admin_scope, AuthContext},
     state::SharedState,
@@ -73,11 +74,63 @@ async fn fwd_delete(state: &SharedState, path: &str) -> Response {
 }
 
 /// POST /api/ui/switch — no auth (Python also requires none)
-pub async fn ui_switch() -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({"ok": false, "error": "not implemented"})),
-    )
+///
+/// Ported from `routes/ui_api.py::api_ui_switch` +
+/// `core/ui_core/manager.py::switch_ui`. The Rust handler previously returned
+/// an unconditional 501 while `fwd_post` above sat unused; with `python_url`
+/// empty by default (and forced empty in standalone, `main.rs:771-775`) that
+/// forwarder could never have served this route anyway.
+///
+/// Python writes `config["ui"] = None` for `"default"` so `resolve_active_ui`
+/// falls through to its own default, and a plain name otherwise. The
+/// load/modify/write triple takes `settings_lock`: `config_io`'s own test
+/// documents that the lock — not the atomic rename — is what prevents lost
+/// updates between concurrent config writers.
+pub async fn ui_switch(State(state): State<SharedState>, body: Bytes) -> Response {
+    let name = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .as_ref()
+        .and_then(|value| value.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if !is_safe_ui_name(&name) {
+        return api_error("Invalid UI name".to_string(), StatusCode::BAD_REQUEST);
+    }
+
+    let ui_dir = state.config.project_root.join("ui").join(&name);
+    if !ui_dir.is_dir() {
+        return api_error(format!("UI '{name}' not found"), StatusCode::NOT_FOUND);
+    }
+    if load_ui_manifest(&ui_dir).is_none() {
+        return api_error(
+            format!("UI '{name}' has no valid manifest.json"),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
+    let _guard = state.settings_lock.lock().await;
+    let mut config = load_config_json(&state.config.config_path);
+    if !config.is_object() {
+        config = json!({});
+    }
+    config["ui"] = if name == "default" {
+        Value::Null
+    } else {
+        json!(name)
+    };
+    if let Err(error) = crate::config_io::write(&state.config.config_path, &config) {
+        let path = state.config.config_path.display();
+        let message = if error.kind() == std::io::ErrorKind::PermissionDenied {
+            format!("Config save failed (permission denied): {path}")
+        } else {
+            format!("Config save failed: {error}")
+        };
+        tracing::error!(?error, "failed to save config while switching UI");
+        return api_error(message, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    api_result(json!({"name": name, "restart_required": true}))
 }
 
 pub async fn install(
@@ -160,21 +213,6 @@ fn list_uis(project_root: &Path, config_path: &Path) -> std::io::Result<Vec<Valu
     Ok(result)
 }
 
-pub(crate) fn load_config_json(config_path: &Path) -> Value {
-    let mut paths = vec![config_path.to_path_buf()];
-    paths.push(PathBuf::from("config.json"));
-    paths.push(PathBuf::from("tagdb_config.json"));
-    for path in paths {
-        if path.exists() {
-            return std::fs::read_to_string(path)
-                .ok()
-                .and_then(|raw| serde_json::from_str(&raw).ok())
-                .unwrap_or_else(|| json!({"scan_roots": []}));
-        }
-    }
-    json!({"scan_roots": []})
-}
-
 pub(crate) fn resolve_active_ui(project_root: &Path, config: &Value) -> String {
     if let Some(explicit) = config
         .get("ui")
@@ -232,6 +270,10 @@ pub(crate) fn api_result(payload: Value) -> Response {
     body.insert("error".to_string(), Value::Null);
     body.entry("data".to_string()).or_insert(Value::Null);
     Json(Value::Object(body)).into_response()
+}
+
+pub(crate) fn api_error(message: String, status: StatusCode) -> Response {
+    (status, Json(json!({"ok": false, "error": message}))).into_response()
 }
 
 pub(crate) fn internal_error(error: impl std::fmt::Debug, message: &'static str) -> Response {
@@ -379,5 +421,120 @@ mod tests {
         let value = json_body(response).await;
         assert_eq!(value["data"]["uis"][0]["name"], "default");
         assert_eq!(value["data"]["uis"][0]["active"], true);
+    }
+
+    /// `switch_ui` fixtures: a real UI directory plus a valid manifest.
+    fn write_ui(root: &Path, name: &str) {
+        write_file(
+            &root.join(format!("ui/{name}/manifest.json")),
+            &format!(r#"{{"name":"{name}","version":"1.0"}}"#),
+        );
+    }
+
+    async fn switch(state: SharedState, body: &str) -> (axum::http::StatusCode, serde_json::Value) {
+        let response = ui_switch(State(state), Bytes::from(body.to_owned())).await;
+        let status = response.status();
+        (status, json_body(response).await)
+    }
+
+    #[tokio::test]
+    async fn ui_switch_writes_the_name_and_reports_restart_required() {
+        let root = temp_root("ui-switch-ok");
+        write_ui(&root, "default");
+        write_ui(&root, "sample");
+        let state = test_state(root.clone(), r#"{"ui":null,"other":1}"#).await;
+
+        let (status, body) = switch(state.clone(), r#"{"name":"sample"}"#).await;
+        let written = load_config_json(&state.config.config_path);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        // Python's api_result -> api_success shape, plus the payload keys.
+        assert_eq!(
+            body,
+            json!({"ok": true, "error": null, "data": null,
+                   "name": "sample", "restart_required": true})
+        );
+        assert_eq!(written["ui"], "sample");
+        // Unrelated config keys must survive the read-modify-write.
+        assert_eq!(written["other"], 1);
+    }
+
+    /// Python writes `config["ui"] = None` for `"default"` (manager.py:55) so
+    /// `resolve_active_ui` falls through rather than pinning the name.
+    #[tokio::test]
+    async fn ui_switch_to_default_clears_the_key_instead_of_writing_the_name() {
+        let root = temp_root("ui-switch-default");
+        write_ui(&root, "default");
+        let state = test_state(root.clone(), r#"{"ui":"sample"}"#).await;
+
+        let (status, body) = switch(state.clone(), r#"{"name":"default"}"#).await;
+        let written = load_config_json(&state.config.config_path);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body["name"], "default");
+        assert_eq!(written["ui"], serde_json::Value::Null);
+        assert_eq!(
+            resolve_active_ui(&PathBuf::from("."), &written),
+            "default",
+            "clearing the key must leave resolve_active_ui on its own default"
+        );
+    }
+
+    #[tokio::test]
+    async fn ui_switch_rejects_unsafe_names_before_touching_the_filesystem() {
+        let root = temp_root("ui-switch-unsafe");
+        write_ui(&root, "default");
+        write_file(
+            &root.join("evil/manifest.json"),
+            r#"{"name":"evil","version":"1.0"}"#,
+        );
+        let state = test_state(root.clone(), r#"{"ui":null}"#).await;
+
+        for body in [
+            r#"{"name":"../evil"}"#,
+            r#"{"name":"/etc"}"#,
+            r#"{"name":"a b"}"#,
+            r#"{"name":"  "}"#,
+            r#"{"name":""}"#,
+            r#"{}"#,
+            r#"{"name":123}"#,
+            "not json at all",
+        ] {
+            let (status, value) = switch(state.clone(), body).await;
+            assert_eq!(
+                (status, value["error"].clone()),
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    json!("Invalid UI name")
+                ),
+                "{body}"
+            );
+        }
+        let untouched = load_config_json(&state.config.config_path);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(untouched["ui"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn ui_switch_reports_missing_directory_and_invalid_manifest_separately() {
+        let root = temp_root("ui-switch-missing");
+        write_ui(&root, "default");
+        // Directory exists but the manifest fails validation (empty name).
+        write_file(&root.join("ui/broken/manifest.json"), r#"{"name":""}"#);
+        let state = test_state(root.clone(), r#"{"ui":null}"#).await;
+
+        let (missing_status, missing) = switch(state.clone(), r#"{"name":"ghost"}"#).await;
+        let (broken_status, broken) = switch(state.clone(), r#"{"name":"broken"}"#).await;
+        let untouched = load_config_json(&state.config.config_path);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(missing_status, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(missing["error"], "UI 'ghost' not found");
+        assert_eq!(missing["ok"], false);
+        assert_eq!(broken_status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(broken["error"], "UI 'broken' has no valid manifest.json");
+        assert_eq!(untouched["ui"], serde_json::Value::Null);
     }
 }

@@ -34,21 +34,12 @@ pub struct ReorderServersBody {
 
 fn read_config(config_path: &Path) -> Result<Value, std::io::Error> {
     let text = std::fs::read_to_string(config_path)?;
-    serde_json::from_str(&text)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-}
-
-fn write_config(config_path: &Path, config: &Value) -> Result<(), std::io::Error> {
-    let tmp = config_path.with_extension("json.tmp");
-    let text = serde_json::to_string_pretty(config)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, config_path)
+    crate::config_io::parse_strict(config_path, &text)
 }
 
 /// `ai_servers` accessor that distinguishes "absent" (treated as empty) from
 /// "present but not a list" (Python returns an error in that case).
-fn servers_array<'a>(config: &'a Value) -> Result<Option<&'a Vec<Value>>, String> {
+fn servers_array(config: &Value) -> Result<Option<&Vec<Value>>, String> {
     match config.get("ai_servers") {
         None => Ok(None),
         Some(Value::Array(arr)) => Ok(Some(arr)),
@@ -288,12 +279,13 @@ pub async fn add_server(State(state): State<SharedState>, Json(raw): Json<Value>
         Ok(body) => body,
         Err(message) => return api_error(&message, StatusCode::BAD_REQUEST),
     };
+    let _guard = state.settings_lock.lock().await;
     let mut config = match read_config(&state.config.config_path) {
         Ok(config) => config,
         Err(error) => return internal_error(error, "failed to read config"),
     };
     match do_add(&mut config, &body) {
-        Ok(result) => match write_config(&state.config.config_path, &config) {
+        Ok(result) => match crate::config_io::write(&state.config.config_path, &config) {
             Ok(()) => api_created(result),
             Err(error) => internal_error(error, "failed to write config"),
         },
@@ -306,12 +298,13 @@ pub async fn activate_server(
     State(state): State<SharedState>,
     AxumPath(server_id): AxumPath<String>,
 ) -> Response {
+    let _guard = state.settings_lock.lock().await;
     let mut config = match read_config(&state.config.config_path) {
         Ok(config) => config,
         Err(error) => return internal_error(error, "failed to read config"),
     };
     match do_activate(&mut config, &server_id) {
-        Ok(result) => match write_config(&state.config.config_path, &config) {
+        Ok(result) => match crate::config_io::write(&state.config.config_path, &config) {
             Ok(()) => api_result(result),
             Err(error) => internal_error(error, "failed to write config"),
         },
@@ -324,12 +317,13 @@ pub async fn reorder_servers(
     State(state): State<SharedState>,
     Json(body): Json<ReorderServersBody>,
 ) -> Response {
+    let _guard = state.settings_lock.lock().await;
     let mut config = match read_config(&state.config.config_path) {
         Ok(config) => config,
         Err(error) => return internal_error(error, "failed to read config"),
     };
     match do_reorder(&mut config, &body.server_ids) {
-        Ok(result) => match write_config(&state.config.config_path, &config) {
+        Ok(result) => match crate::config_io::write(&state.config.config_path, &config) {
             Ok(()) => api_result(result),
             Err(error) => internal_error(error, "failed to write config"),
         },
@@ -445,12 +439,13 @@ pub async fn remove_server(
     State(state): State<SharedState>,
     AxumPath(server_id): AxumPath<String>,
 ) -> Response {
+    let _guard = state.settings_lock.lock().await;
     let mut config = match read_config(&state.config.config_path) {
         Ok(config) => config,
         Err(error) => return internal_error(error, "failed to read config"),
     };
     match do_remove(&mut config, &server_id) {
-        Ok(result) => match write_config(&state.config.config_path, &config) {
+        Ok(result) => match crate::config_io::write(&state.config.config_path, &config) {
             Ok(()) => api_result(result),
             Err(error) => internal_error(error, "failed to write config"),
         },

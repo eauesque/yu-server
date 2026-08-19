@@ -101,7 +101,7 @@ async fn fetch_schema(
 // Args helpers
 // ---------------------------------------------------------------------------
 
-fn set_arg(args: &mut Vec<Value>, lm: &HashMap<String, usize>, label: &str, val: Value) {
+fn set_arg(args: &mut [Value], lm: &HashMap<String, usize>, label: &str, val: Value) {
     if let Some(&i) = lm.get(label) {
         if i < args.len() {
             args[i] = val;
@@ -183,8 +183,7 @@ async fn call_gradio(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("SSE read: {e}"))?;
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        loop {
-            let Some(nl) = buf.find('\n') else { break };
+        while let Some(nl) = buf.find('\n') {
             let line = buf[..nl].trim_end_matches('\r').to_string();
             buf = buf[nl + 1..].to_string();
             if let Some(ev) = line.strip_prefix("event:") {
@@ -264,7 +263,11 @@ async fn resolve_images(
         let b64 = match item {
             Value::String(s) => {
                 if let Some(rest) = s.strip_prefix("data:image") {
-                    rest.splitn(2, ',').nth(1).unwrap_or(s).to_string().into()
+                    rest.split_once(',')
+                        .map(|x| x.1)
+                        .unwrap_or(s)
+                        .to_string()
+                        .into()
                 } else {
                     Some(s.clone())
                 }
@@ -344,7 +347,7 @@ pub async fn generate_gradio(state: SharedState, body: Value) -> Response {
     if body
         .get("init_images")
         .and_then(Value::as_array)
-        .map_or(false, |a| !a.is_empty())
+        .is_some_and(|a| !a.is_empty())
     {
         return api_err(
             "img2img is not supported in Gradio / Forge mode",

@@ -205,7 +205,7 @@ async fn read_gateway_section(state: &SharedState) -> serde_json::Value {
     tokio::fs::read_to_string(&state.config.config_path)
         .await
         .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|raw| crate::config_io::parse(&state.config.config_path, &raw))
         .and_then(|v| v.get("gateway").cloned())
         .unwrap_or_default()
 }
@@ -307,9 +307,8 @@ pub async fn list_extensions(
     // Load user-overridden enabled states from config.json (mirrors Python get_extension_config_value)
     let user_cfg: serde_json::Value = std::fs::read_to_string(&state.config.config_path)
         .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
+        .and_then(|t| crate::config_io::parse(&state.config.config_path, &t))
         .unwrap_or(json!({}));
-    let ext_overrides = &user_cfg["extensions"];
     let extensions: Vec<serde_json::Value> = std::fs::read_dir(&ext_dir)
         .into_iter()
         .flatten()
@@ -319,10 +318,7 @@ pub async fn list_extensions(
             let text = std::fs::read_to_string(&meta_path).ok()?;
             let mut v: serde_json::Value = serde_json::from_str(&text).ok()?;
             let name = v["name"].as_str().unwrap_or("").to_string();
-            // Resolve enabled: user config.json override → extension.json config.enabled → true
-            let enabled = ext_overrides[&name]["enabled"]
-                .as_bool()
-                .unwrap_or_else(|| v["config"]["enabled"].as_bool().unwrap_or(true));
+            let enabled = crate::ext_config::resolve_extension_enabled(&user_cfg, &name, &v);
             let obj = v.as_object_mut()?;
             obj.insert("enabled".into(), serde_json::Value::Bool(enabled));
             obj.entry("nav").or_insert(json!({}));
@@ -345,10 +341,21 @@ fn py_unavailable() -> Response {
 }
 
 #[cfg(feature = "python-backend")]
+fn record_proxy_hit(state: &SharedState, method: &str, path: &str) {
+    *state
+        .proxy_hits
+        .lock()
+        .expect("proxy_hits lock")
+        .entry(format!("{method} {path}"))
+        .or_default() += 1;
+}
+
+#[cfg(feature = "python-backend")]
 async fn fwd_get(state: &crate::state::SharedState, path: &str) -> Response {
     if state.config.python_url.is_empty() {
         return py_unavailable();
     }
+    record_proxy_hit(state, "GET", path);
     let url = format!("{}{}", state.config.python_url.trim_end_matches('/'), path);
     match state
         .python_client
@@ -378,6 +385,7 @@ async fn fwd_post(state: &crate::state::SharedState, path: &str, body: Bytes) ->
     if state.config.python_url.is_empty() {
         return py_unavailable();
     }
+    record_proxy_hit(state, "POST", path);
     let url = format!("{}{}", state.config.python_url.trim_end_matches('/'), path);
     match state
         .python_client
@@ -415,6 +423,7 @@ async fn fwd_post_passthrough(
     if state.config.python_url.is_empty() {
         return py_unavailable();
     }
+    record_proxy_hit(state, "POST", path);
     let url = format!("{}{}", state.config.python_url.trim_end_matches('/'), path);
     let ct = content_type
         .and_then(|v| v.to_str().ok())
@@ -460,6 +469,7 @@ async fn fwd_post_stream(
     if state.config.python_url.is_empty() {
         return py_unavailable();
     }
+    record_proxy_hit(state, "POST", path);
     let url = format!("{}{}", state.config.python_url.trim_end_matches('/'), path);
     let ct = content_type
         .and_then(|v| v.to_str().ok())
@@ -522,6 +532,7 @@ async fn fwd_put(state: &crate::state::SharedState, path: &str, body: Bytes) -> 
     if state.config.python_url.is_empty() {
         return py_unavailable();
     }
+    record_proxy_hit(state, "PUT", path);
     let url = format!("{}{}", state.config.python_url.trim_end_matches('/'), path);
     match state
         .python_client
@@ -554,6 +565,7 @@ async fn fwd_delete(state: &crate::state::SharedState, path: &str) -> Response {
     if state.config.python_url.is_empty() {
         return py_unavailable();
     }
+    record_proxy_hit(state, "DELETE", path);
     let url = format!("{}{}", state.config.python_url.trim_end_matches('/'), path);
     match state
         .python_client
@@ -583,6 +595,7 @@ async fn fwd_patch(state: &crate::state::SharedState, path: &str, body: Bytes) -
     if state.config.python_url.is_empty() {
         return py_unavailable();
     }
+    record_proxy_hit(state, "PATCH", path);
     let url = format!("{}{}", state.config.python_url.trim_end_matches('/'), path);
     match state
         .python_client
@@ -771,18 +784,19 @@ fn utc_now_iso() -> String {
     let mut y = 1970u64;
     let mut rem = secs / 86400;
     loop {
-        let days_in_year = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
-            366
-        } else {
-            365
-        };
+        let days_in_year =
+            if y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400)) {
+                366
+            } else {
+                365
+            };
         if rem < days_in_year {
             break;
         }
         rem -= days_in_year;
         y += 1;
     }
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let leap = y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
     let month_days = [
         31u64,
         if leap { 29 } else { 28 },
@@ -1343,7 +1357,7 @@ pub async fn archive_cleanup_llm_config() -> impl IntoResponse {
 }
 
 /// GET /api/tools/archive-cleanup/list-models
-
+///
 /// GET+POST /ext/lan_cowork/fleet/peers
 pub async fn fleet_peers() -> impl IntoResponse {
     Json(json!({"peers": []}))
@@ -1448,6 +1462,10 @@ mod standalone_tests {
 
     fn make_standalone_state() -> crate::state::SharedState {
         Arc::new(crate::state::AppState {
+            effective_port: 5000,
+            gateway_keys: Vec::new(),
+            gateway_loopback_bypass: true,
+            settings_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             config: crate::state::Config {
                 db_path: "sqlite::memory:".to_string(),
                 pin_hash: String::new(),
@@ -1480,7 +1498,7 @@ mod standalone_tests {
             vectors_db: sqlx::pool::Pool::connect_lazy("sqlite::memory:").unwrap(),
             vectors_db_read: sqlx::pool::Pool::connect_lazy("sqlite::memory:").unwrap(),
             clip_index: std::sync::Arc::new(
-                crate::routes::clip_index::ClipIndex::new_default(&std::env::temp_dir())
+                crate::routes::clip_index::ClipIndex::new_default(std::env::temp_dir())
                     .expect("clip index test default"),
             ),
             clip_indexer: std::sync::Arc::new(crate::routes::clip_indexer::ClipIndexer::new()),
@@ -1509,6 +1527,7 @@ mod standalone_tests {
             infer_client: None,
             infer_child: None,
             scan_manager: std::sync::OnceLock::new(),
+            hailo_yolo_stream: None,
             stats_basic_cache: crate::state::TtlCache::new(crate::state::STATS_CACHE_TTL),
             stats_models_cache: crate::state::TtlCache::new(crate::state::STATS_CACHE_TTL),
             checkpoints_cache: crate::state::TtlCache::new(crate::state::STATS_CACHE_TTL),
@@ -1537,13 +1556,92 @@ mod standalone_tests {
             axum::http::StatusCode::SERVICE_UNAVAILABLE
         );
     }
+
+    #[tokio::test]
+    async fn fwd_post_records_attempt_before_connection_failure() {
+        let mut state = make_standalone_state();
+        Arc::get_mut(&mut state).unwrap().config.python_url = "http://127.0.0.1:0".to_string();
+
+        let response = fwd_post(&state, "/api/some/route", Bytes::new()).await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            state
+                .proxy_hits
+                .lock()
+                .expect("proxy_hits lock")
+                .get("POST /api/some/route"),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test]
+    async fn hailo_genai_handlers_fall_back_to_python_without_infer_client() {
+        let mut state = make_standalone_state();
+        Arc::get_mut(&mut state).unwrap().config.python_url = "http://127.0.0.1:0".to_string();
+
+        let llm_response = hailo_genai_llm_generate(
+            State(state.clone()),
+            None,
+            axum::http::HeaderMap::new(),
+            Bytes::from(json!({"prompt": "hello"}).to_string()),
+        )
+        .await;
+        let embeddings_response = hailo_genai_v1_embeddings(
+            State(state.clone()),
+            None,
+            Bytes::from(json!({"input": "hello"}).to_string()),
+        )
+        .await;
+
+        assert_eq!(llm_response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(embeddings_response.status(), StatusCode::BAD_GATEWAY);
+        let proxy_hits = state.proxy_hits.lock().expect("proxy_hits lock");
+        assert_eq!(
+            proxy_hits.get("POST /ext/hailo-genai/api/llm/generate"),
+            Some(&1)
+        );
+        assert_eq!(
+            proxy_hits.get("POST /ext/hailo-genai/v1/embeddings"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn llm_messages_flatten_text_parts() {
+        let messages = llm_messages(&json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "first"},
+                    {"type": "image_url", "image_url": "ignored"},
+                    {"type": "text", "text": "second"}
+                ]
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            messages,
+            vec![json!({"role": "user", "content": "first\nsecond"})]
+        );
+    }
+
+    #[test]
+    fn embedding_inputs_accept_strings_and_reject_mixed_arrays() {
+        assert_eq!(
+            embedding_inputs(&json!({"input": ["one", "two"]})).unwrap(),
+            vec!["one", "two"]
+        );
+        assert_eq!(
+            embedding_inputs(&json!({"input": ["one", 2]})).unwrap_err(),
+            "input[1] must be a string"
+        );
+    }
 }
 
 // --- hailo-genai API (proxy to Python extension) ---
 
-pub async fn hailo_genai_runtime(State(s): State<SharedState>) -> Response {
-    fwd_ext_get(&s, "/ext/hailo-genai/api/runtime").await
-}
 pub async fn hailo_genai_model_status(
     State(s): State<SharedState>,
     auth_context: Option<Extension<AuthContext>>,
@@ -1617,9 +1715,19 @@ pub async fn hailo_genai_model_unload(State(s): State<SharedState>, body: Bytes)
 }
 pub async fn hailo_genai_llm_generate(
     State(s): State<SharedState>,
+    auth_context: Option<Extension<AuthContext>>,
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Some(response) = require_admin_scope(
+        s.config.pin_auth_enabled,
+        auth_context.as_ref().map(|context| &context.0),
+    ) {
+        return response;
+    }
+    if let Some(infer_client) = s.infer_client.as_ref() {
+        return hailo_genai_llm_generate_native(&s, infer_client, &body).await;
+    }
     fwd_ext_post_stream(
         &s,
         "/ext/hailo-genai/api/llm/generate",
@@ -1627,6 +1735,203 @@ pub async fn hailo_genai_llm_generate(
         headers.get("content-type"),
     )
     .await
+}
+
+fn hailo_genai_error(status: StatusCode, message: impl Into<String>) -> Response {
+    (
+        status,
+        Json(json!({"status": "error", "message": message.into()})),
+    )
+        .into_response()
+}
+
+fn flatten_llm_content(content: Option<&serde_json::Value>) -> Option<String> {
+    match content {
+        None | Some(serde_json::Value::Null) => Some(String::new()),
+        Some(serde_json::Value::String(text)) => Some(text.clone()),
+        Some(serde_json::Value::Array(parts)) => Some(
+            parts
+                .iter()
+                .filter(|part| part.get("type").and_then(|value| value.as_str()) == Some("text"))
+                .filter_map(|part| part.get("text").and_then(|value| value.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => None,
+    }
+}
+
+fn llm_messages(value: &serde_json::Value) -> Result<Vec<serde_json::Value>, &'static str> {
+    match value.get("messages") {
+        Some(serde_json::Value::Array(messages)) if !messages.is_empty() => messages
+            .iter()
+            .map(|message| {
+                let role = message.get("role").and_then(|role| role.as_str());
+                let content = flatten_llm_content(message.get("content"));
+                match (role, content) {
+                    (Some(role), Some(content)) => Ok(json!({"role": role, "content": content})),
+                    _ => Err("Invalid messages format"),
+                }
+            })
+            .collect(),
+        Some(serde_json::Value::Null | serde_json::Value::Array(_)) | None => {
+            let prompt = value
+                .get("prompt")
+                .and_then(|prompt| prompt.as_str())
+                .unwrap_or("")
+                .trim();
+            if prompt.is_empty() {
+                return Err("prompt or messages is required");
+            }
+            let system_prompt = value
+                .get("system_prompt")
+                .and_then(|prompt| prompt.as_str())
+                .unwrap_or("You are a helpful assistant.");
+            Ok(vec![
+                json!({"role": "system", "content": system_prompt}),
+                json!({"role": "user", "content": prompt}),
+            ])
+        }
+        _ => Err("Invalid messages format"),
+    }
+}
+
+fn validate_llm_messages_shape(messages: &serde_json::Value) -> Result<(), String> {
+    let Some(messages) = messages.as_array() else {
+        return Err("messages must be an array".to_string());
+    };
+    for (index, message) in messages.iter().enumerate() {
+        let Some(message) = message.as_object() else {
+            return Err(format!("messages[{index}] must be an object"));
+        };
+        if !message
+            .get("role")
+            .is_some_and(serde_json::Value::is_string)
+        {
+            return Err(format!("messages[{index}].role must be a string"));
+        }
+        match message.get("content") {
+            None | Some(serde_json::Value::Null | serde_json::Value::String(_)) => {}
+            Some(serde_json::Value::Array(parts)) => {
+                for (part_index, part) in parts.iter().enumerate() {
+                    if !part.is_object() {
+                        return Err(format!(
+                            "messages[{index}].content[{part_index}] must be an object"
+                        ));
+                    }
+                }
+            }
+            Some(_) => {
+                return Err(format!(
+                    "messages[{index}].content must be a string or an array"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_llm_generation_request(value: &serde_json::Value) -> Result<(), String> {
+    if !value.is_object() {
+        return Err("request body must be an object".to_string());
+    }
+    for field in ["model", "vlm_model", "prompt", "content", "system_prompt"] {
+        if value
+            .get(field)
+            .is_some_and(|value| !value.is_null() && !value.is_string())
+        {
+            return Err(format!("{field} must be a string"));
+        }
+    }
+    if let Some(messages) = value.get("messages") {
+        validate_llm_messages_shape(messages)?;
+    }
+    for field in ["temperature", "top_p"] {
+        if value
+            .get(field)
+            .is_some_and(|value| !value.as_f64().is_some_and(f64::is_finite))
+        {
+            return Err(format!("{field} must be a finite number"));
+        }
+    }
+    for field in ["max_generated_tokens", "max_tokens"] {
+        if value.get(field).is_some_and(|value| {
+            !matches!(value, serde_json::Value::Number(number) if number.is_i64() || number.is_u64())
+        }) {
+            return Err(format!("{field} must be an integer"));
+        }
+    }
+    Ok(())
+}
+
+async fn hailo_genai_llm_generate_native(
+    state: &SharedState,
+    infer_client: &crate::infer_client::InferClient,
+    body: &Bytes,
+) -> Response {
+    let value: serde_json::Value = serde_json::from_slice(body).unwrap_or_else(|_| json!({}));
+    if let Err(message) = validate_llm_generation_request(&value) {
+        return hailo_genai_error(StatusCode::BAD_REQUEST, message);
+    }
+    let messages = match llm_messages(&value) {
+        Ok(messages) => messages,
+        Err(message) => return hailo_genai_error(StatusCode::BAD_REQUEST, message),
+    };
+    let model = value
+        .get("model")
+        .and_then(|model| model.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::routes::hailo_genai_chat::default_llm_model(state));
+    if !crate::routes::analysis::is_hailo_hef_available(&model) {
+        return hailo_genai_error(
+            StatusCode::BAD_REQUEST,
+            format!("Model '{model}' not downloaded yet"),
+        );
+    }
+
+    let config = read_config_json(state);
+    let temperature = value
+        .get("temperature")
+        .and_then(|value| value.as_f64())
+        .or_else(|| config["extensions"]["builtin-hailo-genai"]["temperature"].as_f64())
+        .unwrap_or(0.7) as f32;
+    let max_generated_tokens = value
+        .get("max_generated_tokens")
+        .and_then(|value| value.as_u64())
+        .or_else(|| config["extensions"]["builtin-hailo-genai"]["max_generated_tokens"].as_u64())
+        .unwrap_or(512) as u32;
+    let upstream = match infer_client
+        .llm_generate_stream(
+            Some(model_name_to_hef_path(&model)),
+            messages,
+            Vec::new(),
+            None,
+            Some(temperature),
+            None,
+            None,
+            None,
+            Some(max_generated_tokens),
+            None,
+            None,
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(%error, "yu-infer LLM generation failed");
+            return sse_event(json!({"error": "LLM generation failed"}));
+        }
+    };
+    stream_sse_from_upstream(upstream)
+}
+
+fn sse_event(value: serde_json::Value) -> Response {
+    Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+        .header(axum::http::header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(axum::body::Body::from(format!("data: {value}\n\n")))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 pub async fn hailo_genai_llm_clear_context(State(s): State<SharedState>, body: Bytes) -> Response {
     fwd_ext_post(&s, "/ext/hailo-genai/api/llm/clear-context", body).await
@@ -1809,7 +2114,7 @@ async fn hailo_genai_vlm_generate_native(
 pub(crate) fn read_config_json(state: &SharedState) -> serde_json::Value {
     std::fs::read_to_string(&state.config.config_path)
         .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
+        .and_then(|t| crate::config_io::parse(&state.config.config_path, &t))
         .unwrap_or(json!({}))
 }
 
@@ -1886,86 +2191,6 @@ pub async fn hailo_semantic_caption_stop(State(s): State<SharedState>, body: Byt
     fwd_ext_post(&s, "/ext/hailo-semantic/api/caption/stop", body).await
 }
 
-// --- hailo-yolo API (proxy to Python extension) ---
-
-pub async fn hailo_yolo_runtime(State(s): State<SharedState>) -> Response {
-    fwd_ext_get(&s, "/ext/hailo-yolo/api/runtime").await
-}
-pub async fn hailo_yolo_labels(State(s): State<SharedState>) -> Response {
-    fwd_ext_get(&s, "/ext/hailo-yolo/api/labels").await
-}
-pub async fn hailo_yolo_detect_start(State(s): State<SharedState>, body: Bytes) -> Response {
-    fwd_ext_post(&s, "/ext/hailo-yolo/api/detect/start", body).await
-}
-pub async fn hailo_yolo_detect_status(State(s): State<SharedState>) -> Response {
-    fwd_ext_get(&s, "/ext/hailo-yolo/api/detect/status").await
-}
-pub async fn hailo_yolo_detect_stop(State(s): State<SharedState>, body: Bytes) -> Response {
-    fwd_ext_post(&s, "/ext/hailo-yolo/api/detect/stop", body).await
-}
-pub async fn hailo_yolo_detect_search(
-    State(s): State<SharedState>,
-    axum::extract::RawQuery(qs): axum::extract::RawQuery,
-) -> Response {
-    let path = qs.map_or_else(
-        || "/ext/hailo-yolo/api/detect/search".to_string(),
-        |q| format!("/ext/hailo-yolo/api/detect/search?{q}"),
-    );
-    fwd_ext_get(&s, &path).await
-}
-pub async fn hailo_yolo_detect_clear(State(s): State<SharedState>, body: Bytes) -> Response {
-    fwd_ext_post(&s, "/ext/hailo-yolo/api/detect/clear", body).await
-}
-pub async fn hailo_yolo_stream_sources_get(State(s): State<SharedState>) -> Response {
-    fwd_ext_get(&s, "/ext/hailo-yolo/api/stream/sources").await
-}
-pub async fn hailo_yolo_stream_sources_post(State(s): State<SharedState>, body: Bytes) -> Response {
-    fwd_ext_post(&s, "/ext/hailo-yolo/api/stream/sources", body).await
-}
-pub async fn hailo_yolo_stream_rules_get(State(s): State<SharedState>) -> Response {
-    fwd_ext_get(&s, "/ext/hailo-yolo/api/stream/rules").await
-}
-pub async fn hailo_yolo_stream_rules_post(State(s): State<SharedState>, body: Bytes) -> Response {
-    fwd_ext_post(&s, "/ext/hailo-yolo/api/stream/rules", body).await
-}
-pub async fn hailo_yolo_stream_status(State(s): State<SharedState>) -> Response {
-    fwd_ext_get(&s, "/ext/hailo-yolo/api/stream/status").await
-}
-
-// --- hailo-yolo dynamic path routes ---
-pub async fn hailo_yolo_detect_results(
-    State(s): State<SharedState>,
-    Path(file_id): Path<String>,
-) -> Response {
-    fwd_ext_get(&s, &format!("/ext/hailo-yolo/api/detect/results/{file_id}")).await
-}
-
-pub async fn hailo_yolo_stream_source_start(
-    State(s): State<SharedState>,
-    Path(source_id): Path<String>,
-    body: Bytes,
-) -> Response {
-    fwd_ext_post(
-        &s,
-        &format!("/ext/hailo-yolo/api/stream/sources/{source_id}/start"),
-        body,
-    )
-    .await
-}
-
-pub async fn hailo_yolo_stream_source_stop(
-    State(s): State<SharedState>,
-    Path(source_id): Path<String>,
-    body: Bytes,
-) -> Response {
-    fwd_ext_post(
-        &s,
-        &format!("/ext/hailo-yolo/api/stream/sources/{source_id}/stop"),
-        body,
-    )
-    .await
-}
-
 // --- hailo-genai dynamic path routes ---
 // --- hailo-genai s2t routes ---
 pub async fn hailo_genai_s2t_transcribe(
@@ -2019,14 +2244,422 @@ pub async fn hailo_genai_s2t_transcript(
 }
 
 // --- hailo-genai OpenAI-compatible v1 routes ---
-pub async fn hailo_genai_v1_models(State(s): State<SharedState>) -> Response {
-    fwd_ext_get(&s, "/ext/hailo-genai/v1/models").await
-}
 pub async fn hailo_genai_v1_chat_completions(
     State(s): State<SharedState>,
     body: Bytes,
 ) -> Response {
+    if let Some(infer_client) = s.infer_client.as_ref() {
+        return hailo_genai_chat_completions_native(&s, infer_client, &body).await;
+    }
     fwd_ext_post(&s, "/ext/hailo-genai/v1/chat/completions", body).await
+}
+
+fn openai_error_with_code(
+    message: impl Into<String>,
+    type_: &str,
+    code: Option<&str>,
+    status: StatusCode,
+) -> Response {
+    (
+        status,
+        Json(json!({
+            "error": {"message": message.into(), "type": type_, "code": code}
+        })),
+    )
+        .into_response()
+}
+
+fn validate_openai_chat_request(value: &serde_json::Value) -> Result<(), String> {
+    let Some(data) = value.as_object() else {
+        return Err("request body must be an object".to_string());
+    };
+    if data
+        .get("model")
+        .is_some_and(|value| !value.is_null() && !value.is_string())
+    {
+        return Err("model must be a string".to_string());
+    }
+    let messages = data.get("messages");
+    if messages.is_none_or(|value| {
+        value.is_null()
+            || value.as_array().is_some_and(Vec::is_empty)
+            || value.as_str() == Some("")
+            || value.as_bool() == Some(false)
+            || value.as_f64() == Some(0.0)
+    }) {
+        return Err("messages is required".to_string());
+    }
+    if let Some(messages) = messages {
+        validate_llm_messages_shape(messages)?;
+    }
+    for field in ["temperature", "top_p"] {
+        if data
+            .get(field)
+            .is_some_and(|value| !value.as_f64().is_some_and(f64::is_finite))
+        {
+            return Err(format!("{field} must be a finite number"));
+        }
+    }
+    if data.get("max_tokens").is_some_and(|value| {
+        !matches!(value, serde_json::Value::Number(number) if number.is_i64() || number.is_u64())
+    }) {
+        return Err("max_tokens must be an integer".to_string());
+    }
+    if data.get("stream").is_some_and(|value| !value.is_boolean()) {
+        return Err("stream must be a boolean".to_string());
+    }
+    Ok(())
+}
+
+fn has_openai_images(messages: &serde_json::Value) -> bool {
+    messages.as_array().is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|parts| {
+                    parts.iter().any(|part| {
+                        part.get("type").and_then(serde_json::Value::as_str) == Some("image_url")
+                    })
+                })
+        })
+    })
+}
+
+enum YuInferSseEvent {
+    Token(String),
+    Done(Option<String>),
+    Error(String),
+    Other,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum YuInferSseFullTextError {
+    Incomplete { dropped_chars: usize },
+    Upstream(String),
+}
+
+fn parse_yu_infer_sse_event(event: &str) -> YuInferSseEvent {
+    let Some(data) = event.strip_prefix("data: ") else {
+        return YuInferSseEvent::Other;
+    };
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(data) else {
+        return YuInferSseEvent::Other;
+    };
+    if let Some(error) = payload.get("error").and_then(serde_json::Value::as_str) {
+        return YuInferSseEvent::Error(error.to_string());
+    }
+    if payload.get("done").and_then(serde_json::Value::as_bool) == Some(true) {
+        return YuInferSseEvent::Done(
+            payload
+                .get("full_text")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        );
+    }
+    payload
+        .get("token")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .map_or(YuInferSseEvent::Other, YuInferSseEvent::Token)
+}
+
+fn yu_infer_sse_full_text(raw_sse: &str) -> Result<String, YuInferSseFullTextError> {
+    let mut tokens = String::new();
+    for event in raw_sse.split("\n\n") {
+        match parse_yu_infer_sse_event(event) {
+            YuInferSseEvent::Token(token) => tokens.push_str(&token),
+            YuInferSseEvent::Done(full_text) => {
+                return Ok(full_text.unwrap_or(tokens));
+            }
+            YuInferSseEvent::Error(error) => return Err(YuInferSseFullTextError::Upstream(error)),
+            YuInferSseEvent::Other => {}
+        }
+    }
+    Err(YuInferSseFullTextError::Incomplete {
+        dropped_chars: tokens.chars().count(),
+    })
+}
+
+fn openai_sse_chunk(
+    id: &str,
+    created: i64,
+    model: &str,
+    delta: serde_json::Value,
+    finish_reason: Option<&str>,
+) -> String {
+    format!(
+        "data: {}\n\n",
+        json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        })
+    )
+}
+
+/// Unwraps an OpenAI Chat Completions `tools` array (`[{"type":"function",
+/// "function":{"name":...,"description":...,"parameters":...}}, ...]`) down
+/// to the inner `function` objects HailoRT's native `write(messages, tools)`
+/// expects (`[{"name":...,"description":...,"parameters":...}, ...]`).
+/// Entries already in the inner shape (no `function` key) pass through as-is.
+fn openai_tools_to_native(tools: Option<&serde_json::Value>) -> Vec<serde_json::Value> {
+    let tools: Vec<serde_json::Value> = tools
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect();
+    crate::routes::llm_client::unwrap_openai_tools(&tools)
+}
+
+async fn hailo_genai_chat_completions_native(
+    state: &SharedState,
+    infer_client: &crate::infer_client::InferClient,
+    body: &Bytes,
+) -> Response {
+    let value: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(_) => {
+            return openai_error_with_code(
+                "request body must be an object",
+                "invalid_request_error",
+                None,
+                StatusCode::BAD_REQUEST,
+            )
+        }
+    };
+    if let Err(message) = validate_openai_chat_request(&value) {
+        return openai_error_with_code(
+            message,
+            "invalid_request_error",
+            None,
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    if has_openai_images(&value["messages"]) {
+        // The Python path routed vision requests to vlm_completion; native VLM is deliberately out of scope here.
+        return openai_error_with_code(
+            "Vision chat is not implemented on the native path",
+            "server_error",
+            Some("vision_not_implemented"),
+            StatusCode::NOT_IMPLEMENTED,
+        );
+    }
+    let model_display = value
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::routes::hailo_genai_chat::default_llm_model(state));
+    let model = model_display.clone();
+    if !crate::routes::analysis::is_hailo_hef_available(&model) {
+        return openai_error_with_code(
+            format!("Model '{model}' not downloaded"),
+            "invalid_request_error",
+            Some("model_not_found"),
+            StatusCode::NOT_FOUND,
+        );
+    }
+    let messages = match llm_messages(&value) {
+        Ok(messages) => messages,
+        Err(message) => {
+            return openai_error_with_code(
+                message,
+                "invalid_request_error",
+                None,
+                StatusCode::BAD_REQUEST,
+            )
+        }
+    };
+    let tools = openai_tools_to_native(value.get("tools"));
+    let temperature = value
+        .get("temperature")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.7) as f32;
+    let max_tokens = value
+        .get("max_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(512) as u32;
+    let stream = value
+        .get("stream")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let upstream = match infer_client
+        .llm_generate_stream(
+            Some(model_name_to_hef_path(&model)),
+            messages,
+            tools,
+            None,
+            Some(temperature),
+            None,
+            None,
+            None,
+            Some(max_tokens),
+            None,
+            None,
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(%error, "yu-infer OpenAI chat generation failed");
+            return openai_error_with_code(
+                "LLM generation failed",
+                "server_error",
+                None,
+                StatusCode::BAD_GATEWAY,
+            );
+        }
+    };
+    if !stream {
+        let raw_sse = match upstream.text().await {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::error!(%error, "yu-infer OpenAI chat response read failed");
+                return openai_error_with_code(
+                    "LLM generation failed",
+                    "server_error",
+                    None,
+                    StatusCode::BAD_GATEWAY,
+                );
+            }
+        };
+        let text = match yu_infer_sse_full_text(&raw_sse) {
+            Ok(text) => text,
+            Err(YuInferSseFullTextError::Incomplete { dropped_chars }) => {
+                tracing::error!(
+                    dropped_chars,
+                    "yu-infer OpenAI chat stream ended before completion"
+                );
+                return openai_error_with_code(
+                    "LLM generation failed",
+                    "server_error",
+                    None,
+                    StatusCode::BAD_GATEWAY,
+                );
+            }
+            Err(YuInferSseFullTextError::Upstream(error)) => {
+                tracing::error!(%error, "yu-infer OpenAI chat stream failed");
+                return openai_error_with_code(
+                    "LLM generation failed",
+                    "server_error",
+                    None,
+                    StatusCode::BAD_GATEWAY,
+                );
+            }
+        };
+        return Json(json!({
+            "id": format!("chatcmpl-{}", &uuid::Uuid::new_v4().simple().to_string()[..24]),
+            "object": "chat.completion",
+            "created": chrono::Utc::now().timestamp(),
+            "model": model_display,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }))
+        .into_response();
+    }
+
+    let id = format!(
+        "chatcmpl-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..24]
+    );
+    let created = chrono::Utc::now().timestamp();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let _ = tx.send(openai_sse_chunk(
+        &id,
+        created,
+        &model_display,
+        json!({"role": "assistant"}),
+        None,
+    ));
+    tokio::spawn(async move {
+        use futures_util::StreamExt;
+
+        let mut upstream = upstream.bytes_stream();
+        let mut buffer = String::new();
+        loop {
+            let chunk = match upstream.next().await {
+                Some(Ok(chunk)) => chunk,
+                Some(Err(error)) => {
+                    tracing::error!(%error, "yu-infer OpenAI chat stream read failed");
+                    let _ = tx.send(openai_sse_chunk(
+                        &id,
+                        created,
+                        &model_display,
+                        json!({}),
+                        Some("error"),
+                    ));
+                    let _ = tx.send("data: [DONE]\n\n".to_string());
+                    return;
+                }
+                None => {
+                    // yu-infer marks completion with `done`; EOF without it means the generation was cut.
+                    let _ = tx.send(openai_sse_chunk(
+                        &id,
+                        created,
+                        &model_display,
+                        json!({}),
+                        Some("error"),
+                    ));
+                    let _ = tx.send("data: [DONE]\n\n".to_string());
+                    return;
+                }
+            };
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(pos) = buffer.find("\n\n") {
+                let event = buffer[..pos].to_string();
+                buffer.drain(..pos + 2);
+                match parse_yu_infer_sse_event(&event) {
+                    YuInferSseEvent::Token(token) => {
+                        let _ = tx.send(openai_sse_chunk(
+                            &id,
+                            created,
+                            &model_display,
+                            json!({"content": token}),
+                            None,
+                        ));
+                    }
+                    YuInferSseEvent::Done(_) => {
+                        let _ = tx.send(openai_sse_chunk(
+                            &id,
+                            created,
+                            &model_display,
+                            json!({}),
+                            Some("stop"),
+                        ));
+                        let _ = tx.send("data: [DONE]\n\n".to_string());
+                        return;
+                    }
+                    YuInferSseEvent::Error(error) => {
+                        tracing::error!(%error, "yu-infer OpenAI chat stream failed");
+                        let _ = tx.send(openai_sse_chunk(
+                            &id,
+                            created,
+                            &model_display,
+                            json!({}),
+                            Some("error"),
+                        ));
+                        let _ = tx.send("data: [DONE]\n\n".to_string());
+                        return;
+                    }
+                    YuInferSseEvent::Other => {}
+                }
+            }
+        }
+    });
+    let body = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|chunk| (Ok::<_, std::io::Error>(Bytes::from(chunk)), rx))
+    });
+    Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+        .header(axum::http::header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(axum::body::Body::from_stream(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 pub async fn hailo_genai_v1_audio_transcriptions(
     State(s): State<SharedState>,
@@ -2041,80 +2674,117 @@ pub async fn hailo_genai_v1_audio_transcriptions(
     )
     .await
 }
-pub async fn hailo_genai_v1_embeddings(State(s): State<SharedState>, body: Bytes) -> Response {
+pub async fn hailo_genai_v1_embeddings(
+    State(s): State<SharedState>,
+    auth_context: Option<Extension<AuthContext>>,
+    body: Bytes,
+) -> Response {
+    if let Some(response) = require_admin_scope(
+        s.config.pin_auth_enabled,
+        auth_context.as_ref().map(|context| &context.0),
+    ) {
+        return response;
+    }
+    if s.infer_client.is_some() {
+        return hailo_genai_v1_embeddings_native(&s, &body).await;
+    }
     fwd_ext_post(&s, "/ext/hailo-genai/v1/embeddings", body).await
 }
 
-// --- hailo-yolo stream dynamic path routes ---
-pub async fn hailo_yolo_stream_source_delete(
-    State(s): State<SharedState>,
-    Path(source_id): Path<String>,
-) -> Response {
-    fwd_ext_delete(
-        &s,
-        &format!("/ext/hailo-yolo/api/stream/sources/{source_id}"),
+fn openai_error(message: impl Into<String>, type_: &str, status: StatusCode) -> Response {
+    (
+        status,
+        Json(json!({
+            "error": {"message": message.into(), "type": type_, "code": null}
+        })),
     )
-    .await
+        .into_response()
 }
-pub async fn hailo_yolo_stream_source_test(
-    State(s): State<SharedState>,
-    Path(source_id): Path<String>,
-    body: Bytes,
-) -> Response {
-    fwd_ext_post(
-        &s,
-        &format!("/ext/hailo-yolo/api/stream/sources/{source_id}/test"),
-        body,
-    )
-    .await
+
+fn embedding_inputs(value: &serde_json::Value) -> Result<Vec<String>, String> {
+    match value.get("input") {
+        None | Some(serde_json::Value::Null) => Err("input is required".to_string()),
+        Some(serde_json::Value::String(input)) => Ok(vec![input.clone()]),
+        Some(serde_json::Value::Array(inputs)) if inputs.is_empty() => {
+            Err("input must not be empty".to_string())
+        }
+        Some(serde_json::Value::Array(inputs)) => inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| {
+                input
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("input[{index}] must be a string"))
+            })
+            .collect(),
+        _ => Err("input must be a string or array of strings".to_string()),
+    }
 }
-pub async fn hailo_yolo_stream_devices(State(s): State<SharedState>) -> Response {
-    fwd_ext_get(&s, "/ext/hailo-yolo/api/stream/devices").await
-}
-pub async fn hailo_yolo_stream_mjpeg(
-    State(s): State<SharedState>,
-    Path(source_id): Path<String>,
-) -> Response {
-    fwd_ext_get(&s, &format!("/ext/hailo-yolo/api/stream/{source_id}/mjpeg")).await
-}
-pub async fn hailo_yolo_stream_recordings(State(s): State<SharedState>) -> Response {
-    fwd_ext_get(&s, "/ext/hailo-yolo/api/stream/recordings").await
-}
-pub async fn hailo_yolo_stream_snapshot(
-    State(s): State<SharedState>,
-    Path(filename): Path<String>,
-) -> Response {
-    fwd_ext_get(
-        &s,
-        &format!("/ext/hailo-yolo/api/stream/snapshot/{filename}"),
-    )
-    .await
-}
-pub async fn hailo_yolo_stream_rule_update(
-    State(s): State<SharedState>,
-    Path(rule_id): Path<String>,
-    body: Bytes,
-) -> Response {
-    fwd_ext_put(
-        &s,
-        &format!("/ext/hailo-yolo/api/stream/rules/{rule_id}"),
-        body,
-    )
-    .await
-}
-pub async fn hailo_yolo_stream_rule_delete(
-    State(s): State<SharedState>,
-    Path(rule_id): Path<String>,
-) -> Response {
-    fwd_ext_delete(&s, &format!("/ext/hailo-yolo/api/stream/rules/{rule_id}")).await
+
+async fn hailo_genai_v1_embeddings_native(state: &SharedState, body: &Bytes) -> Response {
+    let value: serde_json::Value = serde_json::from_slice(body).unwrap_or_else(|_| json!({}));
+    let inputs = match embedding_inputs(&value) {
+        Ok(inputs) => inputs,
+        Err(message) => {
+            return openai_error(message, "invalid_request_error", StatusCode::BAD_REQUEST)
+        }
+    };
+    let model = value
+        .get("model")
+        .cloned()
+        .unwrap_or_else(|| json!("clip-vit-b-16"));
+    let mut data = Vec::with_capacity(inputs.len());
+    for (index, input) in inputs.into_iter().enumerate() {
+        match crate::routes::clip_search::call_clip_text(state, input).await {
+            Ok(embedding) => data.push(json!({
+                "object": "embedding",
+                "index": index,
+                "embedding": embedding,
+            })),
+            Err(crate::routes::clip_search::ClipCallError::Unavailable)
+            | Err(crate::routes::clip_search::ClipCallError::Infer(
+                crate::infer_client::InferClientError::BadStatus { status: 503, .. },
+            )) => {
+                return openai_error(
+                    "CLIP text encoder not available. Enable the builtin-clip-search extension.",
+                    "server_error",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                )
+            }
+            Err(error) => {
+                tracing::error!(?error, "CLIP text embedding failed");
+                return openai_error(
+                    format!("Embedding failed: {error:?}"),
+                    "server_error",
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                );
+            }
+        }
+    }
+    Json(json!({
+        "object": "list",
+        "data": data,
+        "model": model,
+        "usage": {"prompt_tokens": 0, "total_tokens": 0},
+    }))
+    .into_response()
 }
 
 #[cfg(test)]
 mod hailo_genai_vlm_tests {
     use super::*;
+    use axum::{routing::post, Router};
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::collections::HashSet;
     use std::str::FromStr;
+
+    async fn spawn_stub(app: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}")
+    }
 
     #[test]
     fn model_name_to_hef_path_resolves_known_registry_name_to_real_filename() {
@@ -2289,6 +2959,520 @@ mod hailo_genai_vlm_tests {
             )
             .await,
         )
+    }
+
+    #[tokio::test]
+    async fn hailo_genai_llm_generate_reaches_yu_infer_stub() {
+        let captured = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let captured_for_route = captured.clone();
+        let app = Router::new().route(
+            "/v1/infer/llm/generate/stream",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured = captured_for_route.clone();
+                async move {
+                    *captured.lock().await = Some(body);
+                    Response::builder()
+                        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                        .body(axum::body::Body::from(
+                            "data: {\"token\":\"SENTINEL\"}\n\ndata: {\"done\":true,\"full_text\":\"SENTINEL\"}\n\n",
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        let base_url = spawn_stub(app).await;
+        let state = test_state_with_infer_client(&base_url).await;
+        let hef_dir = tempfile::tempdir().unwrap();
+        std::fs::write(hef_dir.path().join("Qwen3-1.7B-Instruct.hef"), b"stub").unwrap();
+        let _guard = crate::ENV_MUTATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_hef_dir = std::env::var_os("HAILO_HEF_DIR");
+        std::env::set_var("HAILO_HEF_DIR", hef_dir.path());
+
+        let response = hailo_genai_llm_generate(
+            State(state),
+            None,
+            axum::http::HeaderMap::new(),
+            Bytes::from(
+                json!({
+                    "model": "qwen3-1.7b-instruct",
+                    "messages": [
+                        {"role": "system", "content": [{"type": "text", "text": "Follow the rules."}]},
+                        {"role": "user", "content": [{"type": "text", "text": "Hello"}]}
+                    ],
+                    "max_generated_tokens": 17,
+                    "temperature": 0.25
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        match previous_hef_dir {
+            Some(value) => std::env::set_var("HAILO_HEF_DIR", value),
+            None => std::env::remove_var("HAILO_HEF_DIR"),
+        }
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("SENTINEL"));
+        let captured = captured.lock().await.take().unwrap();
+        assert_eq!(
+            captured["messages"],
+            json!([
+                {"role": "system", "content": "Follow the rules."},
+                {"role": "user", "content": "Hello"}
+            ])
+        );
+        assert_eq!(captured["max_generated_tokens"], 17);
+        assert_eq!(captured["temperature"], 0.25);
+    }
+
+    #[tokio::test]
+    async fn hailo_genai_v1_chat_completions_rejects_vision_on_native_path() {
+        let state = test_state_with_infer_client("http://127.0.0.1:1").await;
+        let response = hailo_genai_chat_completions_native(
+            &state,
+            state.infer_client.as_ref().unwrap(),
+            &Bytes::from(
+                json!({"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,"}}]}]}).to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"]["code"],
+            "vision_not_implemented"
+        );
+    }
+
+    #[tokio::test]
+    async fn hailo_genai_v1_chat_completions_validates_request_types() {
+        let state = test_state_with_infer_client("http://127.0.0.1:1").await;
+        for (body, message) in [
+            (json!({}), "messages is required"),
+            (
+                json!({"messages": [], "stream": "yes"}),
+                "messages is required",
+            ),
+            (
+                json!({"messages": [{"role": "user", "content": "hi"}], "stream": "yes"}),
+                "stream must be a boolean",
+            ),
+        ] {
+            let response = hailo_genai_chat_completions_native(
+                &state,
+                state.infer_client.as_ref().unwrap(),
+                &Bytes::from(body.to_string()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&response_body).unwrap()["error"]
+                    ["message"],
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn yu_infer_sse_full_text_parses_completion_events() {
+        assert_eq!(
+            yu_infer_sse_full_text(""),
+            Err(YuInferSseFullTextError::Incomplete { dropped_chars: 0 })
+        );
+        assert_eq!(
+            yu_infer_sse_full_text(
+                "data: {\"token\":\"hello \"}\n\ndata: {\"token\":\"world\"}\n\n"
+            ),
+            Err(YuInferSseFullTextError::Incomplete { dropped_chars: 11 })
+        );
+        assert_eq!(
+            yu_infer_sse_full_text("data: {\"token\":\"ignored\"}\n\ndata: {\"done\":true,\"full_text\":\"complete\"}\n\n"),
+            Ok("complete".to_string())
+        );
+        assert_eq!(
+            yu_infer_sse_full_text("data: {\"token\":\"complete\"}\n\ndata: {\"done\":true}\n\n"),
+            Ok("complete".to_string())
+        );
+        assert_eq!(
+            yu_infer_sse_full_text("data: {\"error\":\"device failed\"}\n\n"),
+            Err(YuInferSseFullTextError::Upstream(
+                "device failed".to_string()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn hailo_genai_v1_chat_completions_aggregates_yu_infer_sse() {
+        let app = Router::new().route(
+            "/v1/infer/llm/generate/stream",
+            post(|| async {
+                Response::builder()
+                    .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                    .body(axum::body::Body::from(
+                        "data: {\"token\":\"hello \"}\n\ndata: {\"token\":\"world\"}\n\ndata: {\"done\":true,\"full_text\":\"hello world\"}\n\n",
+                    ))
+                    .unwrap()
+            }),
+        );
+        let base_url = spawn_stub(app).await;
+        let state = test_state_with_infer_client(&base_url).await;
+        let hef_dir = tempfile::tempdir().unwrap();
+        std::fs::write(hef_dir.path().join("Qwen3-1.7B-Instruct.hef"), b"stub").unwrap();
+        let _guard = crate::ENV_MUTATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_hef_dir = std::env::var_os("HAILO_HEF_DIR");
+        std::env::set_var("HAILO_HEF_DIR", hef_dir.path());
+        let response = hailo_genai_v1_chat_completions(
+            State(state),
+            Bytes::from(json!({"model": "qwen3-1.7b-instruct", "messages": [{"role": "user", "content": "hi"}]}).to_string()),
+        )
+        .await;
+        match previous_hef_dir {
+            Some(value) => std::env::set_var("HAILO_HEF_DIR", value),
+            None => std::env::remove_var("HAILO_HEF_DIR"),
+        }
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["object"], "chat.completion");
+        assert_eq!(value["model"], "qwen3-1.7b-instruct");
+        assert_eq!(value["choices"][0]["message"]["content"], "hello world");
+    }
+
+    #[test]
+    fn openai_tools_to_native_unwraps_function_and_passes_through_bare_shapes() {
+        let openai_shaped = json!([{
+            "type": "function",
+            "function": {"name": "search", "description": "Find", "parameters": {}}
+        }]);
+        assert_eq!(
+            openai_tools_to_native(Some(&openai_shaped)),
+            vec![json!({"name": "search", "description": "Find", "parameters": {}})]
+        );
+        let already_bare = json!([{"name": "search"}]);
+        assert_eq!(
+            openai_tools_to_native(Some(&already_bare)),
+            vec![json!({"name": "search"})]
+        );
+        assert!(openai_tools_to_native(None).is_empty());
+        assert!(openai_tools_to_native(Some(&json!("not an array"))).is_empty());
+    }
+
+    #[tokio::test]
+    async fn hailo_genai_v1_chat_completions_forwards_openai_tools_to_yu_infer_natively() {
+        let captured = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let captured_for_route = captured.clone();
+        let app = Router::new().route(
+            "/v1/infer/llm/generate/stream",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured = captured_for_route.clone();
+                async move {
+                    *captured.lock().await = Some(body);
+                    Response::builder()
+                        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                        .body(axum::body::Body::from(
+                            "data: {\"done\":true,\"full_text\":\"ok\"}\n\n",
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        let base_url = spawn_stub(app).await;
+        let state = test_state_with_infer_client(&base_url).await;
+        let hef_dir = tempfile::tempdir().unwrap();
+        std::fs::write(hef_dir.path().join("Qwen3-1.7B-Instruct.hef"), b"stub").unwrap();
+        let _guard = crate::ENV_MUTATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_hef_dir = std::env::var_os("HAILO_HEF_DIR");
+        std::env::set_var("HAILO_HEF_DIR", hef_dir.path());
+        let response = hailo_genai_v1_chat_completions(
+            State(state),
+            Bytes::from(
+                json!({
+                    "model": "qwen3-1.7b-instruct",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [{
+                        "type": "function",
+                        "function": {"name": "get_weather", "description": "Weather lookup", "parameters": {"type": "object"}}
+                    }],
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        match previous_hef_dir {
+            Some(value) => std::env::set_var("HAILO_HEF_DIR", value),
+            None => std::env::remove_var("HAILO_HEF_DIR"),
+        }
+        assert_eq!(response.status(), StatusCode::OK);
+        let forwarded = captured
+            .lock()
+            .await
+            .clone()
+            .expect("tools request captured");
+        assert_eq!(
+            forwarded["tools"],
+            json!([{"name": "get_weather", "description": "Weather lookup", "parameters": {"type": "object"}}])
+        );
+    }
+
+    #[tokio::test]
+    async fn hailo_genai_v1_chat_completions_rejects_truncated_yu_infer_sse() {
+        let app = Router::new().route(
+            "/v1/infer/llm/generate/stream",
+            post(|| async {
+                Response::builder()
+                    .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                    .body(axum::body::Body::from("data: {\"token\":\"partial\"}\n\n"))
+                    .unwrap()
+            }),
+        );
+        let base_url = spawn_stub(app).await;
+        let state = test_state_with_infer_client(&base_url).await;
+        let hef_dir = tempfile::tempdir().unwrap();
+        std::fs::write(hef_dir.path().join("Qwen3-1.7B-Instruct.hef"), b"stub").unwrap();
+        let _guard = crate::ENV_MUTATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_hef_dir = std::env::var_os("HAILO_HEF_DIR");
+        std::env::set_var("HAILO_HEF_DIR", hef_dir.path());
+        let response = hailo_genai_v1_chat_completions(
+            State(state),
+            Bytes::from(json!({"model": "qwen3-1.7b-instruct", "messages": [{"role": "user", "content": "hi"}]}).to_string()),
+        )
+        .await;
+        match previous_hef_dir {
+            Some(value) => std::env::set_var("HAILO_HEF_DIR", value),
+            None => std::env::remove_var("HAILO_HEF_DIR"),
+        }
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["type"], "server_error");
+        assert_eq!(value["error"]["message"], "LLM generation failed");
+        assert!(!String::from_utf8_lossy(&body).contains("partial"));
+    }
+
+    /// The truncation tests below only pin the failure direction. Without this
+    /// one, marking a *completed* stream as `error` would pass unnoticed.
+    #[tokio::test]
+    async fn hailo_genai_v1_chat_completions_stream_marks_completion_as_stop() {
+        let app = Router::new().route(
+            "/v1/infer/llm/generate/stream",
+            post(|| async {
+                Response::builder()
+                    .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                    .body(axum::body::Body::from(
+                        "data: {\"token\":\"hi\"}\n\ndata: {\"done\":true,\"full_text\":\"hi\"}\n\n",
+                    ))
+                    .unwrap()
+            }),
+        );
+        let base_url = spawn_stub(app).await;
+        let state = test_state_with_infer_client(&base_url).await;
+        let hef_dir = tempfile::tempdir().unwrap();
+        std::fs::write(hef_dir.path().join("Qwen3-1.7B-Instruct.hef"), b"stub").unwrap();
+        let _guard = crate::ENV_MUTATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_hef_dir = std::env::var_os("HAILO_HEF_DIR");
+        std::env::set_var("HAILO_HEF_DIR", hef_dir.path());
+        let response = hailo_genai_v1_chat_completions(
+            State(state),
+            Bytes::from(json!({"model": "qwen3-1.7b-instruct", "messages": [{"role": "user", "content": "hi"}], "stream": true}).to_string()),
+        )
+        .await;
+        match previous_hef_dir {
+            Some(value) => std::env::set_var("HAILO_HEF_DIR", value),
+            None => std::env::remove_var("HAILO_HEF_DIR"),
+        }
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("\"finish_reason\":\"stop\""));
+        assert!(!body.contains("\"finish_reason\":\"error\""));
+        assert!(body.contains("\"content\":\"hi\""));
+        assert!(body.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[tokio::test]
+    async fn hailo_genai_v1_chat_completions_stream_reports_truncated_yu_infer_sse() {
+        let app = Router::new().route(
+            "/v1/infer/llm/generate/stream",
+            post(|| async {
+                Response::builder()
+                    .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                    .body(axum::body::Body::from("data: {\"token\":\"partial\"}\n\n"))
+                    .unwrap()
+            }),
+        );
+        let base_url = spawn_stub(app).await;
+        let state = test_state_with_infer_client(&base_url).await;
+        let hef_dir = tempfile::tempdir().unwrap();
+        std::fs::write(hef_dir.path().join("Qwen3-1.7B-Instruct.hef"), b"stub").unwrap();
+        let _guard = crate::ENV_MUTATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_hef_dir = std::env::var_os("HAILO_HEF_DIR");
+        std::env::set_var("HAILO_HEF_DIR", hef_dir.path());
+        let response = hailo_genai_v1_chat_completions(
+            State(state),
+            Bytes::from(json!({"model": "qwen3-1.7b-instruct", "messages": [{"role": "user", "content": "hi"}], "stream": true}).to_string()),
+        )
+        .await;
+        match previous_hef_dir {
+            Some(value) => std::env::set_var("HAILO_HEF_DIR", value),
+            None => std::env::remove_var("HAILO_HEF_DIR"),
+        }
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("\"finish_reason\":\"error\""));
+        assert!(!body.contains("\"finish_reason\":\"stop\""));
+    }
+
+    #[tokio::test]
+    async fn hailo_genai_v1_embeddings_reaches_yu_infer_stub() {
+        let mut expected_vector = vec![0.0; 512];
+        expected_vector[..3].copy_from_slice(&[0.25, -0.5, 0.75]);
+        let stub_vector = expected_vector.clone();
+        let captured = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let captured_for_route = captured.clone();
+        let app = Router::new().route(
+            "/v1/infer/clip-text",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let captured = captured_for_route.clone();
+                let vector = stub_vector.clone();
+                async move {
+                    *captured.lock().await = Some(body);
+                    Json(json!({"data": {"vector": vector}}))
+                }
+            }),
+        );
+        let base_url = spawn_stub(app).await;
+        let state = test_state_with_infer_client(&base_url).await;
+
+        let response = hailo_genai_v1_embeddings(
+            State(state),
+            None,
+            Bytes::from(json!({"input": "Hello", "model": "clip-vit-b-16"}).to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "object": "list",
+                "data": [{
+                    "object": "embedding",
+                    "index": 0,
+                    "embedding": expected_vector,
+                }],
+                "model": "clip-vit-b-16",
+                "usage": {"prompt_tokens": 0, "total_tokens": 0},
+            })
+        );
+        assert_eq!(
+            captured.lock().await.take().unwrap(),
+            json!({"text": "Hello"})
+        );
+    }
+
+    #[tokio::test]
+    async fn hailo_genai_llm_generate_rejects_invalid_generation_types() {
+        let state = test_state_with_infer_client("http://127.0.0.1:1").await;
+        for (body, expected_message) in [
+            (
+                json!({"prompt": "hello", "temperature": "abc"}),
+                "temperature must be a finite number",
+            ),
+            (
+                json!({"prompt": "hello", "max_generated_tokens": 1.5}),
+                "max_generated_tokens must be an integer",
+            ),
+            (json!({"prompt": 123}), "prompt must be a string"),
+        ] {
+            let response = hailo_genai_llm_generate(
+                State(state.clone()),
+                None,
+                axum::http::HeaderMap::new(),
+                Bytes::from(body.to_string()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                value,
+                json!({"status": "error", "message": expected_message})
+            );
+        }
+    }
+
+    #[test]
+    fn llm_generation_request_validation_accepts_valid_types() {
+        assert!(validate_llm_generation_request(&json!({
+            "model": "qwen3-1.7b-instruct",
+            "messages": [{"role": "user", "content": [{"type": "text"}]}],
+            "temperature": 0.25,
+            "top_p": 0.9,
+            "max_generated_tokens": 17,
+            "max_tokens": 18
+        }))
+        .is_ok());
+
+        for (value, message) in [
+            (json!([]), "request body must be an object"),
+            (json!({"messages": null}), "messages must be an array"),
+            (
+                json!({"messages": [{"role": 1}]}),
+                "messages[0].role must be a string",
+            ),
+            (
+                json!({"messages": [{"role": "user", "content": [1]}]}),
+                "messages[0].content[0] must be an object",
+            ),
+            (
+                json!({"temperature": true}),
+                "temperature must be a finite number",
+            ),
+            (
+                json!({"max_generated_tokens": true}),
+                "max_generated_tokens must be an integer",
+            ),
+        ] {
+            assert_eq!(
+                validate_llm_generation_request(&value).unwrap_err(),
+                message
+            );
+        }
     }
 
     #[tokio::test]

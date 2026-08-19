@@ -94,6 +94,11 @@ pub fn save_ext_config(
 ) -> io::Result<()> {
     let _guard = WRITE_LOCK.lock().unwrap();
     let mut cfg = read_config_json(config_path);
+    if matches!(cfg.get("extensions"), None | Some(Value::Null)) {
+        cfg.as_object_mut()
+            .ok_or_else(|| io::Error::other("extensions not an object"))?
+            .insert("extensions".to_string(), Value::Object(Default::default()));
+    }
     let exts = cfg["extensions"]
         .as_object_mut()
         .ok_or_else(|| io::Error::other("extensions not an object"))?;
@@ -835,6 +840,49 @@ pub fn analyze_emphasis(prompt: &str) -> Vec<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn save_ext_config_creates_missing_extensions_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"scan_roots":[]}"#).unwrap();
+        let updates =
+            serde_json::Map::from_iter([("wildcard_dirs".to_string(), json!(["/tmp/wildcards"]))]);
+
+        save_ext_config(path.to_str().unwrap(), "builtin-prompt-simulator", &updates).unwrap();
+
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(
+            saved["extensions"]["builtin-prompt-simulator"]["wildcard_dirs"],
+            json!(["/tmp/wildcards"])
+        );
+    }
+
+    #[test]
+    fn save_ext_config_rejects_non_object_extensions_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let original = r#"{"extensions":"nope"}"#;
+        std::fs::write(&path, original).unwrap();
+        let updates = serde_json::Map::from_iter([("key".to_string(), json!("value"))]);
+
+        assert!(save_ext_config(path.to_str().unwrap(), "test", &updates).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    fn save_ext_config_preserves_other_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"extensions":{"other":{"keep":"me"}}}"#).unwrap();
+        let updates = serde_json::Map::from_iter([("key".to_string(), json!("value"))]);
+
+        save_ext_config(path.to_str().unwrap(), "test", &updates).unwrap();
+
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(saved["extensions"]["other"], json!({"keep":"me"}));
+    }
 
     #[test]
     fn sanitize_valid() {
@@ -1201,7 +1249,7 @@ mod dp_analysis_tests {
     fn test_depth_underflow_no_panic() {
         // 閉じブレース先行でも panic しないこと
         let result = analyze_dp_choices("}garbage{a|b}");
-        assert!(result.len() >= 1); // {a|b} が解析される
+        assert!(!result.is_empty()); // {a|b} が解析される
     }
 
     #[test]

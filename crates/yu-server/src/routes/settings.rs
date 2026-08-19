@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
+use crate::config_io::{load as load_config_json, write as write_config_json};
 use crate::{
     auth::{scope::require_admin_scope, AuthContext},
     secret_store,
@@ -676,68 +677,11 @@ fn load_schema_defs(project_root: &Path) -> Result<Vec<SettingDef>, std::io::Err
     Ok(serde_json::from_str::<Vec<SettingDef>>(&raw).unwrap_or_default())
 }
 
-fn schema_path(project_root: &Path) -> PathBuf {
+/// Canonical location of the generated settings schema. `misc_admin`
+/// reads the same file for its config hints, so keep this the only
+/// place the path is spelled out.
+pub(crate) fn schema_path(project_root: &Path) -> PathBuf {
     project_root.join("config").join("settings_schema.json")
-}
-
-pub(crate) fn validate_base_url(s: &str) -> Result<String, &'static str> {
-    let normalized = s.trim().trim_end_matches('/').to_string();
-    if normalized.is_empty() {
-        return Err("base_url must not be empty");
-    }
-    let lower = normalized.to_ascii_lowercase();
-    let rest = if lower.starts_with("https://") {
-        &normalized[8..]
-    } else if lower.starts_with("http://") {
-        &normalized[7..]
-    } else {
-        return Err("scheme must be http or https");
-    };
-    if rest.split('/').next().unwrap_or("").is_empty() {
-        return Err("host is required");
-    }
-    if normalized.contains('?') {
-        return Err("query string not allowed");
-    }
-    if normalized.contains('#') {
-        return Err("fragment not allowed");
-    }
-    Ok(normalized)
-}
-
-pub(crate) fn load_config_json(config_path: &Path) -> Value {
-    for path in [
-        config_path.to_path_buf(),
-        PathBuf::from("config.json"),
-        PathBuf::from("tagdb_config.json"),
-    ] {
-        if path.exists() {
-            return std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-                .unwrap_or_else(|| json!({}));
-        }
-    }
-    json!({})
-}
-
-pub(crate) fn write_config_json(config_path: &Path, config: &Value) -> Result<(), std::io::Error> {
-    let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(
-        ".config_{}_{}.tmp",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0)
-    ));
-    let text = serde_json::to_string_pretty(config)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    std::fs::write(&tmp, format!("{text}\n"))?;
-    std::fs::rename(&tmp, config_path)?;
-    restrict_owner_only(config_path);
-    Ok(())
 }
 
 fn resolve_dotted_key<'a>(config: &'a Value, key: &str) -> Option<&'a Value> {
@@ -874,13 +818,9 @@ fn migrate_plaintext_secrets(state: &SharedState) -> Result<usize, std::io::Erro
 fn rotate_secrets(state: &SharedState) -> Result<Value, std::io::Error> {
     let schema = load_schema_defs(&state.config.project_root)?;
     let mut config = load_config_json(&state.config.config_path);
-    let (new_key_id, new_key) = secret_store::generate_new_active_key(&state.config.project_root)
-        .ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "failed to generate new secret key",
-        )
-    })?;
+    let (new_key_id, new_key) =
+        secret_store::generate_new_active_key(&state.config.project_root)
+            .ok_or_else(|| std::io::Error::other("failed to generate new secret key"))?;
     let mut rotated = 0;
     for setting in schema.iter().filter(|setting| setting.secret) {
         let Some(raw) = resolve_dotted_key(&config, &setting.key).and_then(Value::as_str) else {
@@ -897,7 +837,7 @@ fn rotate_secrets(state: &SharedState) -> Result<Value, std::io::Error> {
             continue;
         }
         let encrypted = secret_store::encrypt_with_key_id(&plaintext, &new_key_id, &new_key)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "encrypt failed"))?;
+            .ok_or_else(|| std::io::Error::other("encrypt failed"))?;
         set_dotted_key(&mut config, &setting.key, json!(encrypted))
             .map_err(settings_write_to_io)?;
         rotated += 1;
@@ -1673,18 +1613,6 @@ fn settings_write_to_io(error: SettingsWriteError) -> std::io::Error {
     }
 }
 
-fn restrict_owner_only(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(path) {
-            let mut permissions = metadata.permissions();
-            permissions.set_mode(0o600);
-            let _ = std::fs::set_permissions(path, permissions);
-        }
-    }
-}
-
 // --- GET /api/settings/config helpers ---
 
 fn default_config() -> Value {
@@ -2101,10 +2029,9 @@ mod tests {
                     Ok(output) => Ok(output),
                     Err(FakeCliError::NotFound) => Err(CliError::NotFound),
                     Err(FakeCliError::Timeout) => Err(CliError::Timeout),
-                    Err(FakeCliError::Io(message)) => Err(CliError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        message,
-                    ))),
+                    Err(FakeCliError::Io(message)) => {
+                        Err(CliError::Io(std::io::Error::other(message)))
+                    }
                 }
             })
         }
@@ -2136,6 +2063,10 @@ mod tests {
         );
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         Arc::new(AppState {
+            effective_port: 5000,
+            gateway_keys: Vec::new(),
+            gateway_loopback_bypass: true,
+            settings_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             config: Config {
                 db_path: "sqlite::memory:".to_string(),
                 pin_hash: String::new(),
@@ -2168,7 +2099,7 @@ mod tests {
             vectors_db: pool.clone(),
             vectors_db_read: pool,
             clip_index: std::sync::Arc::new(
-                crate::routes::clip_index::ClipIndex::new_default(&std::env::temp_dir())
+                crate::routes::clip_index::ClipIndex::new_default(std::env::temp_dir())
                     .expect("clip index test default"),
             ),
             clip_indexer: std::sync::Arc::new(crate::routes::clip_indexer::ClipIndexer::new()),
@@ -2195,6 +2126,7 @@ mod tests {
             infer_client: None,
             infer_child: None,
             scan_manager: std::sync::OnceLock::new(),
+            hailo_yolo_stream: None,
             stats_basic_cache: crate::state::TtlCache::new(crate::state::STATS_CACHE_TTL),
             stats_models_cache: crate::state::TtlCache::new(crate::state::STATS_CACHE_TTL),
             checkpoints_cache: crate::state::TtlCache::new(crate::state::STATS_CACHE_TTL),
@@ -2722,7 +2654,7 @@ mod tests {
             .unwrap();
         let status = response.status();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let value = serde_json::from_slice(&body).unwrap_or_else(|_| json!(null));
+        let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         (status, value)
     }
 
@@ -2751,7 +2683,11 @@ mod tests {
 
         assert_eq!(schema["schema"][0]["key"], "server.pin");
         assert!(all["settings"].is_array());
-        assert_eq!(export_status, StatusCode::NOT_FOUND);
+        // POST はこの試験用 router に登録されておらず、catch-all
+        // `/api/settings/{*key}` が GET/PUT だけを持つ。従って path は一致し
+        // method が一致せぬ 405 となる（Quart も同じ）。本試験の主旨は
+        // 静的 route が catch-all に飲まれぬことであり、下の schema/all がそれを見る。
+        assert_eq!(export_status, StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(migrate_status, StatusCode::OK);
         assert_eq!(migrate["migrated"], 0);
         assert_eq!(op_delete_status, StatusCode::NOT_FOUND);

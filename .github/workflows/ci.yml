@@ -17,16 +17,24 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates
 
-      # This gate exists to catch a broken mirror: the two files under config/
-      # and extensions/ are read by include_str! from crates/yu-server, and
-      # Cargo's dependency graph cannot see them. If a sync ever drops them,
-      # this job is what notices.
+      # This job exists to catch a broken mirror. `crates/` is meant to be
+      # self-contained, and there are two ways that can quietly stop being true:
+      #
+      #   - at compile time, if something reaches outside the crate with
+      #     include_str!/include_bytes! (Cargo's dependency graph never sees
+      #     those, so `cargo metadata` can resolve on a tree that will not
+      #     compile);
+      #   - at test time, if a test climbs out of CARGO_MANIFEST_DIR to read a
+      #     fixture. That one survives `cargo check` entirely.
+      #
+      # `--all-targets` builds the test targets too, which is what makes the
+      # second case visible here.
       - name: cargo check
         working-directory: crates
         run: cargo check --workspace --all-targets
@@ -35,11 +43,12 @@ jobs:
         working-directory: crates
         run: cargo fmt --all --check
 
-      # Deliberately not gated on clippy: `--all-targets -- -D warnings`
-      # currently reports 4 lints in meta-extract, inherited from upstream.
-      # A gate that is red on arrival is ignored, and an ignored gate is worse
-      # than none. Run it for visibility only.
-      - name: cargo clippy (informational)
+      - name: cargo clippy
         working-directory: crates
-        continue-on-error: true
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Not run: `cargo test`. Five tests in yu-server invoke the Python
+      # implementation to check cross-language agreement, and that
+      # implementation lives in yu_ai_manager rather than here. They are
+      # comparisons with no counterpart present, not failures of the Rust code.
+      # Everything else passes; see the README.

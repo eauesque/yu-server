@@ -129,9 +129,11 @@ impl OpenAiCompatEngine {
                         .map(str::to_string)
                 })
                 .unwrap_or_else(|| body.chars().take(500).collect());
-            let suffix = (!detail.is_empty())
-                .then(|| format!(": {detail}"))
-                .unwrap_or_default();
+            let suffix = if !detail.is_empty() {
+                format!(": {detail}")
+            } else {
+                Default::default()
+            };
             return Err(EngineError::msg(format!(
                 "OpenAI API error (HTTP {status}){suffix}"
             )));

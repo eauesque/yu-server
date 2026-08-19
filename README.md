@@ -15,7 +15,6 @@ A single Cargo workspace under `crates/`:
 | Crate | What it does |
 |---|---|
 | `yu-server` | The HTTP server binary: routes, auth, MCP, analysis engines |
-| `lan-cowork` | LAN peer discovery, pairing, transport, fleet operations |
 | `auth-core` | Shared authentication primitives |
 | `tagdb-core` | Tag database access and migrations |
 | `scan-core` | Filesystem scanning |
@@ -23,19 +22,37 @@ A single Cargo workspace under `crates/`:
 | `xmp-core` | XMP packet read/merge/write for JPEG, PNG and WebP |
 | `yu-infer-shim` | Emits a `yu-infer` binary beside `yu-server`; the sidecar it stands in for lives in [yu-hailo-infer](https://github.com/eauesque/yu-hailo-infer) |
 
-Two files sit outside `crates/`:
+Two crates that used to live here are now their own repositories and are pinned
+by git revision:
 
-```
-config/settings_schema.json
-extensions/builtin_wd_tagger/extension.json
-```
+- [yu-lan-cowork](https://github.com/eauesque/yu-lan-cowork) — LAN peer
+  discovery, pairing, transport, fleet operations
+- [yu-hailo-infer](https://github.com/eauesque/yu-hailo-infer) — the Hailo
+  inference sidecar
 
-They are here because `crates/yu-server/src/routes/misc_admin.rs` pulls them in
-with `include_str!` at their original relative depth. Keeping the paths intact
-means the mirror needs no source changes. It is worth stating why they are easy
-to forget: Cargo's dependency graph never sees `include_str!`, so a tree whose
-`cargo metadata` resolves cleanly can still fail to compile once those two files
-are missing. The only way to settle it is to build the tree somewhere else.
+Both pins point at the **public** repositories on purpose, so a fresh clone or a
+CI runner resolves them with no credentials and no registry setup.
+
+## Self-contained
+
+Nothing outside `crates/` is needed to build or test this workspace. That is
+worth stating because it was not always true, and because the two ways of
+breaking it fail differently:
+
+- **At compile time.** `include_str!` used to reach up to `config/` and
+  `extensions/` at the repository root. Cargo's dependency graph never sees
+  `include_str!`, so a tree whose `cargo metadata` resolves cleanly could still
+  fail to compile once those files were missing. Those reads are now done at
+  runtime from the project root instead.
+- **At test time.** `meta-extract`'s conformance test used to climb two
+  directories up to read its goldens and image fixtures. Compiling and even
+  `cargo check` succeeded; only `cargo test` in an extracted tree failed. The
+  goldens and fixtures now live under `crates/meta-extract/tests/`.
+
+The upstream repository gates the first with a check over `include_str!` /
+`include_bytes!` paths. The second is not something a static check catches — the
+only way to settle it is to build and test the tree somewhere else, which is
+what the mirror sync does before publishing.
 
 ## Build
 
@@ -47,10 +64,6 @@ cargo build --release -p yu-server
 `crates/.cargo/config.toml` pins `jobs = 1`: this workspace is also built on a
 Raspberry Pi 5, where parallel compilation crashes the machine. Remove it or
 override `CARGO_BUILD_JOBS` on a larger host.
-
-The Hailo inference sidecar is pulled from the public
-[yu-hailo-infer](https://github.com/eauesque/yu-hailo-infer) repository by git
-revision, so a fresh clone needs no credentials or registry setup.
 
 ## Running
 
@@ -68,12 +81,18 @@ nothing to serve.
 
 ## Known state
 
-- `cargo clippy --workspace --all-targets -- -D warnings` reports 4 lints in
-  `meta-extract` (`type_complexity`, `manual_strip`, and two map-values
-  iterations). CI therefore gates on `cargo check` and `cargo fmt`, not on
-  clippy — a gate that is red on arrival tells you nothing.
-- The test suite is not run in CI: it carries pre-existing failures inherited
-  from the upstream repository.
+Measured on the extracted tree, not on the upstream checkout:
+
+- `cargo clippy --workspace --all-targets -- -D warnings` passes with no
+  warnings.
+- `cargo test --workspace` runs 1361 passing tests and 5 failing ones. All five
+  invoke the Python implementation to check cross-language agreement — the
+  prompt-engine golden outputs, the encrypted-secret format, the YOLO stream
+  config reader, and the ComfyUI model-registry guard. They shell out to files
+  under `extensions/` in `yu_ai_manager`, which is not part of this repository.
+  They are not failures of the Rust code; they are comparisons with no
+  counterpart present. CI therefore runs `cargo check`, `cargo fmt --check` and
+  clippy.
 
 ## License
 

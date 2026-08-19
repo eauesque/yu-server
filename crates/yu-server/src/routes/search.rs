@@ -11,11 +11,11 @@ use sqlx::{QueryBuilder, Row, Sqlite};
 
 use crate::{
     auth::{scope::require_admin_scope, AuthContext},
+    config_io::load as load_config_json,
     groups_index::GroupsIndex,
     routes::tag_reads::{
         active_model as wd_active_model_name, resolve_model_id_readonly as resolve_wd_model_db_id,
     },
-    routes::ui::load_config_json,
     routes::wd_tagger_normalize::{normalize_tag_name, normalize_tag_name_canonical},
     state::SharedState,
 };
@@ -496,7 +496,7 @@ async fn resolve_wd_tag_search_model(db: &sqlx::SqlitePool, wd_model_param: &str
     }
 }
 
-async fn table_exists(db: &sqlx::SqlitePool, name: &str) -> Result<bool, sqlx::Error> {
+pub(crate) async fn table_exists(db: &sqlx::SqlitePool, name: &str) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)",
     )
@@ -1260,7 +1260,7 @@ fn intersect_group(
     groups
 }
 
-async fn fetch_matching_ids(
+pub(crate) async fn fetch_matching_ids(
     pool: &sqlx::SqlitePool,
     p: &SearchParams,
 ) -> Result<Option<std::collections::HashSet<i64>>, sqlx::Error> {
@@ -1269,7 +1269,9 @@ async fn fetch_matching_ids(
     }
     let active_wd = active_wd_model_id(pool).await;
     let wd_search_model = resolve_wd_tag_search_model(pool, &p.wd_model).await;
-    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("SELECT f.id FROM files f WHERE ");
+    // Regression: fetch_matching_ids built `WHERE  AND ...` which is invalid SQL;
+    // /api/search-grouped returned 500 for any conditioned request.
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("SELECT f.id FROM files f WHERE 1=1");
     push_where_filters(&mut qb, p, active_wd, wd_search_model, false);
     let rows = qb.build().fetch_all(pool).await?;
     Ok(Some(rows.iter().map(|r| r.get::<i64, _>(0)).collect()))
@@ -1463,6 +1465,37 @@ mod tests {
         });
         assert!(has_conditions(&params));
         assert!(!has_conditions(&p(SearchQueryRaw::default())));
+    }
+
+    #[tokio::test]
+    async fn search_grouped_conditioned_request_does_not_generate_invalid_where_sql() {
+        use crate::routes::wd_tagger::tests::{test_dirs, test_state};
+        use axum::{body::to_bytes, extract::State};
+
+        let dirs = test_dirs();
+        let state = test_state(&dirs, json!({})).await;
+        sqlx::query("ALTER TABLE files ADD COLUMN mtime INTEGER DEFAULT 0")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let response = search_grouped(
+            State(state),
+            None,
+            axum::extract::Query(SearchGroupedRaw {
+                search: SearchQueryRaw {
+                    wd_model: Some("model-a".to_string()),
+                    ..Default::default()
+                },
+                group_mode: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["status"],
+            "ok"
+        );
     }
 
     #[tokio::test]

@@ -412,6 +412,10 @@ mod tests {
         .unwrap();
 
         Arc::new(AppState {
+            effective_port: 5000,
+            gateway_keys: Vec::new(),
+            gateway_loopback_bypass: true,
+            settings_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             config: Config {
                 db_path: "sqlite::memory:".to_string(),
                 pin_hash: String::new(),
@@ -444,7 +448,7 @@ mod tests {
             vectors_db: pool.clone(),
             vectors_db_read: pool,
             clip_index: std::sync::Arc::new(
-                crate::routes::clip_index::ClipIndex::new_default(&std::env::temp_dir())
+                crate::routes::clip_index::ClipIndex::new_default(std::env::temp_dir())
                     .expect("clip index test default"),
             ),
             clip_indexer: std::sync::Arc::new(crate::routes::clip_indexer::ClipIndexer::new()),
@@ -471,6 +475,7 @@ mod tests {
             infer_client: None,
             infer_child: None,
             scan_manager: std::sync::OnceLock::new(),
+            hailo_yolo_stream: None,
             stats_basic_cache: crate::state::TtlCache::new(crate::state::STATS_CACHE_TTL),
             stats_models_cache: crate::state::TtlCache::new(crate::state::STATS_CACHE_TTL),
             checkpoints_cache: crate::state::TtlCache::new(crate::state::STATS_CACHE_TTL),
@@ -516,7 +521,7 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         let status = response.status();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let value = serde_json::from_slice(&body).unwrap_or_else(|_| json!(null));
+        let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         (status, value)
     }
 
@@ -529,7 +534,7 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         let status = response.status();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let value = serde_json::from_slice(&body).unwrap_or_else(|_| json!(null));
+        let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         (status, value)
     }
 

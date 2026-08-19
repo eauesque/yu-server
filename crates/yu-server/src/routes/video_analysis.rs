@@ -11,6 +11,7 @@ use axum::{
 use serde_json::{json, Map, Value};
 use sqlx::SqlitePool;
 
+use crate::config_io::load as load_config_json;
 use crate::{
     auth::{scope::require_admin_scope, AuthContext},
     state::SharedState,
@@ -32,22 +33,6 @@ fn admin_scope_error(
     auth_context: Option<&Extension<AuthContext>>,
 ) -> Option<Response> {
     require_admin_scope(state.config.pin_auth_enabled, auth_context.map(|c| &c.0))
-}
-
-pub(crate) fn load_config_json(config_path: &Path) -> Value {
-    for path in [
-        config_path.to_path_buf(),
-        PathBuf::from("config.json"),
-        PathBuf::from("tagdb_config.json"),
-    ] {
-        if path.exists() {
-            return fs::read_to_string(&path)
-                .ok()
-                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-                .unwrap_or_else(|| json!({"scan_roots": []}));
-        }
-    }
-    json!({"scan_roots": []})
 }
 
 fn default_video_config() -> Map<String, Value> {
@@ -164,7 +149,7 @@ pub async fn config_save(
     // Validate keyframe_count
     if let Some(v) = filtered.get("keyframe_count") {
         let n = v.as_i64().unwrap_or(-1);
-        if n < 1 || n > 16 {
+        if !(1..=16).contains(&n) {
             return (
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(json!({"ok": false, "error": "keyframe_count must be an integer between 1 and 16", "code": "invalid_value"})),
@@ -196,6 +181,7 @@ pub async fn config_save(
 
     // Load, merge, save config.json
     let config_path = &state.config.config_path;
+    let _guard = state.settings_lock.lock().await;
     let mut cfg = load_config_json(config_path);
     let va_section = cfg
         .as_object_mut()
@@ -223,18 +209,10 @@ pub async fn config_save(
             );
         }
     }
-    let raw = match serde_json::to_string_pretty(&cfg) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(?e, "video config serialize failed");
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"ok": false, "error": "internal_server_error"})),
-            )
-                .into_response();
-        }
-    };
-    if let Err(e) = fs::write(config_path, &raw) {
+    // Route the write through config_io so this shares the atomic tmp+rename
+    // and 0600 permissions with every other config.json writer. A serialization
+    // failure surfaces as an io::Error from the same call.
+    if let Err(e) = crate::config_io::write(config_path, &cfg) {
         tracing::error!(?e, "video config write failed");
         return (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,

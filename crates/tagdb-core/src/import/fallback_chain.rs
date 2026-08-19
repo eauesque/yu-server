@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use fancy_regex::Regex;
-use meta_extract::{parse_metadata, read_exif_tags, read_png_text_chunks, PngTextChunks};
+use meta_extract::{
+    db_meta_source, parse_metadata, read_exif_tags, read_png_text_chunks, PngTextChunks,
+};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -62,7 +64,7 @@ fn extract_chunks_for_file(path: &Path) -> PngTextChunks {
 }
 
 fn apply_extension_parsers(path: &Path, chunks: &PngTextChunks) -> Option<ExtractedMeta> {
-    if let Some(extracted) = parsed_chunks_to_extracted(chunks) {
+    if let Some(extracted) = parsed_chunks_to_extracted(path, chunks) {
         return Some(extracted);
     }
 
@@ -109,10 +111,10 @@ fn apply_extension_parsers(path: &Path, chunks: &PngTextChunks) -> Option<Extrac
         }
     }
 
-    parsed_chunks_to_extracted(&exif_chunks)
+    parsed_chunks_to_extracted(path, &exif_chunks)
 }
 
-fn parsed_chunks_to_extracted(chunks: &PngTextChunks) -> Option<ExtractedMeta> {
+fn parsed_chunks_to_extracted(path: &Path, chunks: &PngTextChunks) -> Option<ExtractedMeta> {
     if chunks.entries.is_empty() {
         return None;
     }
@@ -123,8 +125,12 @@ fn parsed_chunks_to_extracted(chunks: &PngTextChunks) -> Option<ExtractedMeta> {
     }
 
     let tag_source = parsed.positive.clone();
+    let meta_source = db_meta_source(
+        &parsed.format,
+        path.extension().and_then(|ext| ext.to_str()),
+    );
     Some(ExtractedMeta {
-        meta_source: parsed.format.clone(),
+        meta_source,
         format: parsed.format,
         raw_prompt: parsed.positive,
         raw_negative: parsed.negative,
@@ -133,8 +139,8 @@ fn parsed_chunks_to_extracted(chunks: &PngTextChunks) -> Option<ExtractedMeta> {
     })
 }
 
-fn apply_chunk_fallback(chunks: &PngTextChunks) -> Option<ExtractedMeta> {
-    parsed_chunks_to_extracted(chunks)
+fn apply_chunk_fallback(path: &Path, chunks: &PngTextChunks) -> Option<ExtractedMeta> {
+    parsed_chunks_to_extracted(path, chunks)
 }
 
 fn apply_bytes_fallback(_path: &Path) -> Option<ExtractedMeta> {
@@ -253,7 +259,7 @@ pub fn extract_regular_metadata(path: &Path) -> ExtractedMeta {
     if let Some(extracted) = apply_extension_parsers(path, &chunks) {
         return extracted;
     }
-    if let Some(extracted) = apply_chunk_fallback(&chunks) {
+    if let Some(extracted) = apply_chunk_fallback(path, &chunks) {
         return extracted;
     }
     if let Some(extracted) = apply_bytes_fallback(path) {
@@ -323,6 +329,7 @@ mod tests {
 
         let extracted = extract_regular_metadata(&image);
 
+        assert_eq!(extracted.meta_source, "a1111_png");
         assert_eq!(extracted.format, "a1111");
         assert_eq!(extracted.raw_prompt.as_deref(), Some("embedded"));
         assert_eq!(extracted.tag_source.as_deref(), Some("embedded"));

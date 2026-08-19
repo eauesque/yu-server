@@ -559,7 +559,9 @@ mod tests {
     async fn delete_tag_removes_file_tag() {
         let state = test_state().await;
         let response = delete_tag(State(Arc::clone(&state)), Path((1, 1))).await;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        // 200 + `{"ok": true}`, not 204 — changed deliberately in 197ba88ef for
+        // parity-schema conformance; this assertion was left behind.
+        assert_eq!(response.status(), StatusCode::OK);
 
         let count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM file_tags WHERE file_id = 1 AND tag_id = 1")

@@ -260,16 +260,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stream_connection_count_incremented() {
+    async fn hub_register_connection_counts_per_ip() {
+        // Named for what it actually asserts. It previously read
+        // `test_stream_connection_count_incremented` and opened with
+        // `let _ = app.oneshot(...)` — a future that was dropped without ever
+        // being awaited, so the stream never ran and the name claimed coverage
+        // the body did not provide. End-to-end registration through
+        // `/api/events/stream` is still uncovered here.
         let state = make_state().await;
         let hub = Arc::clone(&state.sse_hub);
-        let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
-        let app = make_app(state);
-        let _ = app.oneshot(req_with_peer("/api/events/stream", peer));
-        // After request is initiated, connection should be registered
-        // (the future may not have completed, but the connection is registered before streaming)
-        // This is a best-effort check; polling would be needed for full certainty.
-        // We verify the hub registration logic works independently.
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
         hub.register_connection(ip);
         assert_eq!(hub.connection_count(ip), 1);

@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{path::Path as FsPath, sync::OnceLock};
@@ -14,12 +14,8 @@ use tokio::sync::Mutex as TokioMutex;
 
 use crate::{
     auth::{client_ip::ClientIp, scope::require_admin_scope, AuthContext},
-    routes::{
-        settings::{
-            load_config_json as load_cfg, validate_base_url, write_config_json as write_cfg,
-        },
-        update_status::detect_install_type,
-    },
+    config_io::{load as load_cfg, validate_base_url, write as write_cfg},
+    routes::update_status::detect_install_type,
     security::CspNonce,
     state::SharedState,
 };
@@ -31,10 +27,38 @@ static CHECK_CACHE: OnceLock<TokioMutex<UpdateCache>> = OnceLock::new();
 static UNIFIED_CACHE: OnceLock<TokioMutex<UpdateCache>> = OnceLock::new();
 static AI_CONTEXT_VERSION: OnceLock<String> = OnceLock::new();
 
-const SETTINGS_SCHEMA_JSON: &str = include_str!("../../../../config/settings_schema.json");
-const WD_TAGGER_MANIFEST_JSON: &str =
-    include_str!("../../../../extensions/builtin_wd_tagger/extension.json");
 const CSRF_NOTE: &str = "POST/PUT/PATCH/DELETE リクエストには X-Requested-With: XMLHttpRequest ヘッダが必要。Bearer API Key 認証時は不要。安全メソッド (GET, HEAD, OPTIONS) は CSRF チェック対象外。除外パスプレフィックス: /api/events/, /api/webhooks/receive/, /v1/。/ext/<name>/v1/* も除外（^/ext/[A-Za-z0-9][\\w\\-]*/v1/）。";
+
+/// Read the generated settings schema from the running installation.
+///
+/// This used to be `include_str!("../../../../config/settings_schema.json")`,
+/// which reached outside the crate and so blocked splitting yu-server into its
+/// own repository (Cargo does not report `include_str!` as a dependency, so
+/// nothing failed to warn about it). `routes::settings` already loads the same
+/// file from `project_root` at runtime; this reuses that path so the two
+/// surfaces cannot read different files.
+fn load_settings_schema(project_root: &FsPath) -> serde_json::Value {
+    std::fs::read_to_string(crate::routes::settings::schema_path(project_root))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// `config.enabled` from an extension's own manifest, defaulting to `true`
+/// when the manifest is absent or unreadable — the same fallback the embedded
+/// copy provided, and the same one `ext_config::resolve_extension_enabled`
+/// applies for every other extension.
+fn extension_manifest(project_root: &FsPath, dir_name: &str) -> serde_json::Value {
+    std::fs::read_to_string(
+        project_root
+            .join("extensions")
+            .join(dir_name)
+            .join("extension.json"),
+    )
+    .ok()
+    .and_then(|raw| serde_json::from_str(&raw).ok())
+    .unwrap_or_default()
+}
 
 fn parse_version(v: &str) -> Vec<u64> {
     v.trim_start_matches('v')
@@ -125,7 +149,7 @@ fn resolve_dotted_key<'a>(
         .try_fold(config, |value, part| value.get(part))
 }
 
-fn get_config_hints(config: &serde_json::Value) -> Vec<serde_json::Value> {
+fn get_config_hints(config: &serde_json::Value, project_root: &FsPath) -> Vec<serde_json::Value> {
     let mut hints = Vec::new();
     let server = config.get("server");
     if json_truthy(server.and_then(|value| value.get("lan")))
@@ -147,7 +171,7 @@ fn get_config_hints(config: &serde_json::Value) -> Vec<serde_json::Value> {
         }));
     }
 
-    let schema: serde_json::Value = serde_json::from_str(SETTINGS_SCHEMA_JSON).unwrap_or_default();
+    let schema = load_settings_schema(project_root);
     for setting in schema.as_array().into_iter().flatten() {
         let key = setting["key"].as_str().unwrap_or("");
         if !setting["secret"].as_bool().unwrap_or(false)
@@ -176,7 +200,11 @@ fn get_config_hints(config: &serde_json::Value) -> Vec<serde_json::Value> {
     hints
 }
 
-fn capabilities(config: &serde_json::Value, native_daemon: bool) -> Vec<&'static str> {
+fn capabilities(
+    config: &serde_json::Value,
+    native_daemon: bool,
+    project_root: &FsPath,
+) -> Vec<&'static str> {
     let mut capabilities = vec!["llm_router"];
     if native_daemon {
         capabilities.push("lan_cowork");
@@ -193,9 +221,8 @@ fn capabilities(config: &serde_json::Value, native_daemon: bool) -> Vec<&'static
     {
         capabilities.push("hailo");
     }
-    let wd_default = serde_json::from_str::<serde_json::Value>(WD_TAGGER_MANIFEST_JSON)
-        .ok()
-        .and_then(|manifest| manifest["config"]["enabled"].as_bool())
+    let wd_default = extension_manifest(project_root, "builtin_wd_tagger")["config"]["enabled"]
+        .as_bool()
         .unwrap_or(true);
     if config["extensions"]["builtin-wd-tagger"]["enabled"]
         .as_bool()
@@ -384,12 +411,13 @@ mod ai_context_tests {
 
     #[test]
     fn ai_context_capabilities_follow_actual_configuration() {
+        let root = tempfile::tempdir().unwrap();
         let config = json!({
             "hailo_tagger": {"enabled": true, "endpoint_url": "http://hailo.test"},
             "extensions": {"builtin-wd-tagger": {"enabled": false}},
         });
         assert_eq!(
-            capabilities(&config, false),
+            capabilities(&config, false, root.path()),
             [
                 "llm_router",
                 "hailo",
@@ -398,15 +426,50 @@ mod ai_context_tests {
                 "scheduler"
             ]
         );
-        assert!(capabilities(&config, true).contains(&"lan_cowork"));
+        assert!(capabilities(&config, true, root.path()).contains(&"lan_cowork"));
+    }
+
+    /// Without a manifest the wd-tagger default is `true`, matching the value
+    /// the embedded `extension.json` used to supply.
+    #[test]
+    fn wd_tagger_default_comes_from_the_installed_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let config = json!({});
+        assert!(capabilities(&config, false, root.path()).contains(&"wd_tagger"));
+
+        let ext = root.path().join("extensions/builtin_wd_tagger");
+        std::fs::create_dir_all(&ext).unwrap();
+        std::fs::write(
+            ext.join("extension.json"),
+            json!({"config": {"enabled": false}}).to_string(),
+        )
+        .unwrap();
+        assert!(!capabilities(&config, false, root.path()).contains(&"wd_tagger"));
     }
 
     #[test]
     fn ai_context_config_hints_match_python_rules() {
-        let keys: Vec<_> = get_config_hints(&json!({
-            "server": {"lan": true},
-            "ai_analysis": {"api_key": ""},
-        }))
+        // The schema-derived hints are read from the installation at run time,
+        // so the fixture has to exist on disk for this assertion to hold.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("config")).unwrap();
+        std::fs::write(
+            root.path().join("config/settings_schema.json"),
+            json!([
+                {"key": "server.restart_token", "secret": true, "default": null, "description": "restart token"},
+                {"key": "webhook_secret", "secret": true, "default": null, "description": "webhook secret"},
+                {"key": "server.port", "secret": false, "default": null, "description": "port"},
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let keys: Vec<_> = get_config_hints(
+            &json!({
+                "server": {"lan": true},
+                "ai_analysis": {"api_key": ""},
+            }),
+            root.path(),
+        )
         .into_iter()
         .map(|hint| hint["key"].as_str().unwrap().to_string())
         .collect();
@@ -439,7 +502,7 @@ pub async fn ai_context(
                 "version": read_version_cached(&AI_CONTEXT_VERSION, &s.config.project_root),
                 "description": "ローカルファースト AI 画像メタデータ管理ツール",
             },
-            "capabilities": capabilities(&config, native_daemon),
+            "capabilities": capabilities(&config, native_daemon, &s.config.project_root),
             "urls": {
                 "settings_schema": "/api/settings/schema",
                 "current_settings": "/api/settings/all",
@@ -451,7 +514,7 @@ pub async fn ai_context(
                 "note": "POST で job を起動し、返された job_id を GET で polling して完了を確認する",
             },
             "csrf_note": CSRF_NOTE,
-            "config_hints": get_config_hints(&config),
+            "config_hints": get_config_hints(&config, &s.config.project_root),
         }
     }))
     .into_response()
@@ -900,13 +963,841 @@ pub async fn collections_export_csv(
 }
 
 /// POST /api/llm/agent
-pub async fn llm_agent(State(_s): State<SharedState>) -> Response {
-    unavailable()
+pub async fn llm_agent(
+    State(state): State<SharedState>,
+    auth_context: Option<Extension<AuthContext>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Some(response) = require_admin_scope(
+        state.config.pin_auth_enabled,
+        auth_context.as_ref().map(|context| &context.0),
+    ) {
+        return response;
+    }
+    let category = body
+        .get("category")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let message = body
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if category.is_empty() || message.is_empty() {
+        return llm_error("category and message are required", StatusCode::BAD_REQUEST);
+    }
+    let endpoint = crate::routes::llm_client::resolve_endpoint(&state, category).or_else(|| {
+        (category == "hailo").then(|| crate::routes::llm_client::Endpoint {
+            base_url: format!(
+                "http://127.0.0.1:{}/ext/hailo-genai/v1",
+                state.effective_port
+            ),
+            model: body
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("qwen2.5-coder-1.5b")
+                .to_string(),
+            api_key: String::new(),
+            timeout_secs: 120,
+        })
+    });
+    let Some(endpoint) = endpoint else {
+        return llm_error(
+            &format!("No LLM endpoint configured for '{category}'"),
+            StatusCode::NOT_FOUND,
+        );
+    };
+    let mode = body
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let tools = agent_tools(&body);
+    let max_rounds = body
+        .get("max_rounds")
+        .and_then(Value::as_u64)
+        .unwrap_or(8)
+        .min(8) as usize;
+    let system_prompt = body.get("system_prompt").and_then(Value::as_str).unwrap_or(
+        "You are a helpful assistant. Use the available tools to answer questions about the file database.",
+    );
+    if mode == "prompt_based" || (mode.is_empty() && endpoint.base_url.contains("hailo-genai")) {
+        return llm_result(
+            crate::routes::llm_agent_prompt::run_agent_prompt_based(
+                &state,
+                &headers,
+                &endpoint,
+                message,
+                &tools,
+                system_prompt,
+                body.get("max_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(512) as u32,
+                body.get("temperature")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.1),
+                max_rounds,
+            )
+            .await,
+        );
+    }
+    let max_tokens = body
+        .get("max_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(1024) as u32;
+    let temperature = body
+        .get("temperature")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.3);
+    let mut history = Vec::new();
+    if !system_prompt.is_empty() {
+        history.push(json!({"role": "system", "content": system_prompt}));
+    }
+    history.push(json!({"role": "user", "content": message}));
+    let mut steps = Vec::new();
+    for round in 0..max_rounds {
+        let response = match crate::routes::llm_client::chat(
+            &state,
+            &endpoint,
+            &history,
+            max_tokens,
+            temperature,
+            Some(&Value::Array(tools.clone())),
+            Some(&headers),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(category, %error, "LLM agent failed");
+                return llm_error("LLM agent request failed", StatusCode::BAD_GATEWAY);
+            }
+        };
+        if response.tool_calls.is_empty() {
+            return llm_result(json!({
+                "content": response.content,
+                "model": response.model,
+                "steps": steps,
+                "rounds": round + 1,
+            }));
+        }
+        history.push(json!({
+            "role": "assistant",
+            "content": response.content,
+            "tool_calls": response.tool_calls.iter().map(|call| json!({
+                "id": call.id,
+                "type": "function",
+                "function": {"name": call.name, "arguments": call.arguments},
+            })).collect::<Vec<_>>(),
+        }));
+        for call in response.tool_calls {
+            let arguments = serde_json::from_str(&call.arguments).unwrap_or_default();
+            let result =
+                crate::routes::llm_client::execute_tool(&state, &headers, &call.name, &arguments)
+                    .await;
+            let result = if let Some(value) = result.as_str() {
+                value.to_string()
+            } else {
+                result.to_string()
+            };
+            steps.push(json!({
+                "tool": call.name,
+                "arguments": arguments,
+                "result_preview": result.chars().take(200).collect::<String>(),
+            }));
+            history.push(json!({"role": "tool", "tool_call_id": call.id, "content": result}));
+        }
+    }
+    llm_result(json!({
+        "content": "[Agent reached maximum tool call rounds]",
+        "model": endpoint.model,
+        "steps": steps,
+        "rounds": max_rounds,
+    }))
+}
+
+#[cfg(test)]
+mod llm_agent_tests {
+    use super::*;
+    use std::{
+        collections::HashSet,
+        path::PathBuf,
+        str::FromStr,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
+
+    use axum::{
+        body::to_bytes,
+        extract::State,
+        routing::{get, post},
+        Router,
+    };
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use tokio::sync::Mutex;
+
+    use crate::state::{AppState, Config};
+
+    #[derive(Clone)]
+    struct StubState {
+        chats: Arc<AtomicUsize>,
+        chat_headers: Arc<Mutex<Vec<HeaderMap>>>,
+        tool_headers: Arc<Mutex<Vec<HeaderMap>>>,
+        requests: Arc<Mutex<Vec<Value>>>,
+    }
+
+    async fn chat(State(stub): State<StubState>, headers: HeaderMap) -> Json<Value> {
+        stub.chat_headers.lock().await.push(headers);
+        let message = if stub.chats.fetch_add(1, Ordering::SeqCst) % 2 == 0 {
+            json!({"content": "", "tool_calls": [{"id": "call-1", "function": {"name": "search_files", "arguments": "{\"q\":\"test\"}"}}]})
+        } else {
+            json!({"content": "done"})
+        };
+        Json(json!({"choices": [{"message": message}], "model": "stub"}))
+    }
+
+    async fn prompt_chat(
+        State(stub): State<StubState>,
+        headers: HeaderMap,
+        Json(request): Json<Value>,
+    ) -> Json<Value> {
+        stub.chat_headers.lock().await.push(headers);
+        stub.requests.lock().await.push(request);
+        let content = if stub.chats.fetch_add(1, Ordering::SeqCst) % 2 == 0 {
+            r#"{"name":"search_files","arguments":{"q":"test"}}"#
+        } else {
+            "done"
+        };
+        Json(json!({"choices":[{"message":{"content":content}}], "model":"stub"}))
+    }
+
+    async fn search(State(stub): State<StubState>, headers: HeaderMap) -> Json<Value> {
+        stub.tool_headers.lock().await.push(headers);
+        Json(json!("x".repeat(2000)))
+    }
+
+    /// First call replies with a malformed-but-recognizable tool-call attempt (a brace fragment
+    /// with a quoted `"name"` key that fails to parse); every call after that replies with a
+    /// plain final answer. Used to prove the one-shot format-correction retry actually fires.
+    async fn prompt_chat_malformed_then_answer(
+        State(stub): State<StubState>,
+        headers: HeaderMap,
+        Json(request): Json<Value>,
+    ) -> Json<Value> {
+        stub.chat_headers.lock().await.push(headers);
+        stub.requests.lock().await.push(request);
+        let content = if stub.chats.fetch_add(1, Ordering::SeqCst) == 0 {
+            r#"{"name": "search_files", "oops":}"#
+        } else {
+            "The answer is 42."
+        };
+        Json(json!({"choices":[{"message":{"content":content}}], "model":"stub"}))
+    }
+
+    async fn test_state(port: u16) -> SharedState {
+        let pool = SqlitePoolOptions::new()
+            .connect_with(SqliteConnectOptions::from_str("sqlite::memory:").unwrap())
+            .await
+            .unwrap();
+        Arc::new(
+            AppState::new(
+                Config {
+                    db_path: "sqlite::memory:".to_string(), pin_hash: String::new(), valid_token: String::new(), secret: String::new(),
+                    trusted_proxy_enabled: false, pin_boss_login_ui: false, trusted_ips: HashSet::new(), trusted_peer_ips: HashSet::new(),
+                    quick_lock_enabled: true, pin_auth_enabled: false, min_pin_length: 4, python_url: String::new(),
+                    config_path: PathBuf::from("config.json"), project_root: PathBuf::from("."),
+                    app_config: json!({"llm_endpoints": {"test": {"base_url": format!("http://127.0.0.1:{port}/v1"), "model": "stub"}}}),
+                    cache_dir: PathBuf::from("."), server_mode: "full".to_string(), headless: false, safe_mode: false,
+                    mcp_native: false, standalone: false, infer_standalone: true, active_profile: None, python_executable: String::new(),
+                },
+                pool.clone(), pool, Arc::new(crate::logs::ring::LogRingBuffer::new(64)),
+            ).await.with_effective_port(port),
+        )
+    }
+
+    async fn response_json(response: Response) -> Value {
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn llm_agent_forwards_caller_credentials_and_limits_result_preview() {
+        let stub = StubState {
+            chats: Arc::new(AtomicUsize::new(0)),
+            chat_headers: Arc::new(Mutex::new(Vec::new())),
+            tool_headers: Arc::new(Mutex::new(Vec::new())),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat))
+            .route("/api/search", get(search))
+            .with_state(stub.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = test_state(port).await;
+        let body = json!({"category": "test", "message": "search"});
+
+        let mut credentials = HeaderMap::new();
+        credentials.insert("Authorization", "Bearer caller".parse().unwrap());
+        credentials.insert("X-Api-Key", "caller-key".parse().unwrap());
+        credentials.insert("Cookie", "session=caller".parse().unwrap());
+        let response = llm_agent(State(state.clone()), None, credentials, Json(body.clone())).await;
+        let result = response_json(response).await;
+        assert_eq!(result["steps"][0]["result_preview"], "x".repeat(200),);
+
+        let mut no_cookie = HeaderMap::new();
+        no_cookie.insert("Authorization", "Bearer caller".parse().unwrap());
+        no_cookie.insert("X-Api-Key", "caller-key".parse().unwrap());
+        let response = llm_agent(State(state), None, no_cookie, Json(body)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let headers = stub.tool_headers.lock().await;
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0].get("Authorization").unwrap(), "Bearer caller");
+        assert_eq!(headers[0].get("X-Api-Key").unwrap(), "caller-key");
+        assert_eq!(headers[0].get("Cookie").unwrap(), "session=caller");
+        assert!(headers[1].get("Cookie").is_none());
+        let chat_headers = stub.chat_headers.lock().await;
+        assert_eq!(chat_headers.len(), 4);
+        assert!(chat_headers.iter().all(|headers| {
+            headers.get("Authorization").is_none()
+                && headers.get("X-Api-Key").is_none()
+                && headers.get("Cookie").is_none()
+        }));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn llm_agent_hailo_prompt_based_passes_native_tools() {
+        let stub = StubState {
+            chats: Arc::new(AtomicUsize::new(0)),
+            chat_headers: Arc::new(Mutex::new(Vec::new())),
+            tool_headers: Arc::new(Mutex::new(Vec::new())),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/ext/hailo-genai/v1/chat/completions", post(prompt_chat))
+            .route("/api/search", get(search))
+            .with_state(stub.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut credentials = HeaderMap::new();
+        credentials.insert("Authorization", "Bearer caller".parse().unwrap());
+        credentials.insert("X-Api-Key", "caller-key".parse().unwrap());
+        credentials.insert("Cookie", "pin_token=caller".parse().unwrap());
+        for body in [
+            json!({"category":"hailo", "message":"go"}),
+            json!({"category":"hailo", "message":"go", "mode":"prompt_based"}),
+        ] {
+            let response = llm_agent(
+                State(test_state(port).await),
+                None,
+                credentials.clone(),
+                Json(body),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = response_json(response).await;
+            assert_eq!(value["steps"][0]["tool"], "search_files");
+            assert_eq!(value["rounds"], 2);
+            assert_eq!(
+                value["steps"][0]["result_preview"]
+                    .as_str()
+                    .unwrap()
+                    .chars()
+                    .count(),
+                200
+            );
+        }
+        let requests = stub.requests.lock().await;
+        assert_eq!(requests.len(), 4);
+        // prompt_based now passes native tool definitions to HailoRT's own
+        // write(messages, tools) instead of relying solely on the prose
+        // system-prompt listing (real Hailo-10H hardware, Qwen3-1.7B-Instruct,
+        // responds to this with <tool_call>{"name":...}</tool_call> — a format
+        // the existing regex parser already handles). Unwrapped to the bare
+        // {"name":...} shape at the call site (llm_agent_prompt.rs), not left
+        // in OpenAI's {"type":"function","function":{...}} envelope — the
+        // model's chat template needs the inner object directly.
+        assert!(requests
+            .iter()
+            .all(|request| request["tools"].as_array().unwrap().len() == 8));
+        assert_eq!(requests[0]["tools"][0]["name"], "search_files");
+        assert!(requests[0]["tools"][0].get("function").is_none());
+        assert_eq!(requests[0]["max_tokens"], 512);
+        assert_eq!(requests[0]["temperature"], 0.1);
+        let tool_result = requests[1]["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(tool_result.contains("...(truncated)"));
+        let chat_headers = stub.chat_headers.lock().await;
+        assert_eq!(chat_headers.len(), 4);
+        assert_eq!(
+            chat_headers[0].get("Authorization").unwrap(),
+            "Bearer caller"
+        );
+        assert_eq!(chat_headers[0].get("X-Api-Key").unwrap(), "caller-key");
+        assert_eq!(chat_headers[0].get("Cookie").unwrap(), "pin_token=caller");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn llm_agent_prompt_based_keeps_openai_tool_envelope_for_non_hailo_endpoints() {
+        // Regression (Codex stop-time review, 2026-08-16): mode="prompt_based" is reachable for
+        // ANY category, not just the synthetic hailo-genai self-loopback endpoint — a caller can
+        // point llm_endpoints.<category> at a real external OpenAI-compatible server. Only the
+        // Hailo native path should get bare {"name":...} tools; everyone else must keep the
+        // OpenAI {"type":"function","function":{...}} envelope tool_definitions() produces.
+        let stub = StubState {
+            chats: Arc::new(AtomicUsize::new(0)),
+            chat_headers: Arc::new(Mutex::new(Vec::new())),
+            tool_headers: Arc::new(Mutex::new(Vec::new())),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(prompt_chat))
+            .route("/api/search", get(search))
+            .with_state(stub.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let body = json!({"category": "test", "message": "go", "mode": "prompt_based"});
+        let response = llm_agent(
+            State(test_state(port).await),
+            None,
+            HeaderMap::new(),
+            Json(body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let requests = stub.requests.lock().await;
+        assert!(!requests.is_empty());
+        assert_eq!(requests[0]["tools"][0]["type"], "function");
+        assert_eq!(requests[0]["tools"][0]["function"]["name"], "search_files");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn llm_agent_prompt_based_correction_retry_fires_even_with_max_rounds_one() {
+        // Regression (Codex stop-time review, 2026-08-16): the correction retry must not be
+        // counted against the round budget, or `max_rounds=1` would let the correction request
+        // consume the single allowed round and the promised retry would never actually happen.
+        let stub = StubState {
+            chats: Arc::new(AtomicUsize::new(0)),
+            chat_headers: Arc::new(Mutex::new(Vec::new())),
+            tool_headers: Arc::new(Mutex::new(Vec::new())),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route(
+                "/ext/hailo-genai/v1/chat/completions",
+                post(prompt_chat_malformed_then_answer),
+            )
+            .with_state(stub.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let response = llm_agent(
+            State(test_state(port).await),
+            None,
+            HeaderMap::new(),
+            Json(json!({"category":"hailo", "message":"go", "max_rounds":1})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = response_json(response).await;
+        // If the retry had been silently skipped, this would instead be
+        // "[Agent reached maximum tool call rounds]" after a single wasted round.
+        assert_eq!(value["content"], "The answer is 42.");
+        let requests = stub.requests.lock().await;
+        assert_eq!(
+            requests.len(),
+            2,
+            "the correction retry must have been sent"
+        );
+        server.abort();
+    }
 }
 
 /// POST /api/llm/chat
-pub async fn llm_chat(State(_s): State<SharedState>) -> Response {
-    unavailable()
+pub async fn llm_chat(State(state): State<SharedState>, Json(body): Json<Value>) -> Response {
+    let category = body
+        .get("category")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let messages = body.get("messages").and_then(Value::as_array);
+    if category.is_empty() || messages.is_none_or(Vec::is_empty) {
+        return llm_error(
+            "category and messages are required",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    let Some(endpoint) = crate::routes::llm_client::resolve_endpoint(&state, category) else {
+        return llm_error(
+            &format!("No LLM endpoint configured for '{category}'"),
+            StatusCode::NOT_FOUND,
+        );
+    };
+    let max_tokens = body
+        .get("max_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(1024) as u32;
+    let temperature = body
+        .get("temperature")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.7);
+    match crate::routes::llm_client::chat(
+        &state,
+        &endpoint,
+        messages.expect("validated messages"),
+        max_tokens,
+        temperature,
+        body.get("tools"),
+        None,
+    )
+    .await
+    {
+        Ok(result) => llm_result(json!({
+            "content": result.content,
+            "model": result.model,
+            "usage": result.usage,
+        })),
+        Err(error) => {
+            tracing::warn!(category, %error, "LLM chat failed");
+            llm_error("LLM request failed", StatusCode::BAD_GATEWAY)
+        }
+    }
+}
+
+fn llm_result(payload: Value) -> Response {
+    let mut body = payload.as_object().cloned().unwrap_or_default();
+    body.insert("ok".to_string(), Value::Bool(true));
+    body.insert("error".to_string(), Value::Null);
+    body.insert("data".to_string(), Value::Null);
+    Json(Value::Object(body)).into_response()
+}
+
+fn llm_error(error: &str, status: StatusCode) -> Response {
+    (
+        status,
+        Json(json!({"ok": false, "error": error, "data": null})),
+    )
+        .into_response()
+}
+
+fn agent_tools(body: &Value) -> Vec<Value> {
+    match body.get("tools") {
+        Some(Value::String(value)) if value == "all" => {
+            crate::routes::llm_client::tool_definitions()
+        }
+        Some(Value::Array(tools)) => tools.clone(),
+        _ => crate::routes::llm_client::tool_definitions()[..8].to_vec(),
+    }
+}
+
+#[cfg(test)]
+mod llm_chat_tests {
+    use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::{header, Method, Request},
+        middleware,
+        routing::post,
+        Router,
+    };
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::{
+        collections::HashSet,
+        path::PathBuf,
+        str::FromStr,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
+    };
+    use tower::ServiceExt;
+    use tower_sessions::{MemoryStore, SessionManagerLayer};
+
+    use crate::{
+        logs::ring::LogRingBuffer,
+        state::{AppState, Config},
+    };
+
+    async fn state_with(
+        base_url: Option<String>,
+        pin_auth_enabled: bool,
+        config_path: PathBuf,
+    ) -> SharedState {
+        let pool = SqlitePoolOptions::new()
+            .connect_with(SqliteConnectOptions::from_str("sqlite::memory:").unwrap())
+            .await
+            .unwrap();
+        Arc::new(AppState::new(Config {
+            db_path: "sqlite::memory:".to_string(), pin_hash: String::new(), valid_token: String::new(),
+            secret: String::new(), trusted_proxy_enabled: false, trusted_ips: HashSet::new(),
+            trusted_peer_ips: HashSet::new(), quick_lock_enabled: true, pin_auth_enabled,
+            min_pin_length: 4, python_url: String::new(), config_path,
+            project_root: PathBuf::from("."), app_config: base_url.map(|base_url| json!({"llm_endpoints": {"test": {"base_url": base_url, "model": "test-model"}}})).unwrap_or_else(|| json!({})),
+            cache_dir: PathBuf::from("."), server_mode: "full".to_string(), headless: false,
+            safe_mode: false, standalone: false, infer_standalone: true, python_executable: String::new(),
+            mcp_native: false, active_profile: None, pin_boss_login_ui: false,
+        }, pool.clone(), pool, Arc::new(LogRingBuffer::new(64))).await)
+    }
+
+    async fn state(base_url: Option<String>) -> SharedState {
+        state_with(base_url, false, PathBuf::from("config.json")).await
+    }
+
+    async fn body(response: Response) -> Value {
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    async fn upstream(status: StatusCode, response: Value) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/chat/completions",
+                    post(move || {
+                        let response = response.clone();
+                        async move { (status, Json(response)) }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    async fn agent_upstream(responses: Vec<Value>, requests: Arc<Mutex<Vec<Value>>>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/chat/completions",
+                    post(move |Json(request): Json<Value>| {
+                        let requests = requests.clone();
+                        let responses = responses.clone();
+                        let calls = calls.clone();
+                        async move {
+                            requests.lock().unwrap().push(request);
+                            Json(
+                                responses[calls
+                                    .fetch_add(1, Ordering::SeqCst)
+                                    .min(responses.len() - 1)]
+                                .clone(),
+                            )
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    fn tool_call_response() -> Value {
+        json!({"model":"agent-model","choices":[{"message":{"content":"", "tool_calls":[{"id":"call-1", "type":"function", "function":{"name":"missing_tool", "arguments":"{}"}}]}}]})
+    }
+
+    #[tokio::test]
+    async fn llm_agent_stops_after_eight_tool_rounds() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let url = agent_upstream(vec![tool_call_response()], requests.clone()).await;
+        let response = llm_agent(
+            State(state(Some(url)).await),
+            None,
+            HeaderMap::new(),
+            Json(json!({"category":"test", "message":"go"})),
+        )
+        .await;
+        let value = body(response).await;
+        assert_eq!(value["content"], "[Agent reached maximum tool call rounds]");
+        assert_eq!(value["rounds"], 8);
+        assert_eq!(value["steps"].as_array().unwrap().len(), 8);
+        assert_eq!(requests.lock().unwrap().len(), 8);
+    }
+
+    #[tokio::test]
+    async fn llm_agent_keeps_going_after_tool_error() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let url = agent_upstream(
+            vec![
+                tool_call_response(),
+                json!({"model":"agent-model","choices":[{"message":{"content":"done"}}]}),
+            ],
+            requests.clone(),
+        )
+        .await;
+        let response = llm_agent(
+            State(state(Some(url)).await),
+            None,
+            HeaderMap::new(),
+            Json(json!({"category":"test", "message":"go"})),
+        )
+        .await;
+        let value = body(response).await;
+        assert_eq!(value["content"], "done");
+        assert_eq!(value["rounds"], 2);
+        let history = &requests.lock().unwrap()[1]["messages"];
+        assert_eq!(
+            history[history.as_array().unwrap().len() - 1]["role"],
+            "tool"
+        );
+        assert!(history[history.as_array().unwrap().len() - 1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown tool: missing_tool"));
+    }
+
+    #[test]
+    fn llm_agent_resolves_all_default_and_custom_tools() {
+        assert_eq!(agent_tools(&json!({"tools":"all"})).len(), 14);
+        assert_eq!(
+            agent_tools(&json!({}))
+                .iter()
+                .map(|tool| tool["function"]["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "search_files",
+                "get_file_tags",
+                "list_scan_roots",
+                "get_stats",
+                "get_server_info",
+                "list_collections",
+                "list_llm_endpoints",
+                "get_server_mode",
+            ],
+        );
+        let custom = json!([{"type":"function","function":{"name":"only"}}]);
+        assert_eq!(
+            agent_tools(&json!({"tools": custom})),
+            custom.as_array().unwrap().clone()
+        );
+    }
+
+    fn full_middleware_app(state: SharedState) -> Router {
+        Router::new()
+            .route("/api/llm/agent", post(llm_agent))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                crate::auth::middleware::auth_middleware,
+            ))
+            .layer(SessionManagerLayer::new(MemoryStore::default()))
+            .layer(middleware::from_fn(crate::csrf::layer))
+            .layer(middleware::from_fn(crate::security::layer))
+            .with_state(state)
+    }
+
+    fn write_api_key_config(path: &std::path::Path, raw_key: &str, scopes: &[&str]) {
+        use sha2::{Digest, Sha256};
+        std::fs::write(
+            path,
+            json!({"api_keys":[{
+                "id":"test", "key_hash": hex::encode(Sha256::digest(raw_key.as_bytes())),
+                "key_prefix":raw_key.get(..8).unwrap_or(raw_key), "label":"test", "scopes":scopes,
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn llm_agent_admin_gate_uses_full_middleware_stack() {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("config.json");
+        let state = state_with(None, true, config_path.clone()).await;
+        let app = full_middleware_app(state);
+        let request = |key: Option<&str>| {
+            let mut builder = Request::builder()
+                .method(Method::POST)
+                .uri("/api/llm/agent")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("X-Requested-With", "XMLHttpRequest");
+            if let Some(key) = key {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {key}"));
+            }
+            builder.body(Body::from("{}")).unwrap()
+        };
+        assert_eq!(
+            app.clone().oneshot(request(None)).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        write_api_key_config(&config_path, "sk_scan_only_0123456789abcdef", &["scan"]);
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Some("sk_scan_only_0123456789abcdef")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        write_api_key_config(&config_path, "sk_admin_0123456789abcdef", &["admin"]);
+        assert_eq!(
+            app.oneshot(request(Some("sk_admin_0123456789abcdef")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_chat_rejects_missing_category_or_messages() {
+        let response = llm_chat(State(state(None).await), Json(json!({"category": "test"}))).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body(response).await["ok"], false);
+    }
+
+    #[tokio::test]
+    async fn llm_chat_rejects_unconfigured_category() {
+        let response = llm_chat(
+            State(state(None).await),
+            Json(json!({"category": "test", "messages": [{"role":"user","content":"hi"}]})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn llm_chat_maps_upstream_failure_to_bad_gateway() {
+        let url = upstream(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "no"})).await;
+        let response = llm_chat(
+            State(state(Some(url)).await),
+            Json(json!({"category": "test", "messages": [{"role":"user","content":"hi"}]})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn llm_chat_returns_openai_content_model_and_usage() {
+        let url = upstream(StatusCode::OK, json!({"model":"reply-model", "usage":{"total_tokens":3}, "choices":[{"message":{"content":"hello"}}]})).await;
+        let response = llm_chat(
+            State(state(Some(url)).await),
+            Json(json!({"category": "test", "messages": [{"role":"user","content":"hi"}]})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body(response).await,
+            json!({"ok":true,"error":null,"data":null,"content":"hello","model":"reply-model","usage":{"total_tokens":3}})
+        );
+    }
 }
 
 /// GET /share
@@ -981,7 +1872,7 @@ async fn read_config_json(state: &SharedState) -> serde_json::Value {
     tokio::fs::read_to_string(&state.config.config_path)
         .await
         .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .and_then(|raw| crate::config_io::parse(&state.config.config_path, &raw))
         .unwrap_or_else(|| serde_json::json!({}))
 }
 
@@ -1520,27 +2411,11 @@ fn scan_to_json(
 
     let meta = parse_metadata(&chunks);
     let parsed = meta.format != "unknown";
-    let meta_source = match meta.format.as_str() {
-        "comfy" => {
-            if ext == ".webp" {
-                "comfy_webp"
-            } else {
-                "comfy_png"
-            }
-        }
-        "nai_v4" => {
-            if ext == ".webp" {
-                "novelai_v4_webp"
-            } else {
-                "novelai_v4_png"
-            }
-        }
-        other => other,
-    };
+    let meta_source = meta_extract::db_meta_source(&meta.format, Some(ext));
 
-    use crate::routes::file_detail::resolve_detail_fields;
+    use meta_extract::resolve_detail_fields;
     let detail = resolve_detail_fields(
-        meta_source,
+        &meta_source,
         meta.positive.as_deref().unwrap_or(""),
         meta.negative.as_deref().unwrap_or(""),
         meta.raw_meta.as_deref(),

@@ -313,9 +313,9 @@ fn md_to_html(md_text: &str) -> String {
         }
 
         // Blockquote
-        if stripped.starts_with("> ") {
+        if let Some(rest) = stripped.strip_prefix("> ") {
             close_list(&mut html_lines, &mut in_list, &mut in_ol);
-            let bq_text = inline_md(&stripped[2..]);
+            let bq_text = inline_md(rest);
             if bq_text.starts_with("<strong>Note</strong>")
                 || bq_text.starts_with("<strong>注意</strong>")
             {
@@ -335,11 +335,7 @@ fn md_to_html(md_text: &str) -> String {
         }
 
         // Ordered list
-        if stripped
-            .chars()
-            .next()
-            .map_or(false, |c| c.is_ascii_digit())
-        {
+        if stripped.chars().next().is_some_and(|c| c.is_ascii_digit()) {
             if let Some(dot_pos) = stripped.find(". ") {
                 let prefix = &stripped[..dot_pos];
                 if prefix.chars().all(|c| c.is_ascii_digit()) {

@@ -1,5 +1,5 @@
 //! Cross-language conformance: Rust parse_metadata output must match Python
-//! builtin parser golden files in tests/compat_goldens/meta_extract/.
+//! builtin parser golden files in tests/goldens/.
 //!
 //! Run: cargo test -p meta-extract
 //!
@@ -10,18 +10,13 @@ use meta_extract::{parse_metadata, read_png_text_chunks};
 use serde_json::Value;
 use std::path::PathBuf;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf()
+fn crate_tests_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests")
 }
 
 fn load_golden(parser_id: &str) -> Value {
-    let path = repo_root()
-        .join("tests/compat_goldens/meta_extract")
+    let path = crate_tests_root()
+        .join("goldens")
         .join(format!("{}.json", parser_id));
     let raw = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("Cannot read golden {}: {}", path.display(), e));
@@ -30,7 +25,7 @@ fn load_golden(parser_id: &str) -> Value {
 }
 
 fn load_capability_matrix() -> Vec<(String, String)> {
-    let path = repo_root().join("tests/compat_goldens/meta_extract/capability_matrix.yaml");
+    let path = crate_tests_root().join("goldens/capability_matrix.yaml");
     let raw = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("Cannot read capability_matrix.yaml: {}", e));
     let mut skips: Vec<(String, String)> = Vec::new();
@@ -86,7 +81,7 @@ fn run_conformance(parser_id: &str) {
     let fixture_rel = golden["fixture"]
         .as_str()
         .unwrap_or_else(|| panic!("Golden {}: missing 'fixture' key", parser_id));
-    let fixture_path = repo_root().join(fixture_rel);
+    let fixture_path = crate_tests_root().join(fixture_rel);
     assert!(
         fixture_path.exists(),
         "Fixture not found: {}",
@@ -119,7 +114,7 @@ fn run_conformance(parser_id: &str) {
         } else {
             panic!(
                 "[{}] positive mismatch - Rust={:?} golden={:?}\n\
-                 If this is a known gap, add it to tests/compat_goldens/meta_extract/capability_matrix.yaml",
+                 If this is a known gap, add it to tests/goldens/capability_matrix.yaml",
                 parser_id, rust_positive, expected_positive
             );
         }
@@ -141,7 +136,7 @@ fn run_conformance(parser_id: &str) {
         } else {
             panic!(
                 "[{}] negative mismatch - Rust={:?} golden={:?}\n\
-                 If this is a known gap, add it to tests/compat_goldens/meta_extract/capability_matrix.yaml",
+                 If this is a known gap, add it to tests/goldens/capability_matrix.yaml",
                 parser_id, rust_negative, expected_negative
             );
         }
@@ -163,7 +158,7 @@ fn run_conformance(parser_id: &str) {
         } else {
             panic!(
                 "[{}] raw_meta mismatch - Rust={:?} golden={:?}\n\
-                 If this is a known gap, add it to tests/compat_goldens/meta_extract/capability_matrix.yaml",
+                 If this is a known gap, add it to tests/goldens/capability_matrix.yaml",
                 parser_id,
                 rust_raw_meta.map(|s| &s[..s.len().min(80)]),
                 expected_raw_meta.map(|s| &s[..s.len().min(80)])

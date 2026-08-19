@@ -17,7 +17,7 @@ use crate::state::SharedState;
 
 const MAX_LIMIT: i64 = 500;
 const DEFAULT_LIMIT: i64 = 100;
-const WD_TAGGER_JOB_ID: &str = "wd_tagger";
+pub(crate) const WD_TAGGER_JOB_ID: &str = "wd_tagger";
 
 #[derive(Debug)]
 pub(crate) enum BatchError {
@@ -204,12 +204,12 @@ pub(crate) async fn resolve_targets(
         Ok((limited, "batch"))
     } else {
         let scan_root = req.scan_root.clone().unwrap_or_default();
-        let ids = query_backfill_targets(state, &scan_root, req.limit, req.force).await;
+        let ids = query_backfill_targets(state, &scan_root, req.limit, req.force, None).await;
         Ok((ids, "backfill"))
     }
 }
 
-async fn filter_active_in_order(db: &sqlx::SqlitePool, file_ids: &[i64]) -> Vec<i64> {
+pub(crate) async fn filter_active_in_order(db: &sqlx::SqlitePool, file_ids: &[i64]) -> Vec<i64> {
     if file_ids.is_empty() {
         return Vec::new();
     }
@@ -234,11 +234,12 @@ async fn filter_active_in_order(db: &sqlx::SqlitePool, file_ids: &[i64]) -> Vec<
         .collect()
 }
 
-async fn query_backfill_targets(
+pub(crate) async fn query_backfill_targets(
     state: &SharedState,
     scan_root: &str,
     limit: i64,
     force: bool,
+    model_id: Option<i64>,
 ) -> Vec<i64> {
     // Deliberately NOT using the kv_state-derived active_model_id/
     // active_model_db_id/count_untagged path (wd_tagger.rs) here: that path
@@ -246,7 +247,7 @@ async fn query_backfill_targets(
     // the model tag_file_native_core actually infers with. We must resolve
     // the same model id that tagging will use, so the backfill target list
     // and the model that ends up writing file_wd_tags always agree.
-    let model_id = resolve_configured_model_id(state).await;
+    let model_id = model_id.or(resolve_configured_model_id(state).await);
 
     let mut clauses = vec!["is_deleted = 0".to_string()];
     let mut like_binds: Vec<String> = Vec::new();
@@ -379,7 +380,7 @@ async fn run_batch_worker(
     .await;
 }
 
-async fn run_batch_worker_with_tagger<F>(
+pub(crate) async fn run_batch_worker_with_tagger<F>(
     state: SharedState,
     job_id: String,
     targets: Vec<i64>,

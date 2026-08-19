@@ -14,10 +14,9 @@ use sqlx::{QueryBuilder, Row, Sqlite};
 
 use crate::{
     auth::{scope::require_admin_scope, AuthContext},
+    ext_config,
     state::SharedState,
 };
-
-use super::ext_config;
 
 const EXT_NAME: &str = "builtin-md-viewer";
 const ROOTS_KEY: &str = "md_scan_roots";
@@ -409,6 +408,7 @@ pub async fn save_scan_roots(
             clean.push(path);
         }
     }
+    let _guard = state.settings_lock.lock().await;
     if let Err(error) = ext_config::save_extension_value(
         &state.config.config_path,
         EXT_NAME,
@@ -438,6 +438,7 @@ pub async fn delete_scan_root(
     if let Some(response) = admin_scope_error(&state, auth_context.as_ref()) {
         return response;
     }
+    let _guard = state.settings_lock.lock().await;
     let (mut roots, _) = match configured_roots(&state) {
         Ok(result) => result,
         Err(error) => return internal_error(error, "failed to read md scan roots"),

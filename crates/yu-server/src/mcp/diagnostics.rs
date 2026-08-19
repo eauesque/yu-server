@@ -129,15 +129,24 @@ fn check_process_info(state: &AppState) -> CheckResult {
     }
 }
 
-pub async fn run_all_checks(state: &AppState) -> serde_json::Value {
+/// Runs the checks and returns them as a `Vec`, without wrapping them in the
+/// MCP tool's response envelope. Shared by `run_all_checks` (MCP tool
+/// contract below) and `routes::diagnostics::doctor_start` (HTTP route,
+/// which renders its own Python-compatible markdown/JSON report from the
+/// same `Vec<CheckResult>`).
+pub async fn collect_checks(state: &AppState) -> Vec<CheckResult> {
     let data_dir = crate::secret_store::data_dir(&state.config.project_root);
     let db_path = PathBuf::from(&state.config.db_path);
 
-    let results = vec![
+    vec![
         check_process_info(state),
         check_writable(&data_dir),
         check_db_integrity(&state.db_read, &db_path).await,
-    ];
+    ]
+}
+
+pub async fn run_all_checks(state: &AppState) -> serde_json::Value {
+    let results = collect_checks(state).await;
 
     let overall = if results.iter().any(|r| r.status == CheckStatus::Error) {
         CheckStatus::Error

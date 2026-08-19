@@ -100,7 +100,7 @@ impl LogRingBuffer {
             .unwrap_or(0);
         let mut out: Vec<LogEntry> = ring
             .iter()
-            .filter(|e| after_seq.map_or(true, |s| e.seq > s) && level_rank(&e.level) >= min_rank)
+            .filter(|e| after_seq.is_none_or(|s| e.seq > s) && level_rank(&e.level) >= min_rank)
             .rev()
             .take(limit)
             .cloned()

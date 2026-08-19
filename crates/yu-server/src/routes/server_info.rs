@@ -151,17 +151,17 @@ fn should_run_subsystem(sub: &SubsystemEntry, mode: &str, safe_mode: bool) -> bo
     if sub.modes.contains(&mode) {
         return true;
     }
-    sub.env_override.is_some_and(|e| env_truthy(e))
+    sub.env_override.is_some_and(env_truthy)
 }
 
 fn should_run_bg_task(task: &BgTaskEntry, mode: &str, safe_mode: bool) -> bool {
     if safe_mode {
         return false;
     }
-    if task.env_disable.is_some_and(|e| env_truthy(e)) {
+    if task.env_disable.is_some_and(env_truthy) {
         return false;
     }
-    if task.env_enable.is_some_and(|e| env_truthy(e)) {
+    if task.env_enable.is_some_and(env_truthy) {
         return true;
     }
     task.modes.contains(&mode)

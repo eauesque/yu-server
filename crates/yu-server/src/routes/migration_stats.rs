@@ -2,10 +2,17 @@ use axum::{extract::State, response::Json};
 
 use crate::state::SharedState;
 
+/// Reports only transfers through the shared forwarders in `auto_stubs`.
+/// Route-specific `python_url` forwarding is not measured.
 pub async fn proxy_stats(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let hits = state.proxy_hits.lock().expect("proxy_hits lock");
     let total: u64 = hits.values().sum();
-    Json(serde_json::json!({ "ok": true, "total": total, "proxied": &*hits }))
+    Json(serde_json::json!({
+        "ok": true,
+        "scope": "auto_stubs",
+        "total": total,
+        "proxied": &*hits,
+    }))
 }
 
 #[cfg(test)]
@@ -73,6 +80,7 @@ mod tests {
         let axum::Json(value) = proxy_stats(State(state)).await;
 
         assert_eq!(value["ok"], true);
+        assert_eq!(value["scope"], "auto_stubs");
         assert_eq!(value["total"], 2);
         assert_eq!(value["proxied"]["GET /api/files"], 1);
         assert_eq!(value["proxied"]["POST /api/tags"], 1);

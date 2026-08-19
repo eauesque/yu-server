@@ -453,14 +453,12 @@ async fn run_generate_simple(state: SharedState, body: Value) -> Response {
     }
 
     // BNK check: only when a1111_mode=true AND te_kind==Clip
-    if params.a1111_mode && params.te_kind == TeKind::Clip {
-        if !check_bnk_node(&state).await {
-            return api_err(
+    if params.a1111_mode && params.te_kind == TeKind::Clip && !check_bnk_node(&state).await {
+        return api_err(
                 "AUTOMATIC1111 互換モードには ComfyUI カスタムノード \
                  'ComfyUI_ADV_CLIP_emb' が必要です。インストールするか、互換モードを OFF にしてください。",
                 StatusCode::BAD_REQUEST,
             );
-        }
     }
 
     // Extract LoRA tokens from prompt

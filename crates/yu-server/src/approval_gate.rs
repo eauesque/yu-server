@@ -25,18 +25,10 @@ struct HistoryEntry {
     wait_seconds: f64,
 }
 
+#[derive(Default)]
 pub struct ApprovalGate {
     pub pending: HashMap<String, ApprovalRequest>,
     history: VecDeque<HistoryEntry>,
-}
-
-impl Default for ApprovalGate {
-    fn default() -> Self {
-        Self {
-            pending: HashMap::new(),
-            history: VecDeque::new(),
-        }
-    }
 }
 
 impl ApprovalGate {

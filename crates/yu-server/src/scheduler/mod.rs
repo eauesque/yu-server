@@ -14,7 +14,7 @@ use tokio_cron_scheduler::{Job, JobScheduler};
 use uuid::Uuid;
 
 use crate::{
-    routes::ext_config, scheduler::history::record_execution, sse::event::SseEvent, state::AppState,
+    ext_config, scheduler::history::record_execution, sse::event::SseEvent, state::AppState,
 };
 
 pub struct JobMeta {

@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use axum::{
     extract::{Extension, Query, State},
     http::StatusCode,
@@ -11,6 +9,7 @@ use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::config_io::{load as load_config_json, write as write_config_json};
 use crate::{
     auth::scope::{require_admin_scope, AuthContext},
     secret_store,
@@ -28,40 +27,6 @@ pub mod gradio4;
 // Must match Python's _SAVE_NAMING_OPTIONS set
 static SAVE_NAMING_OPTIONS: &[&str] = &["daily_folder", "date_prefix", "timestamp"];
 static IMAGE_FORMATS: &[&str] = &["png", "webp", "jpg"];
-
-fn load_config_json(config_path: &Path) -> Value {
-    for path in [
-        config_path.to_path_buf(),
-        std::path::PathBuf::from("config.json"),
-        std::path::PathBuf::from("tagdb_config.json"),
-    ] {
-        if path.exists() {
-            return std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|raw| serde_json::from_str(&raw).ok())
-                .unwrap_or_else(|| json!({}));
-        }
-    }
-    json!({})
-}
-
-fn write_config_json(config_path: &Path, config: &Value) -> Result<(), std::io::Error> {
-    let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(
-        ".sd_cfg_{}_{}.tmp",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-    ));
-    let text = serde_json::to_string_pretty(config)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&tmp, format!("{text}\n"))?;
-    std::fs::rename(&tmp, config_path)?;
-    Ok(())
-}
 
 pub(crate) fn ext_config(state: &SharedState) -> Value {
     let full = load_config_json(&state.config.config_path);
@@ -534,7 +499,7 @@ async fn save_batch(
     // Extract sweep_meta early (validated; None if absent or invalid)
     let sweep_meta = body_json
         .get("sweep_meta")
-        .and_then(|v| crate::routes::sweep_common::validate_sweep_meta(v));
+        .and_then(crate::routes::sweep_common::validate_sweep_meta);
 
     // Rust save
     let images: Vec<String> = body_json

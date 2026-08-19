@@ -2,6 +2,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::{LazyLock, Mutex},
 };
 
 use axum::{
@@ -15,11 +16,219 @@ use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::state::SharedState;
+use crate::{
+    mcp::diagnostics::{collect_checks, CheckResult, CheckStatus},
+    state::SharedState,
+};
 
 const SAFE_MODE_FLAG: &str = "--safe-mode";
 const SAFE_MODE_MARKER_NAME: &str = ".safe_mode_marker";
 const STALE_UPDATE_PENDING_SECONDS: i64 = 7 * 24 * 60 * 60;
+
+/// Cap on the number of doctor job results kept in memory, mirroring
+/// Python's `routes/diagnostics.py::_MAX_DOCTOR_JOBS`.
+const MAX_DOCTOR_JOBS: usize = 10;
+
+/// In-process doctor job registry, mirroring Python's
+/// `_doctor_jobs: OrderedDict[str, dict]`.
+///
+/// A `Vec<(String, Value)>` is used instead of a `HashMap` because Python's
+/// `OrderedDict` has FIFO eviction semantics *and* leaves the position of an
+/// existing key unchanged on reassignment (`_doctor_jobs[job_id] = value`
+/// does not move `job_id` to the end). A `HashMap` has no order to preserve
+/// that invariant; a `Vec` with in-place update (see `register_job`) does.
+static DOCTOR_JOBS: LazyLock<Mutex<Vec<(String, Value)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Registers/updates a doctor job result, mirroring Python's
+/// `_register_job`: an existing `job_id` is replaced in place (no reorder);
+/// a new `job_id` is appended and the oldest entries are evicted (FIFO)
+/// while the registry exceeds `MAX_DOCTOR_JOBS`.
+fn register_job(jobs: &mut Vec<(String, Value)>, job_id: &str, value: Value) {
+    if let Some(entry) = jobs.iter_mut().find(|(id, _)| id == job_id) {
+        entry.1 = value;
+        return;
+    }
+    jobs.push((job_id.to_string(), value));
+    while jobs.len() > MAX_DOCTOR_JOBS {
+        jobs.remove(0);
+    }
+}
+
+fn register_doctor_job(job_id: &str, value: Value) {
+    // Lock is dropped before this function returns; callers must not hold
+    // it across an `.await` (std::sync::Mutex is not Send-safe to hold
+    // across await points).
+    let mut jobs = DOCTOR_JOBS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    register_job(&mut jobs, job_id, value);
+}
+
+fn get_doctor_job(job_id: &str) -> Option<Value> {
+    let jobs = DOCTOR_JOBS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    jobs.iter()
+        .find(|(id, _)| id == job_id)
+        .map(|(_, v)| v.clone())
+}
+
+fn check_status_str(status: CheckStatus) -> &'static str {
+    match status {
+        CheckStatus::Ok => "OK",
+        CheckStatus::Warn => "WARN",
+        CheckStatus::Error => "ERROR",
+    }
+}
+
+/// Mirrors Python's `core/diagnostics/doctor_report.py::summarize`.
+fn doctor_summary(results: &[CheckResult]) -> Value {
+    let errors = results
+        .iter()
+        .filter(|r| r.status == CheckStatus::Error)
+        .count();
+    let warnings = results
+        .iter()
+        .filter(|r| r.status == CheckStatus::Warn)
+        .count();
+    json!({"errors": errors, "warnings": warnings})
+}
+
+/// Mirrors Python's `doctor_report.py::render_markdown` byte-for-byte,
+/// including the escape order (`|` first, then newline) and the trailing
+/// newline produced by appending an empty element before `join`.
+///
+/// Known divergence: Rust's `CheckResult` (ported in `mcp/diagnostics.rs`)
+/// carries an extra `name` field that Python's 3-field `CheckResult` does
+/// not have. `render_markdown` does not surface it (same table columns as
+/// Python), but `render_json`'s `results` array will include it. This is an
+/// accepted, documented difference -- see module docs on `mcp/diagnostics.rs`.
+fn render_markdown(results: &[CheckResult]) -> String {
+    let summary = doctor_summary(results);
+    let errors = summary["errors"].as_u64().unwrap_or(0);
+    let warnings = summary["warnings"].as_u64().unwrap_or(0);
+    let mut lines: Vec<String> = vec![
+        "# Environment Diagnosis".to_string(),
+        String::new(),
+        format!("- Errors: {errors}"),
+        format!("- Warnings: {warnings}"),
+        String::new(),
+        "| Status | Check | Fix hint |".to_string(),
+        "|---|---|---|".to_string(),
+    ];
+    for result in results {
+        // NOTE: table column is labeled "Check" but Python fills it with
+        // `message`, not the check's name. This is intentional -- do not
+        // change to `result.name`, it would diverge from Python's output.
+        let message = result.message.replace('|', "\\|").replace('\n', " ");
+        let hint = result
+            .fix_hint
+            .clone()
+            .unwrap_or_default()
+            .replace('|', "\\|")
+            .replace('\n', " ");
+        lines.push(format!(
+            "| {} | {} | {} |",
+            check_status_str(result.status),
+            message,
+            hint
+        ));
+    }
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+/// Mirrors Python's `doctor_report.py::render_json`. `created_at` uses
+/// second-precision RFC3339 with a `+00:00` offset (not a `Z` suffix), to
+/// match `dt.datetime.now(dt.UTC).isoformat(timespec="seconds")`.
+fn render_json(results: &[CheckResult]) -> Value {
+    let created_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+    json!({
+        "schema": "yu://diagnostics/doctor/1",
+        "created_at": created_at,
+        "summary": doctor_summary(results),
+        "results": results,
+    })
+}
+
+/// Mirrors Python's `doctor_report.py::write_report_files`: writes a
+/// `doctor_<local-timestamp>.md` and `.json` pair to `report_dir`,
+/// appending `-1`, `-2`, ... if either file already exists for that
+/// timestamp (matching Python's "either exists -> advance" collision rule).
+///
+/// JSON key order: Python serializes with `sort_keys=True`. This crate does
+/// not enable serde_json's `preserve_order` feature anywhere in the
+/// dependency graph (verified via `cargo tree -i serde_json` / grep over
+/// `Cargo.lock` for `preserve_order`: no hits), so `serde_json::Map` is
+/// backed by `BTreeMap` and already serializes keys in sorted order. Key
+/// order therefore matches Python without any extra sorting step.
+fn write_report_files(
+    report_dir: &Path,
+    report_md: &str,
+    report_json: &Value,
+) -> std::io::Result<(PathBuf, PathBuf)> {
+    fs::create_dir_all(report_dir)?;
+    let stem = format!("doctor_{}", chrono::Local::now().format("%Y%m%d-%H%M%S"));
+    let mut md_path = report_dir.join(format!("{stem}.md"));
+    let mut json_path = report_dir.join(format!("{stem}.json"));
+    let mut suffix = 1;
+    while md_path.exists() || json_path.exists() {
+        md_path = report_dir.join(format!("{stem}-{suffix}.md"));
+        json_path = report_dir.join(format!("{stem}-{suffix}.json"));
+        suffix += 1;
+    }
+    fs::write(&md_path, report_md)?;
+    let json_body = format!("{}\n", serde_json::to_string_pretty(report_json)?);
+    fs::write(&json_path, json_body)?;
+    Ok((md_path, json_path))
+}
+
+/// Builds the "done" job payload, mirroring Python's `_run_doctor_job`
+/// success branch.
+///
+/// Extracted from `run_doctor_job` purely so the key names can be pinned by a
+/// unit test without constructing an `AppState`. They are a contract with two
+/// consumers at once: `src/ts/diagnostics-page/index.ts` reads `status`,
+/// `summary` and `report_md` straight off the top level of the response
+/// (`api_result` flattens this map), and Python emits the same six keys.
+fn done_job_payload(
+    report_md: &str,
+    report_json: &Value,
+    md_path: &Path,
+    json_path: &Path,
+) -> Value {
+    json!({
+        "status": "done",
+        "report_md": report_md,
+        "report_json": report_json,
+        "summary": report_json["summary"].clone(),
+        // Raw (non-redacted) path, matching Python's `str(md_path)`.
+        "report_md_path": md_path.to_string_lossy(),
+        "report_json_path": json_path.to_string_lossy(),
+    })
+}
+
+async fn run_doctor_job(state: SharedState, job_id: String) {
+    let checks = collect_checks(&state).await;
+    let report_md = render_markdown(&checks);
+    let report_json = render_json(&checks);
+    let report_dir = state.config.project_root.join("reports");
+    match write_report_files(&report_dir, &report_md, &report_json) {
+        Ok((md_path, json_path)) => {
+            register_doctor_job(
+                &job_id,
+                done_job_payload(&report_md, &report_json, &md_path, &json_path),
+            );
+        }
+        Err(err) => {
+            register_doctor_job(
+                &job_id,
+                json!({"status": "error", "error": err.to_string()}),
+            );
+        }
+    }
+}
 
 #[derive(Deserialize)]
 pub struct OpenRepairFolderBody {
@@ -163,11 +372,9 @@ fn cleanup_stale_update_pending(
         } else {
             remove = true;
         }
-        if remove {
-            if fs::remove_file(&path).is_ok() {
-                if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                    deleted.push(name.to_string());
-                }
+        if remove && fs::remove_file(&path).is_ok() {
+            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                deleted.push(name.to_string());
             }
         }
     }
@@ -278,19 +485,32 @@ pub async fn bug_report() -> impl IntoResponse {
 }
 
 /// POST /api/diagnostics/doctor
-pub async fn doctor_start() -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({"ok": false, "error": "not implemented"})),
-    )
+///
+/// Mirrors Python's `api_doctor` + `_run_doctor_job`: registers a "running"
+/// job, spawns the check/render/write pipeline in the background, and
+/// returns the job id immediately so the client can poll
+/// `GET /api/diagnostics/doctor/{job_id}`.
+pub async fn doctor_start(State(state): State<SharedState>) -> Response {
+    let job_id = uuid::Uuid::new_v4().to_string();
+    register_doctor_job(&job_id, json!({"status": "running"}));
+
+    let state_for_task = state.clone();
+    let job_id_for_task = job_id.clone();
+    tokio::spawn(async move {
+        run_doctor_job(state_for_task, job_id_for_task).await;
+    });
+
+    api_result(json!({"job_id": job_id, "status": "running"}))
 }
 
 /// GET /api/diagnostics/doctor/:job_id
-pub async fn doctor_status() -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({"ok": false, "error": "not implemented"})),
-    )
+///
+/// Mirrors Python's `api_doctor_status`.
+pub async fn doctor_status(AxumPath(job_id): AxumPath<String>) -> Response {
+    match get_doctor_job(&job_id) {
+        Some(job) => api_result(job),
+        None => api_error("Job not found", "job_not_found", StatusCode::NOT_FOUND),
+    }
 }
 
 fn zip_dir_to_path(repair_dir: &Path) -> Result<PathBuf, String> {
@@ -362,7 +582,8 @@ pub async fn zip_repair(
 mod tests {
     use std::fs;
 
-    use serde_json::json;
+    use axum::http::StatusCode;
+    use serde_json::{json, Value};
     use tempfile::TempDir;
 
     #[test]
@@ -455,5 +676,224 @@ mod tests {
         );
         assert!(pending.join("fresh.json").exists());
         assert!(pending.join("ignore.txt").exists());
+    }
+
+    use crate::mcp::diagnostics::{CheckResult, CheckStatus};
+
+    fn sample_check(status: CheckStatus, message: &str, fix_hint: Option<&str>) -> CheckResult {
+        CheckResult {
+            name: "sample_check",
+            status,
+            message: message.to_string(),
+            fix_hint: fix_hint.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn check_status_strings_agree_with_the_json_serialization_for_every_variant() {
+        // `check_status_str` (used by the markdown table) and serde's
+        // `rename_all = "UPPERCASE"` (used by `render_json`'s `results`) are
+        // two independent mappings of the same enum. If they drift, a single
+        // report's table and its JSON disagree about the same check, and
+        // nothing else notices. Python has one mapping, so both must equal it.
+        for (status, expected) in [
+            (CheckStatus::Ok, "OK"),
+            (CheckStatus::Warn, "WARN"),
+            (CheckStatus::Error, "ERROR"),
+        ] {
+            assert_eq!(super::check_status_str(status), expected);
+            assert_eq!(
+                serde_json::to_value(status).unwrap(),
+                json!(expected),
+                "JSON serialization must match the markdown string for {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_markdown_emits_every_status_string() {
+        let md = super::render_markdown(&[
+            sample_check(CheckStatus::Ok, "fine", None),
+            sample_check(CheckStatus::Warn, "hmm", None),
+            sample_check(CheckStatus::Error, "bad", None),
+        ]);
+
+        assert!(md.contains("| OK | fine |  |"), "{md:?}");
+        assert!(md.contains("| WARN | hmm |  |"), "{md:?}");
+        assert!(md.contains("| ERROR | bad |  |"), "{md:?}");
+    }
+
+    #[test]
+    fn done_job_payload_pins_the_key_names_the_frontend_reads() {
+        let report_json =
+            json!({"schema": "yu://diagnostics/doctor/1", "summary": {"errors": 2, "warnings": 1}});
+        let payload = super::done_job_payload(
+            "# md",
+            &report_json,
+            std::path::Path::new("/tmp/doctor.md"),
+            std::path::Path::new("/tmp/doctor.json"),
+        );
+
+        let mut keys: Vec<&str> = payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "report_json",
+                "report_json_path",
+                "report_md",
+                "report_md_path",
+                "status",
+                "summary",
+            ],
+            "these key names are the contract with diagnostics-page/index.ts and Python's _run_doctor_job"
+        );
+        assert_eq!(payload["status"], json!("done"));
+        assert_eq!(payload["report_md"], json!("# md"));
+        assert_eq!(payload["summary"], json!({"errors": 2, "warnings": 1}));
+        assert_eq!(payload["report_md_path"], json!("/tmp/doctor.md"));
+        assert_eq!(payload["report_json_path"], json!("/tmp/doctor.json"));
+    }
+
+    #[test]
+    fn register_job_updates_existing_key_in_place_without_reordering() {
+        let mut jobs: Vec<(String, Value)> = Vec::new();
+        super::register_job(&mut jobs, "a", json!({"status": "running"}));
+        super::register_job(&mut jobs, "b", json!({"status": "running"}));
+        super::register_job(&mut jobs, "a", json!({"status": "done"}));
+
+        assert_eq!(
+            jobs.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"],
+            "updating an existing job_id must not move it to the end"
+        );
+        assert_eq!(jobs[0].1, json!({"status": "done"}));
+    }
+
+    #[test]
+    fn register_job_evicts_fifo_only_past_the_cap() {
+        let mut jobs: Vec<(String, Value)> = Vec::new();
+        for i in 0..super::MAX_DOCTOR_JOBS {
+            super::register_job(&mut jobs, &format!("job-{i}"), json!({"status": "running"}));
+        }
+        assert_eq!(
+            jobs.len(),
+            super::MAX_DOCTOR_JOBS,
+            "at the cap, nothing is evicted yet"
+        );
+        assert_eq!(jobs[0].0, "job-0");
+
+        super::register_job(
+            &mut jobs,
+            &format!("job-{}", super::MAX_DOCTOR_JOBS),
+            json!({"status": "running"}),
+        );
+        assert_eq!(
+            jobs.len(),
+            super::MAX_DOCTOR_JOBS,
+            "exceeding the cap evicts exactly one"
+        );
+        assert_eq!(
+            jobs[0].0, "job-1",
+            "oldest entry (job-0) must be evicted first"
+        );
+    }
+
+    #[test]
+    fn doctor_summary_counts_errors_and_warnings_only() {
+        let results = vec![
+            sample_check(CheckStatus::Ok, "ok", None),
+            sample_check(CheckStatus::Warn, "warn", None),
+            sample_check(CheckStatus::Error, "err1", None),
+            sample_check(CheckStatus::Error, "err2", None),
+        ];
+        assert_eq!(
+            super::doctor_summary(&results),
+            json!({"errors": 2, "warnings": 1})
+        );
+    }
+
+    #[test]
+    fn render_markdown_escapes_pipes_before_newlines_and_ends_with_newline() {
+        let results = vec![sample_check(
+            CheckStatus::Error,
+            "a | b\nc",
+            Some("fix | it\nnow"),
+        )];
+        let md = super::render_markdown(&results);
+
+        assert!(
+            md.ends_with('\n'),
+            "output must end with a trailing newline"
+        );
+        assert!(
+            md.contains("| ERROR | a \\| b c | fix \\| it now |"),
+            "pipes must be escaped and newlines replaced with spaces, in that order: {md:?}"
+        );
+        assert!(md.starts_with("# Environment Diagnosis\n\n- Errors: 1\n- Warnings: 0\n"));
+    }
+
+    #[test]
+    fn render_json_created_at_uses_offset_not_z_suffix() {
+        let results = vec![sample_check(CheckStatus::Ok, "ok", None)];
+        let rendered = super::render_json(&results);
+
+        assert_eq!(rendered["schema"], json!("yu://diagnostics/doctor/1"));
+        let created_at = rendered["created_at"].as_str().unwrap();
+        assert!(
+            created_at.ends_with("+00:00"),
+            "created_at must use a +00:00 offset (Python isoformat), not Z: {created_at}"
+        );
+        assert!(!created_at.ends_with('Z'));
+        assert_eq!(rendered["summary"], json!({"errors": 0, "warnings": 0}));
+        assert_eq!(rendered["results"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn write_report_files_appends_suffix_on_collision() {
+        let temp = TempDir::new().unwrap();
+        let report = json!({"summary": {"errors": 0, "warnings": 0}});
+        let (md1, json1) = super::write_report_files(temp.path(), "# a", &report).unwrap();
+        let (md2, json2) = super::write_report_files(temp.path(), "# b", &report).unwrap();
+
+        assert_ne!(md1, md2, "second write must not clobber the first (md)");
+        assert_ne!(
+            json1, json2,
+            "second write must not clobber the first (json)"
+        );
+        assert!(md1.exists() && md2.exists());
+        assert!(json1.exists() && json2.exists());
+        assert!(
+            json2.to_string_lossy().contains('-'),
+            "collision suffix expected in second path"
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_status_returns_404_job_not_found_for_unknown_id() {
+        let response =
+            super::doctor_status(super::AxumPath("does-not-exist-unit-test".to_string())).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn doctor_status_returns_registered_job_payload_flattened_at_top_level() {
+        let job_id = "unit-test-job-status-roundtrip";
+        super::register_doctor_job(job_id, json!({"status": "done", "summary": {"errors": 0}}));
+
+        let response = super::doctor_status(super::AxumPath(job_id.to_string())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["status"], json!("done"));
+        assert_eq!(parsed["ok"], json!(true));
     }
 }

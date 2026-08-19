@@ -149,8 +149,10 @@ pub fn build_image_prompt(
     if mode == AnalyzeMode::Simple {
         return build_simple_prompt(language);
     }
-    if mode == AnalyzeMode::Ocr && existing_prompt.is_some() {
-        return existing_prompt.unwrap().to_string();
+    if mode == AnalyzeMode::Ocr {
+        if let Some(existing) = existing_prompt {
+            return existing.to_string();
+        }
     }
     let lang = prompt_lang(language);
     let mut context = String::new();

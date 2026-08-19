@@ -68,9 +68,9 @@ async fn start_batch_job_processes_files_sequentially_and_finishes() {
 }
 
 #[tokio::test]
-async fn start_batch_job_stops_at_file_boundary_when_cancelled() {
+async fn worker_cancellation_stops_within_one_file_even_for_64_targets() {
     let state = build_test_state().await;
-    for id in 701..=720 {
+    for id in 701..=764 {
         insert_active_file(&state, id).await;
     }
     let (first_started_tx, first_started_rx) = oneshot::channel();
@@ -83,7 +83,7 @@ async fn start_batch_job_stops_at_file_boundary_when_cancelled() {
     let worker = tokio::spawn(run_batch_worker_with_tagger(
         worker_state,
         WD_TAGGER_JOB_ID.to_string(),
-        (701..=720).collect(),
+        (701..=764).collect(),
         false,
         cancel,
         move |_state, file_id, _force| {
@@ -119,8 +119,7 @@ async fn start_batch_job_stops_at_file_boundary_when_cancelled() {
     let processed_and_skipped = result_value["processed"].as_u64().unwrap()
         + result_value["skipped"].as_u64().unwrap()
         + result_value["errors"].as_u64().unwrap();
-    assert_eq!(processed_and_skipped, 1);
-    assert!(processed_and_skipped < 20);
+    assert!(processed_and_skipped <= 1);
 }
 
 #[tokio::test]

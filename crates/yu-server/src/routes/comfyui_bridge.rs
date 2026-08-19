@@ -17,6 +17,7 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+use crate::config_io::{load as load_config_json, write as write_config_json};
 use crate::{
     auth::scope::{require_admin_scope, AuthContext},
     secret_store,
@@ -66,43 +67,6 @@ impl CheckpointCache {
 }
 
 static CHECKPOINT_CACHE: OnceLock<Mutex<CheckpointCache>> = OnceLock::new();
-
-// ---------------------------------------------------------------------------
-// Config helpers (mirrors sd_webui_bridge)
-// ---------------------------------------------------------------------------
-
-fn load_config_json(config_path: &Path) -> Value {
-    for path in [
-        config_path.to_path_buf(),
-        std::path::PathBuf::from("config.json"),
-        std::path::PathBuf::from("tagdb_config.json"),
-    ] {
-        if path.exists() {
-            return std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|raw| serde_json::from_str(&raw).ok())
-                .unwrap_or_else(|| json!({}));
-        }
-    }
-    json!({})
-}
-
-fn write_config_json(config_path: &Path, config: &Value) -> Result<(), std::io::Error> {
-    let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(
-        ".comfy_cfg_{}.tmp",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-    ));
-    let text = serde_json::to_string_pretty(config)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&tmp, format!("{text}\n"))?;
-    std::fs::rename(&tmp, config_path)?;
-    Ok(())
-}
 
 pub(super) fn ext_config(state: &SharedState) -> Value {
     let full = load_config_json(&state.config.config_path);
@@ -1443,7 +1407,7 @@ fn parse_enum_options(data: &Value, node_type: &str, field: &str) -> Vec<String>
         _ => return vec![],
     };
     // New format: ["COMBO", {"options": [...]}]
-    if entry.get(0).and_then(Value::as_str) == Some("COMBO") {
+    if entry.first().and_then(Value::as_str) == Some("COMBO") {
         if let Some(opts) = entry
             .get(1)
             .and_then(|v| v.get("options"))
@@ -1457,7 +1421,7 @@ fn parse_enum_options(data: &Value, node_type: &str, field: &str) -> Vec<String>
         }
     }
     // Legacy format: [["model1", "model2"], ...]
-    if let Some(list) = entry.get(0).and_then(Value::as_array) {
+    if let Some(list) = entry.first().and_then(Value::as_array) {
         return list
             .iter()
             .filter_map(Value::as_str)
@@ -1680,7 +1644,7 @@ async fn post_config(
     }
     if let Some(mbs) = &req.max_batch_size {
         let n = mbs.as_i64().unwrap_or(-1);
-        if n < 1 || n > 64 {
+        if !(1..=64).contains(&n) {
             return api_err(
                 "max_batch_size must be between 1 and 64",
                 StatusCode::BAD_REQUEST,
@@ -3377,7 +3341,7 @@ async fn save_batch(
     // Extract sweep_meta early (validated; None if absent or invalid)
     let sweep_meta = body_json
         .get("sweep_meta")
-        .and_then(|v| crate::routes::sweep_common::validate_sweep_meta(v));
+        .and_then(crate::routes::sweep_common::validate_sweep_meta);
 
     let images: Vec<String> = body_json
         .get("images")
@@ -3455,54 +3419,6 @@ async fn save_batch(
         "saved_items": saved_items,
     }))
     .into_response()
-}
-
-// Proxy to Python backend for routes not yet migrated to Rust
-async fn proxy_to_python(
-    state: &SharedState,
-    req: axum::http::Request<axum::body::Body>,
-) -> Response {
-    let Some(py_base) = python_url(state) else {
-        return api_err(
-            "Python backend not configured",
-            StatusCode::SERVICE_UNAVAILABLE,
-        );
-    };
-    let path = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("");
-    let url = format!("{py_base}{path}");
-    let method = req.method().clone();
-    let headers = req.headers().clone();
-    let body_bytes = axum::body::to_bytes(req.into_body(), 64 * 1024 * 1024)
-        .await
-        .unwrap_or_default();
-    let mut builder = state
-        .python_client
-        .request(
-            reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
-            &url,
-        )
-        .timeout(std::time::Duration::from_secs(120))
-        .body(body_bytes.to_vec());
-    for (k, v) in &headers {
-        if let Ok(val) = v.to_str() {
-            builder = builder.header(k.as_str(), val);
-        }
-    }
-    match builder.send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            let bytes = resp.bytes().await.unwrap_or_default();
-            (status, bytes).into_response()
-        }
-        Err(e) => api_err(&format!("Python proxy error: {e}"), StatusCode::BAD_GATEWAY),
-    }
-}
-
-async fn proxy_generic(
-    State(state): State<SharedState>,
-    req: axum::http::Request<axum::body::Body>,
-) -> Response {
-    proxy_to_python(&state, req).await
 }
 
 // ---------------------------------------------------------------------------

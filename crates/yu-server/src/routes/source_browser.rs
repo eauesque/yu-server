@@ -368,7 +368,7 @@ fn comma(n: u64) -> String {
     let mut out = String::new();
     let len = bytes.len();
     for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
+        if i > 0 && (len - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(*b as char);
@@ -771,11 +771,16 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn tmp_root() -> PathBuf {
-        // Per-test unique dir under the workspace target dir (no Date/rand).
-        let base = std::env::temp_dir().join("yu_source_api_test");
-        let _ = fs::create_dir_all(&base);
-        base
+    /// A directory private to one test.
+    ///
+    /// These tests run concurrently in one process, so a shared directory lets one
+    /// test's writes and `remove_dir_all` land in another's walk. The name argument
+    /// is what keeps them apart -- pass the test's own name.
+    fn tmp_root(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("yu_source_api_test").join(name);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create per-test dir");
+        dir
     }
 
     #[test]
@@ -797,7 +802,7 @@ mod tests {
 
     #[test]
     fn resolve_safe_blocks_traversal() {
-        let root = tmp_root();
+        let root = tmp_root("resolve_safe_blocks_traversal");
         assert!(resolve_safe(&root, "../etc/passwd").is_err());
         assert!(resolve_safe(&root, "a/../../b").is_err());
         assert_eq!(resolve_safe(&root, "").unwrap(), root);
@@ -809,7 +814,7 @@ mod tests {
 
     #[test]
     fn read_formats_line_numbers_and_total() {
-        let root = tmp_root();
+        let root = tmp_root("read_formats_line_numbers_and_total");
         let f = root.join("sample.txt");
         fs::write(&f, "alpha\nbravo\ncharlie\n").unwrap();
         let r = source_read(&root, "sample.txt", 0, 2000).unwrap();
@@ -823,7 +828,7 @@ mod tests {
 
     #[test]
     fn read_offset_past_eof_is_empty_not_panic() {
-        let root = tmp_root();
+        let root = tmp_root("read_offset_past_eof_is_empty_not_panic");
         let f = root.join("short.txt");
         fs::write(&f, "only\nthree\nlines\n").unwrap();
         // offset beyond total_lines must yield empty content, not a slice panic.
@@ -835,7 +840,7 @@ mod tests {
 
     #[test]
     fn read_rejects_blocked_and_missing() {
-        let root = tmp_root();
+        let root = tmp_root("read_rejects_blocked_and_missing");
         assert!(source_read(&root, "", 0, 10).is_err());
         assert!(source_read(&root, "nope.py", 0, 10).is_err());
     }
@@ -858,14 +863,14 @@ mod tests {
 
     #[test]
     fn search_rejects_short_query() {
-        let root = tmp_root();
+        let root = tmp_root("search_rejects_short_query");
         assert!(source_search(&root, "x", "", 30).is_err());
         assert!(source_search(&root, "", "", 30).is_err());
     }
 
     #[test]
     fn walk_search_finds_case_insensitive_with_glob() {
-        let root = tmp_root().join("search_case");
+        let root = tmp_root("walk_search_finds_case_insensitive_with_glob").join("search_case");
         let _ = fs::create_dir_all(&root);
         fs::write(root.join("a.py"), "needle_here = 1\nNEEDLE_HERE = 2\n").unwrap();
         fs::write(root.join("b.txt"), "needle_here in text\n").unwrap();
