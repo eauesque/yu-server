@@ -425,7 +425,7 @@ mod tests {
 
         let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
-            .and_then(|p| p.parent())
+            .and_then(|p| p.parent()) // crate-escapes-root: This cross-language test helper intentionally targets the yu_ai_manager checkout to compare Python extensions, which are absent from the extracted crates/ mirror and make this test unable to run there.
             .unwrap()
             .to_path_buf();
         let pool = SqlitePoolOptions::new()
