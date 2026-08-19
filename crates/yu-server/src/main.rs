@@ -1578,11 +1578,11 @@ async fn main() {
             "/api/analysis/servers/{server_id}/activate",
             post(routes::analysis_servers::activate_server),
         )
-        // Server remove (batch 2); PUT(update) stays on the Python proxy (api_key secret boundary)
+        // Server remove/update (batch 2); legacy update preserves stored encrypted keys.
         .route(
             "/api/analysis/servers/{server_id}",
             delete(routes::analysis_servers::remove_server)
-                .put(routes::analysis_servers::update_server_fwd),
+                .put(routes::analysis_servers::update_server),
         )
         .route(
             "/api/analysis/ollama/models",

@@ -121,6 +121,83 @@ struct ServerEntry {
     config: Value,
 }
 
+pub(crate) fn legacy_server_entry(config: &Value) -> Option<Value> {
+    let ai = config.get("ai_analysis")?;
+    // Python `_legacy_to_entry` bails on a falsy ai_config, so an empty object
+    // yields no legacy entry rather than a synthesised claude_api default.
+    if !ai.as_object().is_some_and(|fields| !fields.is_empty()) {
+        return None;
+    }
+    let engine = ai
+        .get("engine")
+        .and_then(Value::as_str)
+        .unwrap_or("claude_api");
+    let language = ai.get("language").and_then(Value::as_str).unwrap_or("ja");
+    let (name, cfg) = match engine {
+        "ollama" => {
+            let model = ai
+                .get("ollama_model")
+                .and_then(Value::as_str)
+                .unwrap_or("llava:latest");
+            (
+                format!("Ollama ({model})"),
+                json!({"base_url": ai.get("ollama_url").and_then(Value::as_str).unwrap_or("http://localhost:11434"), "model": model, "language": language}),
+            )
+        }
+        "openai_compat" => {
+            let model = ai
+                .get("openai_compat_model")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            (
+                format!(
+                    "OpenAI Compatible ({})",
+                    if model.is_empty() { "default" } else { model }
+                ),
+                json!({"base_url": ai.get("openai_compat_url").and_then(Value::as_str).unwrap_or(""), "api_key": ai.get("openai_compat_api_key").and_then(Value::as_str).unwrap_or(""), "model": model, "language": language}),
+            )
+        }
+        "hailo_vlm" => {
+            let model = ai
+                .get("hailo_vlm_model")
+                .and_then(Value::as_str)
+                .unwrap_or("qwen2-vl-2b-instruct");
+            (
+                format!("Hailo VLM ({model})"),
+                json!({"model_name": model, "language": language}),
+            )
+        }
+        "openai" => {
+            let model = ai
+                .get("openai_model")
+                .and_then(Value::as_str)
+                .unwrap_or("gpt-4o-mini");
+            (
+                format!("OpenAI ({model})"),
+                json!({"api_key": ai.get("openai_api_key").and_then(Value::as_str).unwrap_or(""), "model": model, "language": language}),
+            )
+        }
+        _ => {
+            let model = ai
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("claude-sonnet-4-6");
+            (
+                format!("Claude ({model})"),
+                json!({"api_key": ai.get("api_key").and_then(Value::as_str).unwrap_or(""), "model": model, "language": language}),
+            )
+        }
+    };
+    Some(json!({
+        "id": "legacy-default",
+        "name": name,
+        "type": engine,
+        "priority": 10,
+        "enabled": true,
+        "config": cfg,
+    }))
+}
+
 fn all_servers(config: &Value, project_root: &Path) -> Vec<ServerEntry> {
     let mut servers = config
         .get("ai_servers")
@@ -176,75 +253,23 @@ fn all_servers(config: &Value, project_root: &Path) -> Vec<ServerEntry> {
     if !servers.is_empty() {
         return servers;
     }
-    let ai = config.get("ai_analysis").unwrap_or(&Value::Null);
-    if !ai.is_object() {
+    let Some(server) = legacy_server_entry(config) else {
         return Vec::new();
-    }
-    let engine = ai
-        .get("engine")
-        .and_then(Value::as_str)
-        .unwrap_or("claude_api");
-    let language = ai.get("language").and_then(Value::as_str).unwrap_or("ja");
-    let (name, cfg) = match engine {
-        "ollama" => {
-            let model = ai
-                .get("ollama_model")
-                .and_then(Value::as_str)
-                .unwrap_or("llava:latest");
-            (
-                format!("Ollama ({model})"),
-                json!({"base_url": ai.get("ollama_url").and_then(Value::as_str).unwrap_or("http://localhost:11434"), "model": model, "language": language}),
-            )
-        }
-        "openai_compat" => {
-            let model = ai
-                .get("openai_compat_model")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            (
-                format!(
-                    "OpenAI Compatible ({})",
-                    if model.is_empty() { "default" } else { model }
-                ),
-                json!({"base_url": ai.get("openai_compat_url").and_then(Value::as_str).unwrap_or(""), "api_key": decrypted_config_secret(ai, "openai_compat_api_key", project_root), "model": model, "language": language}),
-            )
-        }
-        "hailo_vlm" => {
-            let model = ai
-                .get("hailo_vlm_model")
-                .and_then(Value::as_str)
-                .unwrap_or("qwen2-vl-2b-instruct");
-            (
-                format!("Hailo VLM ({model})"),
-                json!({"model_name": model, "language": language}),
-            )
-        }
-        "openai" => {
-            let model = ai
-                .get("openai_model")
-                .and_then(Value::as_str)
-                .unwrap_or("gpt-4o-mini");
-            (
-                format!("OpenAI ({model})"),
-                json!({"api_key": decrypted_config_secret(ai, "openai_api_key", project_root), "model": model, "language": language}),
-            )
-        }
-        _ => {
-            let model = ai
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or("claude-sonnet-4-6");
-            (
-                format!("Claude ({model})"),
-                json!({"api_key": decrypted_config_secret(ai, "api_key", project_root), "model": model, "language": language}),
-            )
-        }
     };
+    let mut server_config = server.get("config").cloned().unwrap_or_else(|| json!({}));
+    if let Some(map) = server_config.as_object_mut() {
+        if let Some(stored) = map.get("api_key").and_then(Value::as_str) {
+            map.insert(
+                "api_key".to_string(),
+                Value::String(secret_store::decrypt(stored, project_root)),
+            );
+        }
+    }
     vec![ServerEntry {
-        id: "legacy-default".to_string(),
-        name,
-        server_type: engine.to_string(),
-        config: cfg,
+        id: server["id"].as_str().unwrap_or_default().to_string(),
+        name: server["name"].as_str().unwrap_or_default().to_string(),
+        server_type: server["type"].as_str().unwrap_or_default().to_string(),
+        config: server_config,
     }]
 }
 

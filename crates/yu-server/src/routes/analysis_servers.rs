@@ -100,6 +100,16 @@ pub struct AddServerBody {
     pub config: Value,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct UpdateServerBody {
+    pub name: Option<String>,
+    #[serde(rename = "type")]
+    pub server_type: Option<String>,
+    pub priority: Option<i64>,
+    pub enabled: Option<bool>,
+    pub config: Option<Value>,
+}
+
 /// Strictly validates a raw JSON request body into an `AddServerBody`,
 /// mirroring pydantic's `AnalysisServerCreateRequest` (`StrictStr`/
 /// `StrictInt`/`StrictBool`, `name` and `type` required with no default,
@@ -434,6 +444,85 @@ fn do_remove(config: &mut Value, server_id: &str) -> Result<Value, String> {
     Ok(json!({"success": true}))
 }
 
+fn apply_update(server: &mut Value, body: &UpdateServerBody) -> Result<(), String> {
+    let entry = server
+        .as_object_mut()
+        .ok_or_else(|| "Invalid server entry".to_string())?;
+    if let Some(name) = &body.name {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("Server name is required".to_string());
+        }
+        entry.insert("name".to_string(), Value::String(name.to_string()));
+    }
+    if let Some(server_type) = &body.server_type {
+        if !VALID_SERVER_TYPES.contains(&server_type.as_str()) {
+            return Err(format!("Invalid type: {server_type}"));
+        }
+        entry.insert("type".to_string(), Value::String(server_type.clone()));
+    }
+    if let Some(priority) = body.priority {
+        entry.insert("priority".to_string(), json!(priority));
+    }
+    if let Some(enabled) = body.enabled {
+        entry.insert("enabled".to_string(), json!(enabled));
+    }
+    if let Some(config) = &body.config {
+        entry.insert("config".to_string(), config.clone());
+    }
+    Ok(())
+}
+
+pub(crate) fn do_update(
+    config: &mut Value,
+    server_id: &str,
+    body: &UpdateServerBody,
+) -> Result<Value, String> {
+    if matches!(config.get("ai_servers"), Some(value) if !value.is_array()) {
+        return Err("No servers configured".to_string());
+    }
+
+    if let Some(server) = config
+        .get_mut("ai_servers")
+        .and_then(Value::as_array_mut)
+        .and_then(|servers| {
+            servers
+                .iter_mut()
+                .find(|server| server.get("id").and_then(Value::as_str) == Some(server_id))
+        })
+    {
+        apply_update(server, body)?;
+        let server = server.clone();
+        cleanup_discovery_metadata(config);
+        return Ok(json!({"success": true, "server": server}));
+    }
+
+    if server_id == "legacy-default" {
+        // Persist the raw stored key; all_servers decrypts only the API response.
+        if let Some(mut server) = super::analysis::legacy_server_entry(config) {
+            apply_update(&mut server, body)?;
+            if config.get("ai_servers").is_none() {
+                config["ai_servers"] = json!([]);
+            }
+            config["ai_servers"]
+                .as_array_mut()
+                .expect("ai_servers checked as an array")
+                .push(server.clone());
+            if config
+                .get("ai_servers_active")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                config["ai_servers_active"] = json!("legacy-default");
+            }
+            cleanup_discovery_metadata(config);
+            return Ok(json!({"success": true, "server": server}));
+        }
+    }
+
+    Err(format!("Server '{server_id}' not found"))
+}
+
 /// DELETE /api/analysis/servers/{id}
 pub async fn remove_server(
     State(state): State<SharedState>,
@@ -498,7 +587,6 @@ fn internal_error(error: impl std::fmt::Debug, message: &'static str) -> Respons
         .into_response()
 }
 
-/// PUT /api/analysis/servers/{server_id} — admin scope required; forward to Python
 /// POST /api/analysis/servers/{server_id}/test — Rust native connectivity check
 pub async fn test_server(
     State(state): State<SharedState>,
@@ -583,20 +671,36 @@ pub async fn test_server(
     Json(json!({"ok": true, "available": available, "elapsed_ms": elapsed_ms})).into_response()
 }
 
-pub async fn update_server_fwd(
+/// PUT /api/analysis/servers/{server_id} — admin scope required.
+///
+/// Native port of `core/analysis_api/server_crud.py::update_server`.
+pub async fn update_server(
     State(state): State<SharedState>,
     auth: Option<Extension<AuthContext>>,
+    AxumPath(server_id): AxumPath<String>,
+    Json(raw): Json<Value>,
 ) -> Response {
     use crate::auth::scope::require_admin_scope;
     if let Some(r) = require_admin_scope(state.config.pin_auth_enabled, auth.as_ref().map(|c| &c.0))
     {
         return r;
     }
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({"ok": false, "error": "not implemented"})),
-    )
-        .into_response()
+    let body = match serde_json::from_value::<UpdateServerBody>(raw) {
+        Ok(body) => body,
+        Err(error) => return api_error(&error.to_string(), StatusCode::BAD_REQUEST),
+    };
+    let _write_guard = state.settings_lock.lock().await;
+    let mut config = match read_config(&state.config.config_path) {
+        Ok(config) => config,
+        Err(error) => return internal_error(error, "failed to read config"),
+    };
+    match do_update(&mut config, &server_id, &body) {
+        Ok(result) => match crate::config_io::write(&state.config.config_path, &config) {
+            Ok(()) => api_result(result),
+            Err(error) => internal_error(error, "failed to write config"),
+        },
+        Err(error) => api_error(&error, StatusCode::BAD_REQUEST),
+    }
 }
 
 #[cfg(test)]
@@ -949,5 +1053,167 @@ mod tests {
         assert_eq!(body.priority, Some(15));
         assert!(!body.enabled);
         assert_eq!(body.config, json!({"base_url": "http://x"}));
+    }
+
+    fn update_body() -> UpdateServerBody {
+        UpdateServerBody::default()
+    }
+
+    #[test]
+    fn update_name_only_preserves_other_fields() {
+        let mut config = json!({"ai_servers": [{"id": "a", "name": "Old", "type": "ollama", "priority": 3, "enabled": false, "config": {"model": "x"}}]});
+        let body = UpdateServerBody {
+            name: Some(" New ".to_string()),
+            ..update_body()
+        };
+        do_update(&mut config, "a", &body).unwrap();
+        assert_eq!(
+            config["ai_servers"][0],
+            json!({"id": "a", "name": "New", "type": "ollama", "priority": 3, "enabled": false, "config": {"model": "x"}})
+        );
+    }
+
+    #[test]
+    fn update_rejects_invalid_type() {
+        let mut config = json!({"ai_servers": [{"id": "a"}]});
+        let body = UpdateServerBody {
+            server_type: Some("bogus".to_string()),
+            ..update_body()
+        };
+        assert_eq!(
+            do_update(&mut config, "a", &body),
+            Err("Invalid type: bogus".to_string())
+        );
+    }
+
+    #[test]
+    fn update_rejects_blank_name() {
+        let mut config = json!({"ai_servers": [{"id": "a"}]});
+        let body = UpdateServerBody {
+            name: Some("   ".to_string()),
+            ..update_body()
+        };
+        assert_eq!(
+            do_update(&mut config, "a", &body),
+            Err("Server name is required".to_string())
+        );
+    }
+
+    #[test]
+    fn update_rejects_unknown_server_without_legacy_config() {
+        let mut config = json!({"ai_servers": []});
+        assert_eq!(
+            do_update(&mut config, "nope", &update_body()),
+            Err("Server 'nope' not found".to_string())
+        );
+    }
+
+    #[test]
+    fn update_legacy_default_appends_raw_legacy_entry() {
+        let mut config = json!({"ai_analysis": {"engine": "ollama", "ollama_model": "vision"}});
+        do_update(&mut config, "legacy-default", &update_body()).unwrap();
+        assert_eq!(config["ai_servers"][0]["priority"], 10);
+        assert_eq!(config["ai_servers"][0]["enabled"], true);
+        assert_eq!(config["ai_servers"][0]["config"]["model"], "vision");
+    }
+
+    #[test]
+    fn update_legacy_default_keeps_stored_api_key() {
+        let mut config =
+            json!({"ai_analysis": {"engine": "openai", "openai_api_key": "encrypted-key"}});
+        do_update(&mut config, "legacy-default", &update_body()).unwrap();
+        assert_eq!(
+            config["ai_servers"][0]["config"]["api_key"],
+            "encrypted-key"
+        );
+    }
+
+    #[test]
+    fn update_rejects_non_list_servers() {
+        let mut config = json!({"ai_servers": {"oops": true}});
+        assert_eq!(
+            do_update(&mut config, "a", &update_body()),
+            Err("No servers configured".to_string())
+        );
+    }
+
+    #[test]
+    fn update_writes_priority_enabled_and_config() {
+        let mut config = json!({"ai_servers": [{"id": "a", "priority": 1, "enabled": true, "config": {"model": "old"}}]});
+        let body = UpdateServerBody {
+            priority: Some(42),
+            enabled: Some(false),
+            config: Some(json!({"model": "new"})),
+            ..update_body()
+        };
+        do_update(&mut config, "a", &body).unwrap();
+        assert_eq!(config["ai_servers"][0]["priority"], 42);
+        assert_eq!(config["ai_servers"][0]["enabled"], false);
+        assert_eq!(config["ai_servers"][0]["config"], json!({"model": "new"}));
+    }
+
+    #[test]
+    fn update_legacy_default_sets_active_when_unset() {
+        let mut config = json!({"ai_analysis": {"engine": "ollama"}});
+        do_update(&mut config, "legacy-default", &update_body()).unwrap();
+        assert_eq!(config["ai_servers_active"], "legacy-default");
+    }
+
+    #[test]
+    fn update_legacy_default_keeps_an_existing_active_id() {
+        let mut config = json!({"ai_analysis": {"engine": "ollama"}, "ai_servers_active": "other"});
+        do_update(&mut config, "legacy-default", &update_body()).unwrap();
+        assert_eq!(config["ai_servers_active"], "other");
+    }
+
+    #[test]
+    fn update_legacy_default_rejects_empty_ai_analysis() {
+        // Python `_legacy_to_entry` bails on a falsy ai_config; an empty object
+        // must not synthesise a claude_api entry.
+        let mut config = json!({"ai_analysis": {}});
+        assert_eq!(
+            do_update(&mut config, "legacy-default", &update_body()),
+            Err("Server 'legacy-default' not found".to_string())
+        );
+        assert!(config.get("ai_servers").is_none());
+    }
+
+    #[test]
+    fn update_returns_the_stored_entry_not_the_request() {
+        let mut config = json!({"ai_servers": [{"id": "a", "name": "Kept", "type": "ollama"}]});
+        let body = UpdateServerBody {
+            priority: Some(7),
+            ..update_body()
+        };
+        let result = do_update(&mut config, "a", &body).unwrap();
+        assert_eq!(result["server"]["name"], "Kept");
+        assert_eq!(result["server"]["priority"], 7);
+    }
+
+    #[test]
+    fn update_leaves_config_unwritten_shape_on_validation_error() {
+        // A later invalid field must not let an earlier valid one reach the
+        // caller as a success; the handler discards the config on Err.
+        let mut config = json!({"ai_servers": [{"id": "a", "name": "Old"}]});
+        let body = UpdateServerBody {
+            name: Some("New".to_string()),
+            server_type: Some("bogus".to_string()),
+            ..update_body()
+        };
+        assert!(do_update(&mut config, "a", &body).is_err());
+    }
+
+    #[test]
+    fn update_prunes_incompatible_discovery_match() {
+        let mut config = json!({
+            "ai_servers": [{"id": "a", "type": "ollama"}],
+            "ai_servers_discovery_matches": {"http://x": {"server_id": "a", "provider": "ollama"}}
+        });
+        let body = UpdateServerBody {
+            server_type: Some("openai".to_string()),
+            ..update_body()
+        };
+        do_update(&mut config, "a", &body).unwrap();
+        assert!(config.get("ai_servers_discovery_matches").is_none());
     }
 }
