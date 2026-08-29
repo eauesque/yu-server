@@ -3,6 +3,9 @@ name = "xmp-core"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [dependencies]
 quick-xml = { workspace = true }
 thiserror = { workspace = true }

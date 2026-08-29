@@ -762,10 +762,23 @@ fn log_test_request(uri: &str, session: Option<tower_sessions::Session>) -> Http
     request
 }
 
-fn log_test_configure_fleet(state: &SharedState, chief: bool, allow: &[&str]) {
+/// `allow_remote_update` is the master switch every remote fleet operation is
+/// gated on, log streaming included. It is a separate parameter rather than a
+/// constant because a caller that hard-codes it to true can no longer tell the
+/// switch apart from the per-route allowlist.
+fn log_test_configure_fleet(
+    state: &SharedState,
+    chief: bool,
+    allow: &[&str],
+    allow_remote_update: bool,
+) {
     write_config_json(
         &state.config.config_path,
-        &json!({"extensions":{"builtin-lan-cowork":{"fleet":{"chief": chief, "allow_log_stream_from": allow}}}}),
+        &json!({"extensions":{"builtin-lan-cowork":{"fleet":{
+            "chief": chief,
+            "allow_log_stream_from": allow,
+            "allow_remote_update": allow_remote_update,
+        }}}}),
     )
     .unwrap();
 }
@@ -865,7 +878,7 @@ async fn log_peer_positive_and_unauthenticated_self_have_discriminating_controls
 
     let root = tempfile::tempdir().unwrap();
     let (state, lc, token) = log_test_peer_state(true, root.path()).await;
-    log_test_configure_fleet(&state, false, &["peer"]);
+    log_test_configure_fleet(&state, false, &["peer"], true);
     state.log_ring.push(PartialEntry {
         level: "INFO".into(),
         target: "fleet".into(),
@@ -885,6 +898,30 @@ async fn log_peer_positive_and_unauthenticated_self_have_discriminating_controls
     assert!(log_test_first_sse_chunk(response)
         .await
         .contains("peer-positive"));
+
+    // Same peer, same allowlist, master switch off. Log streaming ships this
+    // node's ring buffer to a remote peer, so an operator who unchecked the
+    // switch must not still be serving it. Only this leg fails if the gate is
+    // removed -- the leg above passes either way.
+    //
+    // The nonce must differ from the one above: nonces are single-use, and a
+    // replay is rejected with 401 before this route reads any config at all,
+    // which would make the leg green without ever reaching the gate.
+    log_test_configure_fleet(&state, false, &["peer"], false);
+    let response = lan_cowork_fleet_ops::routes()
+        .with_state(lc.clone())
+        .oneshot(log_test_signed_request(
+            "/ext/lan_cowork/fleet/logs/stream?lines=1",
+            Some(&token),
+            "peer-switch-off",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        log_test_json_body(response).await["error"],
+        "remote_update_disabled"
+    );
 }
 
 #[tokio::test]

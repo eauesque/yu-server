@@ -27,6 +27,8 @@ pub const SCOPE_OLLAMA_PROXY: &str = "ollama:proxy";
 pub const SCOPE_SD_GENERATE: &str = "sd:generate";
 pub const SCOPE_SD_QUERY: &str = "sd:query";
 pub const SCOPE_SD_ADMIN: &str = "sd:admin";
+pub const SCOPE_LLM_MODELS: &str = "llm:models";
+pub const SCOPE_NODE_STATUS: &str = "node:status";
 
 /// One gateway API key, decrypted and hashed once at startup.
 ///

@@ -27,7 +27,9 @@ use crate::{
 use super::analysis_net;
 use crate::routes::auto_stubs::read_config_json;
 use crate::routes::tag_reads::build_wd_tags;
-use crate::routes::wd_infer::{call_wd_infer, call_wd_infer_temp_frame, WdInferOutcome};
+use crate::routes::wd_infer::{
+    call_wd_infer, call_wd_infer_temp_frame, validate_wd_infer_path, WdInferOutcome,
+};
 use crate::routes::wd_tagger_infer::{sanitize_model_id, NSFW_TAG_SET};
 use crate::routes::wd_tagger_write::{write_wd_tags, write_wd_tags_for_retag};
 use crate::routes::wd_tagger_xmp::write_wd_xmp;
@@ -203,7 +205,9 @@ fn read_profile_result(path: &Path, builtin: bool) -> Result<Value, String> {
     Ok(value)
 }
 
-fn load_full_profiles(project_root: &Path) -> BTreeMap<String, (Value, &'static str, bool)> {
+pub(crate) fn load_full_profiles(
+    project_root: &Path,
+) -> BTreeMap<String, (Value, &'static str, bool)> {
     let mut builtin_ids = HashSet::new();
     let mut profiles = BTreeMap::new();
     for path in sorted_json_files(&builtin_profiles_dir(project_root)) {
@@ -1416,7 +1420,110 @@ async fn fwd_post_wt(state: &SharedState, path: &str, body: Bytes) -> Response {
     }
 }
 
-const NATIVE_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
+const NATIVE_IMAGE_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "webp", "bmp", "gif", "tiff", "tif", "svg", "avif",
+];
+
+fn requires_image_transcode(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "bmp" | "gif" | "tiff" | "tif" | "svg" | "avif"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn has_extension(path: &Path, wanted: &str) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(wanted))
+}
+
+/// Decodes an AVIF into `output` as PNG.
+///
+/// A decode failure is reported as a `BackendError`, not forwarded to Python.
+/// `avif-rust` fails closed on profiles it does not implement, so such a file
+/// is not tagged and the caller sees an explicit error rather than silently
+/// falling back. Measured before choosing this: every AVIF Pillow can write
+/// (15 variants: all four subsamplings, alpha, greyscale, limited/full range,
+/// odd dimensions, 1x1, 1024x768, quality extremes) decodes here, as do 10-bit
+/// 4:4:4 and 12-bit 4:2:0 built with rav1e. grid/tiled and animated could not
+/// be tested — no tool on the build host can produce them — and `avif-rust`
+/// claims grid support. If one turns up undecodable, the fix is to widen the
+/// decoder or restore a fallback here; see the avif entry in TODO.md.
+fn transcode_avif(path: &Path, output: &Path) -> Result<(), String> {
+    let decoded = avif_rust::image_from_file(path).map_err(|error| format!("{error:?}"))?;
+    // `avif-rust` reports dimensions as usize; reject anything that will not fit
+    // rather than truncating, which would silently mis-shape the buffer.
+    let width = u32::try_from(decoded.width).map_err(|_| "avif width out of range".to_string())?;
+    let height =
+        u32::try_from(decoded.height).map_err(|_| "avif height out of range".to_string())?;
+    let buffer: image::RgbaImage = image::ImageBuffer::from_raw(width, height, decoded.rgba)
+        .ok_or_else(|| "avif buffer does not match its dimensions".to_string())?;
+    buffer
+        .save_with_format(output, image::ImageFormat::Png)
+        .map_err(|error| error.to_string())
+}
+
+async fn call_wd_infer_image(
+    state: &SharedState,
+    path: &Path,
+    model_id: &str,
+    general_thr: f32,
+    character_thr: f32,
+) -> WdInferOutcome {
+    if !requires_image_transcode(&path.to_string_lossy()) {
+        return call_wd_infer(state, path, model_id, general_thr, character_thr).await;
+    }
+    // Validate BEFORE transcoding: `call_wd_infer_temp_frame` deliberately skips
+    // the scan_roots check (wd_infer.rs), so transcoding first would let every
+    // widened format bypass it.
+    if validate_wd_infer_path(state, path).is_err() {
+        return WdInferOutcome::PathRejected;
+    }
+    let temp = match fs::create_dir_all(&state.config.cache_dir).and_then(|()| {
+        Builder::new()
+            .prefix("yu_wd_tagger_")
+            .suffix(".png")
+            .tempfile_in(&state.config.cache_dir)
+    }) {
+        Ok(temp) => temp,
+        Err(error) => return WdInferOutcome::BackendError(error.to_string()),
+    };
+    let result = if has_extension(path, "svg") {
+        rasterize_svg(path, temp.path())
+    } else if has_extension(path, "avif") {
+        transcode_avif(path, temp.path())
+    } else {
+        image::open(path)
+            .and_then(|image| image.save_with_format(temp.path(), image::ImageFormat::Png))
+            .map_err(|error| error.to_string())
+    };
+    if let Err(error) = result {
+        return WdInferOutcome::BackendError(error);
+    }
+    call_wd_infer_temp_frame(state, temp.path(), model_id, general_thr, character_thr).await
+}
+
+fn rasterize_svg(path: &Path, output: &Path) -> Result<(), String> {
+    let data = fs::read(path).map_err(|error| error.to_string())?;
+    let tree = resvg::usvg::Tree::from_data(&data, &resvg::usvg::Options::default())
+        .map_err(|error| error.to_string())?;
+    let width = tree.size().width().ceil() as u32;
+    let height = tree.size().height().ceil() as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
+        .ok_or_else(|| "invalid SVG raster size".to_string())?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::identity(),
+        &mut pixmap.as_mut(),
+    );
+    pixmap.save_png(output).map_err(|error| error.to_string())
+}
 
 fn is_native_image_format(path: &str) -> bool {
     std::path::Path::new(path)
@@ -1437,6 +1544,7 @@ pub(crate) enum TagOutcome {
 
 #[derive(Debug)]
 pub(crate) enum FatalReason {
+    InferSidecarUnavailable,
     ModelNotDownloaded,
     BackendError(String),
     Unreachable(String),
@@ -1444,8 +1552,8 @@ pub(crate) enum FatalReason {
 
 /// Core (Rust) implementation of the WD-Tagger single-file tag operation.
 /// Returns `TagOutcome::Fallback` when the request must fall back to the
-/// Python sidecar (`fwd_post_wt`): non-image formats, standalone mode
-/// without a running yu-infer sidecar, and `WdInferOutcome::PathRejected`.
+/// Python sidecar (`fwd_post_wt`): unsupported formats only.
+/// Standalone without yu-infer and `WdInferOutcome::PathRejected` are native errors.
 /// All such fallback checks happen before any DB write or XMP write, so the
 /// native and fallback paths can never both mutate state for the same
 /// request.
@@ -1509,12 +1617,21 @@ pub(crate) async fn tag_file_native_core(
         if crate::routes::wd_tagger_video::is_native_video_format(&path) {
             return tag_video_core(state, file_id, &path, force).await;
         }
-        return TagOutcome::Fallback;
+        // Python answers the same thing for these, so forwarding buys nothing:
+        // `single_ops.py::tag_one_file` gates on `is_taggable_file()` and returns
+        // `unsupported_type`. The native image set (10) and video set (7) match
+        // Python's effective sets exactly -- heif/heic/jxl sit in Python's source
+        // but behind `HEIF_AVAILABLE`/`JXL_AVAILABLE`, both False here. If those
+        // packages are ever installed, Python gains formats Rust lacks and this
+        // branch has to become a forward again; see TODO.md.
+        return TagOutcome::Rejected(
+            json!({"error": "File type not supported for tagging", "code": "unsupported_type"}),
+        );
     }
 
-    // 4. standaloneでyu-infer未起動ならPythonへfallback
+    // Standalone mode has no Python backend to forward to.
     if state.infer_client.is_none() && state.config.infer_standalone {
-        return TagOutcome::Fallback;
+        return TagOutcome::Fatal(FatalReason::InferSidecarUnavailable);
     }
 
     // (skip判定) force=falseかつ既存タグありならskipped応答
@@ -1550,7 +1667,7 @@ pub(crate) async fn tag_file_native_core(
         .unwrap_or(0.85) as f32;
 
     // 5. サイドカー呼出
-    let outcome = call_wd_infer(
+    let outcome = call_wd_infer_image(
         state,
         std::path::Path::new(&path),
         &model_id,
@@ -1560,7 +1677,9 @@ pub(crate) async fn tag_file_native_core(
     .await;
     let tag_result = match outcome {
         WdInferOutcome::Success(result) => result,
-        WdInferOutcome::PathRejected => return TagOutcome::Fallback, // Pythonへfallback
+        WdInferOutcome::PathRejected => {
+            return TagOutcome::Rejected(json!({"ok": false, "error": "internal_server_error"}));
+        }
         WdInferOutcome::ModelNotDownloaded => {
             return TagOutcome::Fatal(FatalReason::ModelNotDownloaded)
         }
@@ -1772,6 +1891,55 @@ fn filter_and_dedupe_tags(
     filtered
 }
 
+/// Writes per-keyframe tagger results, mirroring
+/// `core/files_core/video_keyframe_store.py::save_keyframe_results`.
+///
+/// The SQL is the same upsert keyed on `(file_id, keyframe_idx, model)`, and
+/// `timestamp_ms` is 0 for the same reason Python writes 0: the keyframe
+/// extractor does not return the position alongside the frame. `vector` stays
+/// NULL — that column belongs to the CLIP path, not this one.
+async fn save_keyframe_results(
+    db: &sqlx::SqlitePool,
+    file_id: i64,
+    frames: &[Vec<(String, f32, String)>],
+    model: &str,
+) -> Result<(), sqlx::Error> {
+    if frames.is_empty() {
+        return Ok(());
+    }
+    let mut tx = db.begin().await?;
+    for (index, tags) in frames.iter().enumerate() {
+        let payload: Vec<Value> = tags
+            .iter()
+            .map(|(tag, confidence, category)| {
+                json!({"tag": tag, "confidence": confidence, "category": category})
+            })
+            .collect();
+        let wd_tags_json = if payload.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&payload).unwrap_or_else(|_| "[]".to_string()))
+        };
+        sqlx::query(
+            "INSERT INTO file_keyframes \
+                 (file_id, keyframe_idx, timestamp_ms, vector, wd_tags_json, model) \
+             VALUES (?, ?, 0, NULL, ?, ?) \
+             ON CONFLICT(file_id, keyframe_idx, model) DO UPDATE SET \
+                 timestamp_ms = excluded.timestamp_ms, \
+                 vector = excluded.vector, \
+                 wd_tags_json = excluded.wd_tags_json, \
+                 created_at = strftime('%s','now')",
+        )
+        .bind(file_id)
+        .bind(index as i64)
+        .bind(wd_tags_json)
+        .bind(model)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
+}
+
 async fn tag_video_core(state: &SharedState, file_id: i64, path: &str, force: bool) -> TagOutcome {
     let full_config = read_config_json(state);
     let video_config = crate::routes::video_analysis::merged_video_config(&full_config);
@@ -1786,17 +1954,19 @@ async fn tag_video_core(state: &SharedState, file_id: i64, path: &str, force: bo
     let store_per_keyframe = video_config["store_per_keyframe"]
         .as_bool()
         .unwrap_or(false);
-    if strategy == "scene" || store_per_keyframe {
-        return TagOutcome::Fallback;
-    }
+    let scene_threshold = video_config["scene_threshold"].as_f64().unwrap_or(0.4);
 
     if !crate::routes::video_analysis::check_ffmpeg() {
-        return TagOutcome::Fallback;
+        // Python needs ffmpeg for the same extraction, so it answers
+        // `keyframe_error` here too (single_ops.py). Forwarding gains nothing.
+        return TagOutcome::Rejected(
+            json!({"error": "Failed to extract keyframes", "code": "keyframe_error"}),
+        );
     }
 
-    // standaloneでyu-infer未起動ならPythonへfallback
+    // standalone mode has no Python backend to forward to.
     if state.infer_client.is_none() && state.config.infer_standalone {
-        return TagOutcome::Fallback;
+        return TagOutcome::Fatal(FatalReason::InferSidecarUnavailable);
     }
 
     // (skip判定) force=falseかつ既存タグありならskipped応答
@@ -1838,11 +2008,12 @@ async fn tag_video_core(state: &SharedState, file_id: i64, path: &str, force: bo
             return TagOutcome::Rejected(json!({"ok": false, "error": "internal_server_error"}));
         }
     };
-    let frames = crate::routes::wd_tagger_video::extract_keyframes(
+    let frames = crate::routes::wd_tagger_video::extract_keyframes_with_threshold(
         std::path::Path::new(path),
         temp_dir.path(),
         keyframe_count,
         &strategy,
+        scene_threshold,
     )
     .await;
     if frames.is_empty() {
@@ -1879,7 +2050,36 @@ async fn tag_video_core(state: &SharedState, file_id: i64, path: &str, force: bo
         }
     }
 
+    // Snapshot what per-keyframe storage needs before the merge consumes the
+    // frame results; `TagResult` is not `Clone`.
+    let per_keyframe: Option<Vec<Vec<(String, f32, String)>>> = store_per_keyframe.then(|| {
+        collected_results
+            .iter()
+            .map(|result| {
+                result
+                    .tags
+                    .iter()
+                    .map(|tag| (tag.tag.clone(), tag.confidence, tag.category.clone()))
+                    .collect()
+            })
+            .collect()
+    });
+
     let merged = crate::routes::wd_tagger_video::merge_tag_results(collected_results);
+
+    if let Some(frames) = per_keyframe {
+        // Mirrors single_ops.py: timestamp_ms is written as 0 there too, because
+        // the extractor does not hand the position back with the frame.
+        if let Err(error) =
+            save_keyframe_results(&state.db, file_id, &frames, &merged.model_id).await
+        {
+            tracing::error!(
+                ?error,
+                file_id,
+                "failed to store per-keyframe tagger results"
+            );
+        }
+    }
 
     // NSFWフィルタ + dedup(先勝ち)
     let nsfw_filter = read_config_json(state)["extensions"]["builtin-wd-tagger"]["nsfw_filter"]
@@ -1909,25 +2109,42 @@ async fn tag_video_core(state: &SharedState, file_id: i64, path: &str, force: bo
 }
 
 /// Native (Rust) implementation of the WD-Tagger single-file tag endpoint.
-/// Returns `None` when the request must fall back to the Python sidecar
-/// (`fwd_post_wt`): non-image formats, standalone mode without a running
-/// yu-infer sidecar, and `WdInferOutcome::PathRejected`. All such fallback
-/// checks happen before any DB write or XMP write, so the native and
-/// fallback paths can never both mutate state for the same request.
-async fn tag_file_native(state: &SharedState, file_id: i64, force: bool) -> Option<Response> {
+///
+/// No longer forwards: every format Python can tag is native (10 image + 7
+/// video, matching Python's effective sets), and the branches that used to
+/// forward now return the answer Python itself would give —
+/// `unsupported_type` and `keyframe_error`. Standalone without a sidecar is a
+/// typed `infer_sidecar_unavailable`, and `PathRejected` is a rejection rather
+/// than a forward that would have defeated the scan-root check.
+async fn tag_file_native(state: &SharedState, file_id: i64, force: bool) -> Response {
     match tag_file_native_core(state, file_id, force).await {
-        TagOutcome::Tagged(body) => Some(api_result(body)),
-        TagOutcome::Skipped(body) => Some(api_result(body)),
+        TagOutcome::Tagged(body) => api_result(body),
+        TagOutcome::Skipped(body) => api_result(body),
         TagOutcome::Rejected(body) => {
             // "code" キーで判別する("reason" ではない)。file_not_found/file_missing は
             // 既存コードでは両方とも 400 BAD_REQUEST であり 404 ではない。
             // internal_error 由来(DB参照/書込失敗)は "code" キー自体を持たないため
             // デフォルト分岐で 500 に落ちる。
             let status = rejected_status_from_body(&body);
-            Some((status, Json(body)).into_response())
+            (status, Json(body)).into_response()
         }
-        TagOutcome::Fallback => None,
-        TagOutcome::Fatal(reason) => Some(fatal_reason_to_response(reason)),
+        // `tag_file_native_core` no longer produces `Fallback`: every format
+        // Python handles is native, and the cases where it used to forward now
+        // return the same answer Python would (`unsupported_type`,
+        // `keyframe_error`). Kept as a compile-time exhaustive arm so adding a
+        // new forward has to be a deliberate edit here.
+        TagOutcome::Fallback => {
+            tracing::error!(
+                file_id,
+                "tag_file_native_core returned an unexpected Fallback"
+            );
+            api_error_code(
+                "File type not supported for tagging",
+                StatusCode::BAD_REQUEST,
+                "unsupported_type",
+            )
+        }
+        TagOutcome::Fatal(reason) => fatal_reason_to_response(reason),
     }
 }
 
@@ -1936,12 +2153,21 @@ fn rejected_status_from_body(body: &serde_json::Value) -> StatusCode {
         Some("file_not_found") => StatusCode::BAD_REQUEST,
         Some("file_missing") => StatusCode::BAD_REQUEST,
         Some("keyframe_error") => StatusCode::BAD_REQUEST,
+        // Python's `api_error(..., 400, code="unsupported_type")`. Without this
+        // arm the new native branch fell through to 500, which is the wrong
+        // status and would have been a parity regression.
+        Some("unsupported_type") => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
 fn fatal_reason_to_response(reason: FatalReason) -> Response {
     match reason {
+        FatalReason::InferSidecarUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ok": false, "code": "infer_sidecar_unavailable"})),
+        )
+            .into_response(),
         FatalReason::ModelNotDownloaded => (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "Model not downloaded", "code": "model_not_available"})),
@@ -1971,10 +2197,7 @@ pub async fn tag_file(
         .ok()
         .and_then(|v| v.get("force").and_then(|f| f.as_bool()))
         .unwrap_or(false);
-    if let Some(response) = tag_file_native(&state, file_id, force).await {
-        return response;
-    }
-    fwd_post_wt(&state, &format!("/api/wd-tagger/tag/{file_id}"), body).await
+    tag_file_native(&state, file_id, force).await
 }
 
 #[derive(Debug)]
@@ -2654,12 +2877,20 @@ pub async fn retag_single(
         );
     };
     let profile_id = profile["id"].as_str().unwrap_or(model_input);
-    if profile["adapter_family"].as_str() != Some("wd")
-        || profile["backend"].as_str() != Some("onnx")
-        || !profile["hf_subdir"].is_null()
-        || (state.infer_client.is_none() && state.config.infer_standalone)
-    {
-        return fwd_post_wt(&state, "/api/wd-tagger/retag/single", body).await;
+    // Families other than `wd`, and variants living in an `hf_subdir`, used to
+    // be forwarded to Python because the sidecar knew exactly one recipe in
+    // exactly one directory. It now takes both from the profile. A non-ONNX
+    // backend has no local weights at all, so it is refused rather than
+    // forwarded — Python cannot run it either.
+    if profile["backend"].as_str() != Some("onnx") {
+        return api_error_code(
+            "model backend is not supported for retag",
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+        );
+    }
+    if state.infer_client.is_none() && state.config.infer_standalone {
+        return fatal_reason_to_response(FatalReason::InferSidecarUnavailable);
     }
     let model_cache_id = sanitize_model_id(profile["model_id"].as_str().unwrap_or(profile_id));
     match retag_file_native_core(
@@ -2678,7 +2909,21 @@ pub async fn retag_single(
                 json!((start.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0);
             api_result(json!({"data": body}))
         }
-        TagOutcome::Fallback => fwd_post_wt(&state, "/api/wd-tagger/retag/single", body).await,
+        // `retag_file_native_core` never produces `Fallback`; every outcome it
+        // can reach is Tagged / Rejected / Fatal / Skipped. Kept as a
+        // compile-time exhaustive arm so reintroducing a forward has to be a
+        // deliberate edit here.
+        TagOutcome::Fallback => {
+            tracing::error!(
+                file_id,
+                "retag_file_native_core returned an unexpected Fallback"
+            );
+            api_error_code(
+                "model is not supported by native retag",
+                StatusCode::BAD_REQUEST,
+                "invalid_input",
+            )
+        }
         TagOutcome::Rejected(body) => {
             (rejected_status_from_body(&body), Json(body)).into_response()
         }
@@ -2715,24 +2960,30 @@ async fn retag_file_native_core(
         }
     };
     if !is_native_image_format(&path) {
-        return TagOutcome::Fallback;
+        // Same reasoning as tag_file_native_core: Python returns
+        // `unsupported_type` for these, so a forward adds a hop and no answer.
+        return TagOutcome::Rejected(
+            json!({"error": "File type not supported for tagging", "code": "unsupported_type"}),
+        );
     }
     if !Path::new(&path).exists() {
         return TagOutcome::Rejected(
             json!({"ok": false, "error": "File not found on disk", "code": "file_missing"}),
         );
     }
-    let result = match call_wd_infer(
+    let outcome = call_wd_infer_image(
         state,
         Path::new(&path),
         model_id,
         general_thr,
         character_thr,
     )
-    .await
-    {
+    .await;
+    let result = match outcome {
         WdInferOutcome::Success(result) => result,
-        WdInferOutcome::PathRejected => return TagOutcome::Fallback,
+        WdInferOutcome::PathRejected => {
+            return TagOutcome::Rejected(json!({"ok": false, "error": "internal_server_error"}));
+        }
         WdInferOutcome::ModelNotDownloaded => {
             return TagOutcome::Fatal(FatalReason::ModelNotDownloaded)
         }
@@ -4432,7 +4683,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn tag_file_native_core_returns_fallback_for_unsupported_format() {
+    async fn tag_file_native_core_reports_unsupported_format_without_forwarding() {
         let dirs = test_dirs();
         let state = test_state(&dirs, json!({})).await;
         let video_path = dirs.root.join("unsupported.pdf");
@@ -4442,13 +4693,19 @@ pub(crate) mod tests {
             .execute(&state.db)
             .await
             .unwrap();
-        let outcome = tag_file_native_core(&state, 103, false).await;
-        assert!(matches!(outcome, TagOutcome::Fallback));
+        // Matches Python's own answer (`single_ops.py` -> unsupported_type), so
+        // there is nothing to forward for.
+        match tag_file_native_core(&state, 103, false).await {
+            TagOutcome::Rejected(body) => {
+                assert_eq!(body["code"], "unsupported_type");
+                assert_eq!(body["error"], "File type not supported for tagging");
+            }
+            other => panic!("unsupported format must be reported, not forwarded: {other:?}"),
+        }
     }
 
     #[tokio::test]
     async fn tag_file_native_wrapper_unchanged_behavior_for_fallback() {
-        // ラッパー tag_file_native は Fallback の場合 None を返す既存動作を維持すること
         let dirs = test_dirs();
         let state = test_state(&dirs, json!({})).await;
         let video_path = dirs.root.join("unsupported2.mp4");
@@ -4458,8 +4715,275 @@ pub(crate) mod tests {
             .execute(&state.db)
             .await
             .unwrap();
-        let resp = tag_file_native(&state, 104, false).await;
-        assert!(resp.is_none());
+        let response = tag_file_native(&state, 104, false).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            json_body(response).await["code"],
+            "infer_sidecar_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn tag_file_native_rejects_path_rejected_without_python_fallback() {
+        let dirs = test_dirs();
+        let outside = tempfile::tempdir().unwrap();
+        let image_path = outside.path().join("outside.png");
+        image::RgbImage::new(1, 1).save(&image_path).unwrap();
+        let scan_root = fs::canonicalize(&dirs.root).unwrap();
+        let state = test_state_ex(
+            &dirs,
+            json!({"scan_roots": [{"path": scan_root.to_string_lossy()}]}),
+            None,
+            false,
+            PathBuf::from("."),
+        )
+        .await;
+        sqlx::query("INSERT INTO files (id, path, is_deleted) VALUES (105, ?, 0)")
+            .bind(image_path.to_string_lossy().to_string())
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            tag_file_native_core(&state, 105, false).await,
+            TagOutcome::Rejected(_)
+        ));
+        // A response at all means it did not forward; the wrapper is infallible now.
+        let _ = tag_file_native(&state, 105, false).await;
+    }
+
+    #[tokio::test]
+    async fn widened_gif_rejects_outside_scan_roots_before_transcoding() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/v1/infer/wd",
+                    axum::routing::post(move || {
+                        let request_count = request_count.clone();
+                        async move {
+                            request_count.fetch_add(1, Ordering::SeqCst);
+                            Json(json!({"data":{"tags":[],"rating":"general","path":"irrelevant","model_id":"irrelevant"}}))
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let dirs = test_dirs();
+        let cache_dir = dirs.root.join("transcode");
+        fs::create_dir(&cache_dir).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_gif = outside.path().join("outside.gif");
+        image::RgbImage::new(1, 1)
+            .save_with_format(&outside_gif, image::ImageFormat::Gif)
+            .unwrap();
+        let inside_gif = dirs.root.join("inside.gif");
+        image::RgbImage::new(1, 1)
+            .save_with_format(&inside_gif, image::ImageFormat::Gif)
+            .unwrap();
+        let root = fs::canonicalize(&dirs.root).unwrap();
+        let state = test_state_ex(
+            &dirs,
+            json!({"scan_roots":[{"path":root.to_string_lossy()}]}),
+            Some(crate::infer_client::InferClient::new(
+                format!("http://{address}"),
+                String::new(),
+            )),
+            true,
+            cache_dir.clone(),
+        )
+        .await;
+        for (id, path) in [(108, &outside_gif), (109, &inside_gif)] {
+            sqlx::query("INSERT INTO files (id, path, is_deleted) VALUES (?, ?, 0)")
+                .bind(id)
+                .bind(path.to_string_lossy().to_string())
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+
+        assert!(matches!(
+            tag_file_native_core(&state, 108, false).await,
+            TagOutcome::Rejected(_)
+        ));
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert!(fs::read_dir(&cache_dir).unwrap().next().is_none());
+        match tag_file_native_core(&state, 109, false).await {
+            TagOutcome::Tagged(_) => {}
+            other => panic!("inside widened GIF must reach native transcode: {other:?}"),
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn widened_formats_use_native_transcode_and_undecodable_avif_forwards() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/v1/infer/wd",
+                    axum::routing::post(move || {
+                        let request_count = request_count.clone();
+                        async move {
+                            request_count.fetch_add(1, Ordering::SeqCst);
+                            Json(json!({"data":{"tags":[],"rating":"general","path":"irrelevant","model_id":"irrelevant"}}))
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let dirs = test_dirs();
+        let cache_dir = dirs.root.join("transcode");
+        fs::create_dir(&cache_dir).unwrap();
+        let root = fs::canonicalize(&dirs.root).unwrap();
+        let state = test_state_ex(
+            &dirs,
+            json!({"scan_roots":[{"path":root.to_string_lossy()}]}),
+            Some(crate::infer_client::InferClient::new(
+                format!("http://{address}"),
+                String::new(),
+            )),
+            true,
+            cache_dir,
+        )
+        .await;
+        for (id, extension, format) in [
+            (110, "bmp", image::ImageFormat::Bmp),
+            (111, "gif", image::ImageFormat::Gif),
+            (112, "tiff", image::ImageFormat::Tiff),
+            (113, "tif", image::ImageFormat::Tiff),
+        ] {
+            let path = dirs.root.join(format!("native.{extension}"));
+            image::RgbImage::new(1, 1)
+                .save_with_format(&path, format)
+                .unwrap();
+            sqlx::query("INSERT INTO files (id, path, is_deleted) VALUES (?, ?, 0)")
+                .bind(id)
+                .bind(path.to_string_lossy().to_string())
+                .execute(&state.db)
+                .await
+                .unwrap();
+            assert!(matches!(
+                tag_file_native_core(&state, id, false).await,
+                TagOutcome::Tagged(_)
+            ));
+        }
+        let svg = dirs.root.join("native.svg");
+        fs::write(
+            &svg,
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>"#,
+        )
+        .unwrap();
+        sqlx::query("INSERT INTO files (id, path, is_deleted) VALUES (114, ?, 0)")
+            .bind(svg.to_string_lossy().to_string())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert!(matches!(
+            tag_file_native_core(&state, 114, false).await,
+            TagOutcome::Tagged(_)
+        ));
+        // A real AVIF decodes natively via avif-rust and must NOT reach Python.
+        let avif_ok = dirs.root.join("native.avif");
+        image::RgbImage::from_pixel(8, 8, image::Rgb([200, 120, 40]))
+            .save_with_format(&avif_ok, image::ImageFormat::Avif)
+            .unwrap();
+        sqlx::query("INSERT INTO files (id, path, is_deleted) VALUES (116, ?, 0)")
+            .bind(avif_ok.to_string_lossy().to_string())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert!(matches!(
+            tag_file_native_core(&state, 116, false).await,
+            TagOutcome::Tagged(_)
+        ));
+        assert_eq!(requests.load(Ordering::SeqCst), 6);
+
+        // An AVIF avif-rust cannot decode is reported, not forwarded: the whole
+        // point of v4.659.0 is that no format reaches Python any more.
+        let avif = dirs.root.join("undecodable.avif");
+        fs::write(&avif, b"not an avif").unwrap();
+        sqlx::query("INSERT INTO files (id, path, is_deleted) VALUES (115, ?, 0)")
+            .bind(avif.to_string_lossy().to_string())
+            .execute(&state.db)
+            .await
+            .unwrap();
+        match tag_file_native_core(&state, 115, false).await {
+            TagOutcome::Fatal(FatalReason::BackendError(_)) => {}
+            other => panic!("undecodable avif must be reported, not forwarded: {other:?}"),
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 6);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn tag_file_native_returns_typed_error_without_standalone_sidecar() {
+        let dirs = test_dirs();
+        let image_path = dirs.root.join("standalone.png");
+        image::RgbImage::new(1, 1).save(&image_path).unwrap();
+        let state = test_state(&dirs, json!({})).await;
+        sqlx::query("INSERT INTO files (id, path, is_deleted) VALUES (106, ?, 0)")
+            .bind(image_path.to_string_lossy().to_string())
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            tag_file_native_core(&state, 106, false).await,
+            TagOutcome::Fatal(FatalReason::InferSidecarUnavailable)
+        ));
+        let response = tag_file_native(&state, 106, false).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            json_body(response).await["code"],
+            "infer_sidecar_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn retag_single_returns_typed_error_without_standalone_sidecar() {
+        let dirs = test_dirs();
+        write_profile(
+            &dirs
+                .root
+                .join("extensions/builtin_wd_tagger/core_impl/profiles/a.json"),
+            "profile-a",
+            "A",
+            "model-a",
+        );
+        let image_path = dirs.root.join("retag-standalone.png");
+        image::RgbImage::new(1, 1).save(&image_path).unwrap();
+        let state = test_state(&dirs, json!({})).await;
+        sqlx::query("INSERT INTO files (id, path, is_deleted) VALUES (107, ?, 0)")
+            .bind(image_path.to_string_lossy().to_string())
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        let response = retag_single(
+            State(state),
+            None,
+            Bytes::from_static(br#"{"file_id":107,"model_id":"profile-a"}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            json_body(response).await["code"],
+            "infer_sidecar_unavailable"
+        );
     }
 
     // 既存のリグレッションテスト(下記 tag_file_native_* 系)は成功/skip/fallback系のみを検証しており、
@@ -4496,7 +5020,7 @@ pub(crate) mod tests {
         ));
 
         // ラッパーの実際のHTTPレスポンス形状も検証する(wd_tagger.rs 内 fatal_reason_to_response と一致すること)
-        let resp = tag_file_native(&state, 301, false).await.unwrap();
+        let resp = tag_file_native(&state, 301, false).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body_bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let body: Value = serde_json::from_slice(&body_bytes).unwrap();
@@ -4521,12 +5045,12 @@ pub(crate) mod tests {
     async fn tag_file_native_rejects_missing_file() {
         let dirs = test_dirs();
         let state = test_state(&dirs, json!({})).await;
-        let response = tag_file_native(&state, 9999, false).await.unwrap();
+        let response = tag_file_native(&state, 9999, false).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
-    async fn tag_file_native_falls_back_for_non_image_format() {
+    async fn tag_file_native_reports_non_image_format_without_forwarding() {
         let dirs = test_dirs();
         let state = test_state(&dirs, json!({})).await;
         let video_path = dirs.root.join("document.pdf");
@@ -4536,11 +5060,9 @@ pub(crate) mod tests {
             .execute(&state.db)
             .await
             .unwrap();
-        let result = tag_file_native(&state, 101, false).await;
-        assert!(
-            result.is_none(),
-            "non-image format must fall back to Python"
-        );
+        // The wrapper answers directly now; assert the answer, not its presence.
+        let response = tag_file_native(&state, 101, false).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -4564,9 +5086,14 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn tag_video_core_returns_fallback_when_strategy_is_scene() {
+    async fn tag_video_core_no_longer_forwards_when_strategy_is_scene() {
         let dirs = test_dirs();
-        let state = test_state(&dirs, json!({"video_analysis": {"strategy": "scene"}})).await;
+        fs::write(
+            dirs.root.join("config.json"),
+            json!({"video_analysis": {"strategy": "scene"}}).to_string(),
+        )
+        .unwrap();
+        let state = test_state_ex(&dirs, json!({}), None, false, PathBuf::from(".")).await;
         let video_path = dirs.root.join("scene.mp4");
         fs::write(&video_path, b"fake").unwrap();
         sqlx::query("INSERT INTO files (id, path, is_deleted) VALUES (401, ?, 0)")
@@ -4575,18 +5102,25 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let outcome = tag_file_native_core(&state, 401, false).await;
-        assert!(matches!(outcome, TagOutcome::Fallback));
+        // Scene strategy is native as of v4.659.0. The fixture is a fake mp4, so
+        // extraction fails and we get `keyframe_error` -- the point of the test
+        // is that it is no longer `Fallback`, i.e. nothing reaches Python.
+        match tag_file_native_core(&state, 401, false).await {
+            TagOutcome::Rejected(body) => assert_eq!(body["code"], "keyframe_error"),
+            TagOutcome::Fallback => panic!("scene strategy must not forward to Python"),
+            other => panic!("unexpected outcome: {other:?}"),
+        }
     }
 
     #[tokio::test]
-    async fn tag_video_core_returns_fallback_when_store_per_keyframe_is_true() {
+    async fn tag_video_core_no_longer_forwards_when_store_per_keyframe_is_true() {
         let dirs = test_dirs();
-        let state = test_state(
-            &dirs,
-            json!({"video_analysis": {"store_per_keyframe": true}}),
+        fs::write(
+            dirs.root.join("config.json"),
+            json!({"video_analysis": {"store_per_keyframe": true}}).to_string(),
         )
-        .await;
+        .unwrap();
+        let state = test_state_ex(&dirs, json!({}), None, false, PathBuf::from(".")).await;
         let video_path = dirs.root.join("per-keyframe.mp4");
         fs::write(&video_path, b"fake").unwrap();
         sqlx::query("INSERT INTO files (id, path, is_deleted) VALUES (402, ?, 0)")
@@ -4595,8 +5129,13 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let outcome = tag_file_native_core(&state, 402, false).await;
-        assert!(matches!(outcome, TagOutcome::Fallback));
+        // Per-keyframe storage is native as of v4.659.0; same reasoning as the
+        // scene test above.
+        match tag_file_native_core(&state, 402, false).await {
+            TagOutcome::Rejected(body) => assert_eq!(body["code"], "keyframe_error"),
+            TagOutcome::Fallback => panic!("per-keyframe storage must not forward to Python"),
+            other => panic!("unexpected outcome: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -4703,7 +5242,7 @@ pub(crate) mod tests {
                 if body.get("code").and_then(|code| code.as_str()) == Some("keyframe_error")
         ));
 
-        let response = tag_file_native(&state, 404, false).await.unwrap();
+        let response = tag_file_native(&state, 404, false).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

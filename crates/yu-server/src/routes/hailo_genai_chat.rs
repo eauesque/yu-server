@@ -21,19 +21,16 @@
 //! even when a fallback-path Python request creates or updates a
 //! conversation Rust never saw a request for.
 //!
-//! `chat/send`'s native path covers only **text-only, non-web-search,
-//! non-subprocess-mode** chat (v1 scope, matching the VLM native-path
-//! precedent in `auto_stubs.rs`). Image chat (multipart image or JSON
-//! `file_id`), `web_search: true`, and `hailo_genai.llm_subprocess` config
-//! all fall back to the Python proxy — verbatim, with **zero native DB
-//! writes**, since the fallback decision is made before any side effect.
+//! `chat/send`'s native path covers text-only non-web-search chat and
+//! multipart image uploads. JSON `file_id`, web search, and LLM subprocess
+//! mode still fall back to Python before any native database write.
 
 use std::{collections::HashMap, path::Path};
 
 use axum::{
     body::Bytes,
     extract::{Extension, Path as AxumPath, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -43,7 +40,7 @@ use sqlx::Row;
 
 use crate::{
     auth::{scope::require_admin_scope, AuthContext},
-    routes::auto_stubs::{model_name_to_hef_path, read_config_json},
+    routes::auto_stubs::{model_name_to_hef_path, read_config_json, VLM_MAX_IMAGE_UPLOAD_BYTES},
     state::SharedState,
 };
 
@@ -466,6 +463,12 @@ pub async fn chat_send(
             if let Some(response) = chat_send_native(&state, infer_client, &body).await {
                 return response;
             }
+        } else if content_type.starts_with("multipart/form-data") {
+            if let Some(response) =
+                chat_send_multipart_native(&state, infer_client, &headers, &body).await
+            {
+                return response;
+            }
         }
     }
 
@@ -476,6 +479,245 @@ pub async fn chat_send(
         headers.get("content-type"),
     )
     .await
+}
+
+#[derive(Debug)]
+struct ChatVlmRequest {
+    content: String,
+    model: String,
+    vlm_model: String,
+    conversation_id: Option<i64>,
+    temperature: f32,
+    max_tokens: u32,
+    frame_b64: String,
+}
+
+struct ChatMultipartDefaults {
+    model: String,
+    vlm_model: String,
+    temperature: f32,
+    max_tokens: u32,
+}
+
+fn chat_multipart_defaults(state: &SharedState) -> ChatMultipartDefaults {
+    let config = read_config_json(state);
+    let extension = &config["extensions"]["builtin-hailo-genai"];
+    ChatMultipartDefaults {
+        model: extension["default_llm_model"]
+            .as_str()
+            .unwrap_or("qwen3-1.7b-instruct")
+            .to_string(),
+        vlm_model: extension["default_vlm_model"]
+            .as_str()
+            .unwrap_or("qwen2-vl-2b-instruct")
+            .to_string(),
+        temperature: extension["temperature"].as_f64().unwrap_or(0.7) as f32,
+        max_tokens: extension["max_generated_tokens"].as_u64().unwrap_or(512) as u32,
+    }
+}
+
+fn invalid_model_name(model: &str) -> bool {
+    model.contains('/') || model.contains('\\') || model.contains("..")
+}
+
+fn chat_error(status: StatusCode, message: &str) -> Response {
+    (status, Json(json!({"status": "error", "message": message}))).into_response()
+}
+
+fn with_thousands_separators(value: usize) -> String {
+    let digits = value.to_string();
+    let mut output = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            output.push(',');
+        }
+        output.push(character);
+    }
+    output
+}
+
+async fn chat_send_multipart_native(
+    state: &SharedState,
+    infer_client: &crate::infer_client::InferClient,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Option<Response> {
+    let defaults = chat_multipart_defaults(state);
+    let request = match parse_chat_multipart(headers, body, &defaults).await? {
+        Ok(request) => request,
+        Err(response) => return Some(response),
+    };
+
+    let hef_path = match resolve_chat_request_vlm_hef(&request, resolve_chat_vlm_hef) {
+        Ok(path) => path,
+        Err(response) => return Some(response),
+    };
+
+    Some(chat_send_multipart_with_hef(state, infer_client, request, hef_path).await)
+}
+
+fn resolve_chat_request_vlm_hef(
+    request: &ChatVlmRequest,
+    resolve: impl FnOnce(&str) -> Result<String, Response>,
+) -> Result<String, Response> {
+    resolve(&request.vlm_model)
+}
+
+fn resolve_chat_vlm_hef(model: &str) -> Result<String, Response> {
+    validate_chat_vlm_hef(model, model_name_to_hef_path(model))
+}
+
+fn validate_chat_vlm_hef(model: &str, hef_path: String) -> Result<String, Response> {
+    Path::new(&hef_path)
+        .exists()
+        .then_some(hef_path)
+        .ok_or_else(|| {
+            chat_error(
+                StatusCode::BAD_REQUEST,
+                &format!("VLM model '{model}' not downloaded"),
+            )
+        })
+}
+
+async fn chat_send_multipart_with_hef(
+    state: &SharedState,
+    infer_client: &crate::infer_client::InferClient,
+    request: ChatVlmRequest,
+    hef_path: String,
+) -> Response {
+    let (conv_id, new_title) = match prepare_chat_conversation(
+        state,
+        request.conversation_id,
+        &request.model,
+        &format!("[Image] {}", request.content),
+        &request.content,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+
+    let upstream = match infer_client
+        .vlm_generate_stream(
+            Some(hef_path),
+            request.content,
+            None,
+            vec![request.frame_b64],
+            Some(crate::infer_client::DEFAULT_GENERATE_TIMEOUT_MS),
+            Some(request.temperature),
+            None,
+            None,
+            None,
+            Some(request.max_tokens),
+            None,
+            None,
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!("yu-infer vlm_generate_stream request failed: {error}");
+            return chat_error(StatusCode::BAD_GATEWAY, "Chat generation failed");
+        }
+    };
+
+    chat_send_sse_response(state.clone(), upstream, conv_id, new_title, true)
+}
+
+async fn parse_chat_multipart(
+    headers: &HeaderMap,
+    body: &Bytes,
+    defaults: &ChatMultipartDefaults,
+) -> Option<Result<ChatVlmRequest, Response>> {
+    let boundary = multer::parse_boundary(
+        headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+    )
+    .ok()?;
+    let owned = body.clone();
+    let stream = futures_util::stream::once(async move { Ok::<_, std::io::Error>(owned) });
+    let mut multipart = multer::Multipart::new(stream, boundary);
+    let mut content = String::new();
+    let mut model = None;
+    let mut conversation_id = None;
+    let mut temperature = None;
+    let mut max_tokens = None;
+    let mut web_search = false;
+    let mut image = None;
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(_) => return None,
+        };
+        let name = field.name().unwrap_or_default().to_string();
+        match name.as_str() {
+            "image" if field.file_name().is_some_and(|name| !name.is_empty()) => {
+                let bytes = field.bytes().await.ok()?;
+                if bytes.len() > VLM_MAX_IMAGE_UPLOAD_BYTES {
+                    return Some(Err(chat_error(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        &format!(
+                            "file exceeds {} byte limit",
+                            with_thousands_separators(VLM_MAX_IMAGE_UPLOAD_BYTES)
+                        ),
+                    )));
+                }
+                if !bytes.is_empty() {
+                    image = Some(bytes);
+                }
+            }
+            "content" => content = field.text().await.ok()?.trim().to_string(),
+            "model" => model = field.text().await.ok(),
+            "conversation_id" => conversation_id = field.text().await.ok()?.trim().parse().ok(),
+            "temperature" => temperature = field.text().await.ok()?.trim().parse().ok(),
+            "max_tokens" => max_tokens = field.text().await.ok()?.trim().parse().ok(),
+            "web_search" => {
+                web_search = matches!(
+                    field.text().await.ok()?.to_lowercase().as_str(),
+                    "true" | "1" | "yes"
+                )
+            }
+            // Python collects extra_context but never passes it to the VLM branch.
+            "system_prompt" | "extra_context" | "file_id" | "image" => {}
+            _ => {}
+        }
+    }
+
+    let image = image?;
+    if web_search {
+        return None;
+    }
+    if content.is_empty() {
+        return Some(Err(chat_error(
+            StatusCode::BAD_REQUEST,
+            "content is required",
+        )));
+    }
+    let model = model
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| defaults.model.clone());
+    let vlm_model = defaults.vlm_model.clone();
+    if invalid_model_name(&model) || invalid_model_name(&vlm_model) {
+        return Some(Err(chat_error(
+            StatusCode::BAD_REQUEST,
+            "invalid model name",
+        )));
+    }
+    use base64::Engine as _;
+    Some(Ok(ChatVlmRequest {
+        content,
+        model,
+        vlm_model,
+        conversation_id,
+        temperature: temperature.unwrap_or(defaults.temperature),
+        max_tokens: max_tokens.unwrap_or(defaults.max_tokens),
+        frame_b64: base64::engine::general_purpose::STANDARD.encode(image),
+    }))
 }
 
 /// Attempts the native yu-infer path for a JSON chat/send request. Returns
@@ -541,51 +783,12 @@ async fn chat_send_native(
         v.as_i64()
             .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
     });
-    let conv_id = match requested_conv_id {
-        Some(id) => {
-            let exists: Option<i64> =
-                sqlx::query_scalar("SELECT id FROM chat_conversations WHERE id = ? AND source = ?")
-                    .bind(id)
-                    .bind(SOURCE)
-                    .fetch_optional(&state.db_read)
-                    .await
-                    .ok()
-                    .flatten();
-            match exists {
-                Some(id) => id,
-                None => {
-                    return Some(
-                        (
-                            StatusCode::NOT_FOUND,
-                            Json(json!({"status": "error", "message": "Conversation not found"})),
-                        )
-                            .into_response(),
-                    );
-                }
-            }
-        }
-        None => match create_conversation_row(state, &model).await {
-            Ok(id) => id,
-            Err(error) => return Some(internal_error(error)),
-        },
-    };
-
-    if let Err(error) = append_message(state, conv_id, "user", &content).await {
-        return Some(internal_error(error));
-    }
-
-    let user_message_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM chat_messages WHERE conversation_id = ? AND role = 'user'",
-    )
-    .bind(conv_id)
-    .fetch_one(&state.db_read)
-    .await
-    .unwrap_or(0);
-    let new_title = if user_message_count == 1 {
-        Some(auto_title(state, conv_id, &content).await)
-    } else {
-        None
-    };
+    let (conv_id, new_title) =
+        match prepare_chat_conversation(state, requested_conv_id, &model, &content, &content).await
+        {
+            Ok(result) => result,
+            Err(response) => return Some(response),
+        };
 
     let system_prompt = value
         .get("system_prompt")
@@ -621,7 +824,7 @@ async fn chat_send_native(
             Some(hef_path),
             messages,
             Vec::new(),
-            None,
+            Some(crate::infer_client::DEFAULT_GENERATE_TIMEOUT_MS),
             temperature,
             None,
             None,
@@ -650,7 +853,58 @@ async fn chat_send_native(
         upstream,
         conv_id,
         new_title,
+        false,
     ))
+}
+
+async fn prepare_chat_conversation(
+    state: &SharedState,
+    requested_conv_id: Option<i64>,
+    model: &str,
+    message_content: &str,
+    title_content: &str,
+) -> Result<(i64, Option<String>), Response> {
+    let conv_id = match requested_conv_id {
+        Some(id) => {
+            let exists: Option<i64> =
+                sqlx::query_scalar("SELECT id FROM chat_conversations WHERE id = ? AND source = ?")
+                    .bind(id)
+                    .bind(SOURCE)
+                    .fetch_optional(&state.db_read)
+                    .await
+                    .ok()
+                    .flatten();
+            match exists {
+                Some(id) => id,
+                None => {
+                    return Err(chat_error(StatusCode::NOT_FOUND, "Conversation not found"));
+                }
+            }
+        }
+        None => match create_conversation_row(state, model).await {
+            Ok(id) => id,
+            Err(error) => return Err(internal_error(error)),
+        },
+    };
+
+    if let Err(error) = append_message(state, conv_id, "user", message_content).await {
+        return Err(internal_error(error));
+    }
+
+    let user_message_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM chat_messages WHERE conversation_id = ? AND role = 'user'",
+    )
+    .bind(conv_id)
+    .fetch_one(&state.db_read)
+    .await
+    .unwrap_or(0);
+    let new_title = if user_message_count == 1 {
+        Some(auto_title(state, conv_id, title_content).await)
+    } else {
+        None
+    };
+
+    Ok((conv_id, new_title))
 }
 
 async fn create_conversation_row(state: &SharedState, model: &str) -> Result<i64, sqlx::Error> {
@@ -683,11 +937,16 @@ fn chat_send_sse_response(
     upstream: reqwest::Response,
     conv_id: i64,
     title: Option<String>,
+    vlm: bool,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let _ = tx.send(format!(
         "data: {}\n\n",
-        json!({"conversation_id": conv_id, "title": title})
+        if vlm {
+            json!({"conversation_id": conv_id, "title": title, "vlm": true})
+        } else {
+            json!({"conversation_id": conv_id, "title": title})
+        }
     ));
 
     tokio::spawn(async move {
@@ -765,7 +1024,10 @@ mod tests {
     };
     use std::{
         collections::{HashMap, HashSet},
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
     };
 
     async fn test_state() -> (SharedState, TempDir) {
@@ -851,6 +1113,8 @@ mod tests {
                     .expect("clip index test default"),
             ),
             clip_indexer: std::sync::Arc::new(crate::routes::clip_indexer::ClipIndexer::new()),
+            caption_runner: std::sync::Arc::new(crate::routes::caption_runner::CaptionRunner::new()),
+            s2t_runner: std::sync::Arc::new(crate::routes::s2t_runner::S2tRunner::new()),
             clip_runtime_cache: crate::state::TtlCache::new(crate::state::CLIP_RUNTIME_CACHE_TTL),
             inference_client: reqwest::Client::new(),
             python_client: reqwest::Client::new(),
@@ -870,7 +1134,7 @@ mod tests {
             version: "0.0.0".to_string(),
             start_time: std::time::Instant::now(),
             scheduler_state: std::sync::OnceLock::new(),
-            wd_infer: std::sync::OnceLock::new(),
+            wd_infer: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             infer_client: base_url.map(|url| {
                 crate::infer_client::InferClient::new(url.to_string(), "e2e-test-token".to_string())
             }),
@@ -1348,5 +1612,251 @@ mod tests {
             text2.to_lowercase().contains("teal"),
             "expected turn 2 to recall turn 1's context, got: {text2}"
         );
+    }
+
+    fn chat_multipart_body(parts: &[(&str, Option<&str>, &[u8])]) -> Bytes {
+        let mut body = Vec::new();
+        for (name, filename, value) in parts {
+            body.extend_from_slice(b"--chat-boundary\r\nContent-Disposition: form-data; name=\"");
+            body.extend_from_slice(name.as_bytes());
+            body.extend_from_slice(b"\"");
+            if let Some(filename) = filename {
+                body.extend_from_slice(b"; filename=\"");
+                body.extend_from_slice(filename.as_bytes());
+                body.extend_from_slice(b"\"");
+            }
+            body.extend_from_slice(b"\r\n\r\n");
+            body.extend_from_slice(value);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(b"--chat-boundary--\r\n");
+        Bytes::from(body)
+    }
+
+    fn chat_multipart_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("multipart/form-data; boundary=chat-boundary"),
+        );
+        headers
+    }
+
+    fn chat_defaults() -> ChatMultipartDefaults {
+        ChatMultipartDefaults {
+            model: "qwen3-1.7b-instruct".to_string(),
+            vlm_model: "qwen2-vl-2b-instruct".to_string(),
+            temperature: 0.7,
+            max_tokens: 512,
+        }
+    }
+
+    #[tokio::test]
+    async fn hailo_genai_chat_multipart_maps_image_request() {
+        let body = chat_multipart_body(&[
+            ("content", None, b"describe this"),
+            ("model", None, b"qwen3-1.7b-instruct"),
+            ("vlm_model", None, b"ignored-client-vlm"),
+            ("temperature", None, b"0.25"),
+            ("max_tokens", None, b"77"),
+            ("image", Some("cat.png"), b"image-bytes"),
+        ]);
+        let request = parse_chat_multipart(&chat_multipart_headers(), &body, &chat_defaults())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.content, "describe this");
+        assert_eq!(request.model, "qwen3-1.7b-instruct");
+        assert_eq!(request.vlm_model, "qwen2-vl-2b-instruct");
+        assert_eq!(request.temperature, 0.25);
+        assert_eq!(request.max_tokens, 77);
+        assert_eq!(request.frame_b64, "aW1hZ2UtYnl0ZXM=");
+    }
+
+    #[tokio::test]
+    async fn hailo_genai_chat_multipart_defaults_and_defers_match_python() {
+        let defaults = ChatMultipartDefaults {
+            model: "configured-llm".to_string(),
+            vlm_model: "configured-vlm".to_string(),
+            temperature: 0.3,
+            max_tokens: 321,
+        };
+        let image =
+            chat_multipart_body(&[("content", None, b"hi"), ("image", Some("a.png"), b"bytes")]);
+        let request = parse_chat_multipart(&chat_multipart_headers(), &image, &defaults)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.model, "configured-llm");
+        assert_eq!(request.vlm_model, "configured-vlm");
+        assert_eq!(request.temperature, 0.3);
+        assert_eq!(request.max_tokens, 321);
+
+        let no_image = chat_multipart_body(&[("content", None, b"hi"), ("file_id", None, b"1")]);
+        assert!(
+            parse_chat_multipart(&chat_multipart_headers(), &no_image, &defaults)
+                .await
+                .is_none()
+        );
+        let searched = chat_multipart_body(&[
+            ("content", None, b"hi"),
+            ("web_search", None, b"true"),
+            ("image", Some("a.png"), b"bytes"),
+        ]);
+        assert!(
+            parse_chat_multipart(&chat_multipart_headers(), &searched, &defaults)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn hailo_genai_chat_multipart_rejects_invalid_input() {
+        for (field, value) in [("content", b"   ".as_slice()), ("model", b"../../bad")] {
+            let body = chat_multipart_body(&[
+                (
+                    "content",
+                    None,
+                    if field == "content" { value } else { b"hi" },
+                ),
+                (field, None, value),
+                ("image", Some("a.png"), b"bytes"),
+            ]);
+            let response = parse_chat_multipart(&chat_multipart_headers(), &body, &chat_defaults())
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let oversized = vec![0; VLM_MAX_IMAGE_UPLOAD_BYTES + 1];
+        let body = chat_multipart_body(&[
+            ("content", None, b"hi"),
+            ("image", Some("big.png"), &oversized),
+        ]);
+        let response = parse_chat_multipart(&chat_multipart_headers(), &body, &chat_defaults())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let traversal_defaults = ChatMultipartDefaults {
+            vlm_model: "../evil".to_string(),
+            ..chat_defaults()
+        };
+        let body =
+            chat_multipart_body(&[("content", None, b"hi"), ("image", Some("a.png"), b"bytes")]);
+        let response = parse_chat_multipart(&chat_multipart_headers(), &body, &traversal_defaults)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn hailo_genai_chat_multipart_streams_vlm_only_and_persists_image_message() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(Mutex::new(None));
+        let app = axum::Router::new().route(
+            "/v1/infer/vlm/generate/stream",
+            axum::routing::post({
+                let requests = requests.clone();
+                let captured = captured.clone();
+                move |Json(payload): Json<Value>| {
+                    let requests = requests.clone();
+                    let captured = captured.clone();
+                    async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        *captured.lock().unwrap() = Some(payload);
+                        "data: {\"token\":\"ok\"}\n\ndata: {\"done\":true,\"full_text\":\"done\"}\n\n"
+                    }
+                }
+            }),
+        );
+        let _server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (state, _temp) = test_state_with_infer_client(Some(&format!("http://{address}"))).await;
+        let request = ChatVlmRequest {
+            content: "describe".to_string(),
+            model: "llm-model".to_string(),
+            vlm_model: "vlm-model".to_string(),
+            conversation_id: None,
+            temperature: 0.4,
+            max_tokens: 12,
+            frame_b64: "aW1hZ2U=".to_string(),
+        };
+        let response = chat_send_multipart_with_hef(
+            &state,
+            state.infer_client.as_ref().unwrap(),
+            request,
+            tempfile::NamedTempFile::new()
+                .unwrap()
+                .path()
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .await;
+        let text = String::from_utf8_lossy(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .into_owned();
+        assert!(text.contains("\"vlm\":true"));
+        let payload = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(payload["frames"], json!(["aW1hZ2U="]));
+        assert!(payload["system_prompt"].is_null());
+        assert!(payload.get("messages").is_none());
+        let message: String = sqlx::query_scalar(
+            "SELECT content FROM chat_messages WHERE role = 'user' ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&state.db_read)
+        .await
+        .unwrap();
+        assert_eq!(message, "[Image] describe");
+
+        let missing =
+            validate_chat_vlm_hef("missing-vlm", "definitely-missing.hef".to_string()).unwrap_err();
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn hailo_genai_chat_resolves_the_configured_vlm_model() {
+        let request = ChatVlmRequest {
+            content: "hi".to_string(),
+            model: "configured-llm".to_string(),
+            vlm_model: "configured-vlm".to_string(),
+            conversation_id: None,
+            temperature: 0.7,
+            max_tokens: 512,
+            frame_b64: String::new(),
+        };
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_string_lossy().into_owned();
+        let resolved = resolve_chat_request_vlm_hef(&request, |model| {
+            assert_eq!(model, "configured-vlm");
+            validate_chat_vlm_hef(model, path.clone())
+        })
+        .unwrap();
+        assert_eq!(resolved, path);
+    }
+
+    #[test]
+    fn hailo_genai_chat_send_route_has_body_limit() {
+        let source = include_str!("../main.rs")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let route = source
+            .split("/ext/hailo-genai/api/chat/send")
+            .nth(1)
+            .unwrap_or_default()
+            .split("\n        .route(")
+            .next()
+            .unwrap_or_default();
+        assert!(route.contains("DefaultBodyLimit::max"));
     }
 }

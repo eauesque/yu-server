@@ -162,6 +162,10 @@ pub struct AppState {
     pub clip_index: Arc<crate::routes::clip_index::ClipIndex>,
     /// Background job state for native CLIP image indexing.
     pub clip_indexer: Arc<crate::routes::clip_indexer::ClipIndexer>,
+    /// Background job state for native VLM captioning.
+    pub caption_runner: Arc<crate::routes::caption_runner::CaptionRunner>,
+    /// Background job state for native speech2text batch transcription.
+    pub s2t_runner: Arc<crate::routes::s2t_runner::S2tRunner>,
     pub inference_client: reqwest::Client,
     /// Gateway API keys (`gateway.auth.api_keys`), decrypted once at startup.
     /// Separate from the app's own `api_keys`; see [`crate::auth::gateway`].
@@ -192,9 +196,13 @@ pub struct AppState {
     pub version: String,
     pub start_time: std::time::Instant,
     pub scheduler_state: std::sync::OnceLock<Arc<crate::scheduler::SchedulerState>>,
-    pub wd_infer: std::sync::OnceLock<Arc<infer_core::WdInferEngine>>,
+    /// Loaded WD engines, keyed by cache directory plus a fingerprint of
+    /// the resolved profile. Keyed rather than a single slot because the
+    /// engine holds the vocabulary and preprocess recipe, so two profiles
+    /// over the same directory are two different engines.
+    pub wd_infer: Arc<std::sync::Mutex<HashMap<String, Arc<infer_core::WdInferEngine>>>>,
     pub infer_client: Option<crate::infer_client::InferClient>,
-    pub infer_child: Option<std::sync::Mutex<std::process::Child>>,
+    pub infer_child: Option<Arc<std::sync::Mutex<std::process::Child>>>,
     pub scan_manager: std::sync::OnceLock<Arc<crate::scan_manager::ScanManager>>,
     /// Native stream owners are initialized before the Python-forwarded routes are served.
     pub hailo_yolo_stream: Option<Arc<crate::routes::hailo_yolo_stream::registry::StreamState>>,
@@ -223,7 +231,7 @@ impl AppState {
         db_read: SqlitePool,
         log_ring: Arc<LogRingBuffer>,
         infer_client: Option<crate::infer_client::InferClient>,
-        infer_child: Option<std::sync::Mutex<std::process::Child>>,
+        infer_child: Option<Arc<std::sync::Mutex<std::process::Child>>>,
     ) -> Self {
         let (vectors_db, vectors_db_read) = open_vectors_pools(&config.db_path, None)
             .await
@@ -255,7 +263,7 @@ impl AppState {
         vectors_db_read: SqlitePool,
         log_ring: Arc<LogRingBuffer>,
         infer_client: Option<crate::infer_client::InferClient>,
-        infer_child: Option<std::sync::Mutex<std::process::Child>>,
+        infer_child: Option<Arc<std::sync::Mutex<std::process::Child>>>,
     ) -> Self {
         let inference_client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
@@ -362,6 +370,8 @@ impl AppState {
             vectors_db_read,
             clip_index,
             clip_indexer: Arc::new(crate::routes::clip_indexer::ClipIndexer::new()),
+            caption_runner: Arc::new(crate::routes::caption_runner::CaptionRunner::new()),
+            s2t_runner: Arc::new(crate::routes::s2t_runner::S2tRunner::new()),
             inference_client,
             gateway_keys,
             gateway_loopback_bypass,
@@ -401,7 +411,7 @@ impl AppState {
             version,
             start_time: std::time::Instant::now(),
             scheduler_state: std::sync::OnceLock::new(),
-            wd_infer: std::sync::OnceLock::new(),
+            wd_infer: Arc::new(std::sync::Mutex::new(HashMap::new())),
             infer_client,
             infer_child,
             scan_manager: std::sync::OnceLock::new(),

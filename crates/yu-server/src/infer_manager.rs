@@ -1,6 +1,8 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub fn resolve_vdevice_group_id(config: &serde_json::Value, env_group_id: Option<&str>) -> String {
@@ -149,6 +151,103 @@ pub async fn spawn_with_restart(
     None
 }
 
+/// Polls the yu-infer sidecar's liveness and respawns it if it exits while
+/// the server is running. `spawn_with_restart` only retries at startup; once
+/// healthy, nothing previously watched the child, so a crash (OOM-kill,
+/// panic, segfault — anything unrelated to the known CMA non-reclaim issue)
+/// left every subsequent request failing until `yu-server` itself restarted.
+#[allow(clippy::too_many_arguments)]
+pub async fn supervise(
+    child: Arc<Mutex<Child>>,
+    binary_path: PathBuf,
+    port: u16,
+    scan_roots: Vec<PathBuf>,
+    auth_token: String,
+    instance_id: String,
+    vdevice_group_id: String,
+    wd_cache_dir: PathBuf,
+    clip_text_model_dir: PathBuf,
+    stop: Arc<AtomicBool>,
+) {
+    let poll_interval = Duration::from_secs(3);
+    loop {
+        tokio::time::sleep(poll_interval).await;
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+
+        let exit_status = {
+            let mut guard = child
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match guard.try_wait() {
+                Ok(status) => status,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to poll yu-infer sidecar status");
+                    None
+                }
+            }
+        };
+        let Some(status) = exit_status else {
+            continue;
+        };
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+
+        tracing::error!(%status, "yu-infer sidecar exited unexpectedly; respawning");
+        match spawn_with_restart(
+            &binary_path,
+            port,
+            &scan_roots,
+            &auth_token,
+            &instance_id,
+            &vdevice_group_id,
+            &wd_cache_dir,
+            &clip_text_model_dir,
+            5,
+        )
+        .await
+        {
+            Some(mut new_child) => {
+                // The `stop` recheck and the install must happen under the
+                // same lock acquisition as shutdown's own lock-and-terminate
+                // step (see the graceful-shutdown closure in main.rs). A
+                // check-then-lock sequence leaves a window where shutdown can
+                // set `stop`, terminate whatever child is currently installed,
+                // and return — all before this task gets to install
+                // `new_child`, orphaning it. Locking first and checking
+                // `stop` while still holding the lock makes the two mutually
+                // exclusive: either shutdown's terminate call happens first
+                // (and sees the old child, or an already-installed
+                // `new_child` if this task ran first), or this task's
+                // recheck happens first and sees `stop` already set, in
+                // which case it discards `new_child` instead of installing
+                // it.
+                let mut guard = child
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if stop.load(Ordering::Acquire) {
+                    drop(guard);
+                    terminate_child(&mut new_child);
+                    let _ = new_child.wait();
+                    tracing::info!(
+                        "yu-infer sidecar respawn completed after shutdown was requested; terminated the new child instead of installing it"
+                    );
+                    return;
+                }
+                *guard = new_child;
+                tracing::info!("yu-infer sidecar respawned after crash");
+            }
+            None => {
+                tracing::error!(
+                    "failed to respawn yu-infer sidecar after crash; will retry on next poll"
+                );
+            }
+        }
+    }
+}
+
 pub async fn wait_for_healthy(
     base_url: &str,
     expected_instance_id: &str,
@@ -264,6 +363,44 @@ mod tests {
         .await;
 
         assert!(child.is_none());
+    }
+
+    #[tokio::test]
+    async fn supervise_detects_crash_and_attempts_respawn_without_panicking() {
+        // A child that exits almost immediately stands in for a crashed sidecar.
+        let dead_child = Command::new("true")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn `true`");
+        let child = Arc::new(Mutex::new(dead_child));
+        let stop = Arc::new(AtomicBool::new(false));
+        let missing_binary =
+            std::env::temp_dir().join(format!("yu-infer-missing-{}", std::process::id()));
+
+        let stop_clone = Arc::clone(&stop);
+        let supervisor = tokio::spawn(supervise(
+            Arc::clone(&child),
+            missing_binary,
+            18771,
+            vec![],
+            "tok123".to_string(),
+            "inst-1".to_string(),
+            "YU_SHARED".to_string(),
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+            stop_clone,
+        ));
+
+        // Give the first poll tick time to observe the exit and attempt (and
+        // fail, since the respawn binary does not exist) a respawn.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        stop.store(true, Ordering::Release);
+
+        tokio::time::timeout(Duration::from_secs(5), supervisor)
+            .await
+            .expect("supervisor task did not stop after the stop flag was set")
+            .expect("supervisor task panicked");
     }
 
     #[tokio::test]

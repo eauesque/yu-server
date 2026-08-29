@@ -2,11 +2,34 @@ use serde_json::json;
 
 use infer_core::yolo_postprocess::Detection;
 
+/// Default `timeout_ms` for LLM/VLM generate calls when the caller doesn't
+/// override it. yu-infer's own default (30s) is tuned for a healthy device;
+/// under low `CmaFree` a cold model load alone can take 60-100s+ even though
+/// the request eventually succeeds (measured on real Hailo-10H hardware,
+/// TODO.md "低 CmaFree 下では...HAILO_TIMEOUT"), so 30s spuriously surfaces
+/// HAILO_TIMEOUT for requests that would otherwise complete fine.
+pub const DEFAULT_GENERATE_TIMEOUT_MS: u32 = 120_000;
+
 #[derive(Clone)]
 pub struct InferClient {
     base_url: String,
     auth_token: String,
     http: reqwest::Client,
+}
+
+/// One transcribed segment, matching yu-infer's `{"text","start","end"}`
+/// response shape (mirrors the SDK's `Speech2Text::SegmentInfo`).
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+pub struct S2tSegment {
+    pub text: String,
+    pub start: f32,
+    pub end: f32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct S2tTranscription {
+    pub text: String,
+    pub segments: Vec<S2tSegment>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -17,6 +40,8 @@ pub enum InferClientError {
     BadStatus { status: u16, body: String },
     #[error("invalid yu-infer YOLO response: {0}")]
     InvalidYoloResponse(String),
+    #[error("invalid yu-infer response: {0}")]
+    InvalidResponse(String),
 }
 
 impl InferClient {
@@ -38,17 +63,26 @@ impl InferClient {
         model_id: &str,
         general_thr: f32,
         character_thr: f32,
+        profile: Option<&serde_json::Value>,
+        model_subdir: Option<&str>,
     ) -> Result<serde_json::Value, InferClientError> {
+        let mut payload = json!({
+            "path": path,
+            "model_id": model_id,
+            "general_thr": general_thr,
+            "character_thr": character_thr,
+        });
+        if let Some(profile) = profile {
+            payload["profile"] = profile.clone();
+        }
+        if let Some(subdir) = model_subdir.filter(|s| !s.is_empty()) {
+            payload["model_subdir"] = json!(subdir);
+        }
         let response = self
             .http
             .post(format!("{}/v1/infer/wd", self.base_url))
             .bearer_auth(&self.auth_token)
-            .json(&json!({
-                "path": path,
-                "model_id": model_id,
-                "general_thr": general_thr,
-                "character_thr": character_thr,
-            }))
+            .json(&payload)
             .send()
             .await?;
 
@@ -171,6 +205,48 @@ impl InferClient {
         self.json_response(response).await
     }
 
+    /// Transcribes 16 kHz mono WAV audio (already base64-encoded by the
+    /// caller) via yu-infer's `/v1/infer/speech2text/transcribe`, which
+    /// itself decodes/resamples the WAV -- callers do not need to touch PCM
+    /// samples directly.
+    pub async fn speech2text_transcribe(
+        &self,
+        hef_path: Option<String>,
+        audio_base64: String,
+        language: Option<String>,
+        timeout_ms: u32,
+    ) -> Result<S2tTranscription, InferClientError> {
+        let response = self
+            .http
+            .post(self.endpoint("/v1/infer/speech2text/transcribe"))
+            .bearer_auth(&self.auth_token)
+            .json(&json!({
+                "hef_path": hef_path,
+                "audio_base64": audio_base64,
+                "language": language,
+                "timeout_ms": timeout_ms,
+            }))
+            .send()
+            .await?;
+        let value = self.json_response(response).await?;
+        let data = value.get("data").unwrap_or(&value);
+        let text = data
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let segments = data
+            .get("segments")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error: serde_json::Error| {
+                InferClientError::InvalidResponse(format!("malformed segments: {error}"))
+            })?
+            .unwrap_or_default();
+        Ok(S2tTranscription { text, segments })
+    }
+
     pub async fn llm_tokenize(
         &self,
         hef_path: Option<String>,
@@ -209,6 +285,34 @@ impl InferClient {
             .await?;
 
         self.json_response(response).await
+    }
+
+    pub async fn vlm_generate(
+        &self,
+        hef_path: String,
+        prompt: String,
+        frames: Vec<String>,
+        timeout_ms: u32,
+    ) -> Result<String, InferClientError> {
+        let response = self
+            .http
+            .post(self.endpoint("/v1/infer/vlm/generate"))
+            .bearer_auth(&self.auth_token)
+            .json(&json!({
+                "hef_path": hef_path,
+                "prompt": prompt,
+                "frames": frames,
+                "timeout_ms": timeout_ms,
+            }))
+            .send()
+            .await?;
+        self.json_response(response)
+            .await?
+            .get("data")
+            .and_then(|data| data.get("text"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| InferClientError::InvalidResponse("missing data.text".to_string()))
     }
 
     /// Starts an LLM streaming generation and returns the raw upstream

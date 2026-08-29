@@ -53,6 +53,7 @@ impl OpenAiCompatEngine {
         messages: &serde_json::Value,
         max_tokens: u32,
         use_schema: bool,
+        ctx: &AnalyzeContext,
     ) -> Result<String, EngineError> {
         let base = self.effective_base();
         let client = build_pinned_client(&base, self.is_custom_compat(), TIMEOUT).await?;
@@ -72,12 +73,12 @@ impl OpenAiCompatEngine {
                 token_key: max_tokens,
             });
             if with_schema {
-                payload["response_format"] = json!({
+                let schema = ctx.json_schema.clone().unwrap_or_else(
+                    || serde_json::json!({"type": "object", "additionalProperties": true}),
+                );
+                payload["response_format"] = serde_json::json!({
                     "type": "json_schema",
-                    "json_schema": {
-                        "name": "image_analysis",
-                        "schema": {"type": "object", "additionalProperties": true},
-                    },
+                    "json_schema": {"name": "image_analysis", "schema": schema},
                 });
             }
             let mut request = client
@@ -167,7 +168,7 @@ impl AnalysisEngine for OpenAiCompatEngine {
                 {"type": "image_url", "image_url": {"url": format!("data:{media_type};base64,{image_data}"), "detail": "low"}},
                 {"type": "text", "text": prompt},
             ]},
-        ]), 2000, true).await?;
+        ]), 2000, true, ctx).await?;
         Ok(if ctx.mode == AnalyzeMode::Ocr {
             AnalysisResult {
                 raw_response: raw,
@@ -191,7 +192,14 @@ impl AnalysisEngine for OpenAiCompatEngine {
         if prompts.is_empty() {
             return Ok(json!({"error": "No prompts to analyze"}));
         }
-        let raw = self.call_api(&json!([{"role": "user", "content": prompts::build_trends_prompt(&prompts, &self.language)}]), 3000, true).await?;
+        let ctx = AnalyzeContext {
+            existing_tags: vec![],
+            existing_prompt: None,
+            mode: AnalyzeMode::Full,
+            language: self.language.clone(),
+            json_schema: None,
+        };
+        let raw = self.call_api(&json!([{"role": "user", "content": prompts::build_trends_prompt(&prompts, &self.language)}]), 3000, true, &ctx).await?;
         Ok(parse_trends_result(&raw))
     }
 
@@ -242,6 +250,16 @@ mod tests {
     use super::*;
     use axum::{extract::Json, http::StatusCode, response::IntoResponse, routing::post, Router};
 
+    fn test_context() -> AnalyzeContext {
+        AnalyzeContext {
+            existing_tags: vec![],
+            existing_prompt: None,
+            mode: AnalyzeMode::Full,
+            language: "ja".into(),
+            json_schema: None,
+        }
+    }
+
     #[tokio::test]
     async fn grammar_error_retries_without_schema_once() {
         let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
@@ -281,7 +299,12 @@ mod tests {
             language: "ja".into(),
         };
         assert!(engine
-            .call_api(&json!([{"role": "user", "content": "x"}]), 2000, true)
+            .call_api(
+                &json!([{"role": "user", "content": "x"}]),
+                2000,
+                true,
+                &test_context()
+            )
             .await
             .unwrap()
             .contains("cat"));
@@ -307,7 +330,7 @@ mod tests {
             language: "ja".into(),
         };
         assert!(engine
-            .call_api(&json!([]), 2000, true)
+            .call_api(&json!([]), 2000, true, &test_context())
             .await
             .unwrap_err()
             .to_string()
@@ -358,7 +381,12 @@ mod tests {
             language: "ja".into(),
         };
         assert!(engine
-            .call_api(&json!([{"role": "user", "content": "x"}]), 2000, true)
+            .call_api(
+                &json!([{"role": "user", "content": "x"}]),
+                2000,
+                true,
+                &test_context()
+            )
             .await
             .unwrap()
             .contains("dog"));

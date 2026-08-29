@@ -126,7 +126,7 @@ impl FrameSource for SyntheticSource {
                 let index = *next;
                 let base = (index as u8).wrapping_mul(17);
                 let mut bytes = vec![base; frame_len];
-                for pixel in bytes.chunks_exact_mut(3) {
+                for pixel in bytes.as_chunks_mut::<3>().0 {
                     pixel[1] = base.wrapping_add(1);
                     pixel[2] = base.wrapping_add(2);
                 }

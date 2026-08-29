@@ -8,11 +8,21 @@ use std::time::Duration;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 
 pub use db::file::{upsert_file, FileRow, UpsertFileParams};
+pub use db::genesis::{create_fresh_database, is_sqlite_uri, GenesisOutcome};
 pub use db::mark_deleted;
-pub use db::migrate::apply_pending_rust_migrations;
+pub use db::migrate::{apply_pending_rust_migrations, apply_pending_rust_migrations_with_data_dir};
 pub use db::CURRENT_PARSER_VERSION;
 pub use db::{connect, connect_readonly};
 pub use error::TagdbError;
+
+/// The Python schema version a database must be at for this binary to use it.
+///
+/// Python owns `schema_version` and its migration chain; Rust never writes that
+/// table. This constant is the version the generated genesis SQL produces and
+/// the version the standalone start-up gate compares against. It is pinned to
+/// `core/schema_core/schema_constants.py::CURRENT_SCHEMA_VERSION` by
+/// `scripts/pre_push_check.py`, so the two cannot drift apart silently.
+pub const EXPECTED_PYTHON_SCHEMA_VERSION: i64 = 87;
 
 /// Connect to a SQLCipher-encrypted database, mirroring the Python
 /// core/services_core/db_cipher.py behavior (key + mmap_size=0).

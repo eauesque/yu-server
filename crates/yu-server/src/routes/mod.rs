@@ -11,6 +11,7 @@ pub mod analysis_servers;
 pub mod annotations;
 pub mod auto_stubs;
 pub mod bridge_save;
+pub mod caption_runner;
 pub mod chatlog;
 pub mod clip_index;
 pub mod clip_indexer;
@@ -37,6 +38,7 @@ pub mod hailo_genai_chat;
 pub(crate) mod hailo_model_download;
 pub(crate) mod hailo_model_registry;
 pub mod hailo_tagger;
+pub(crate) mod hailo_web_search;
 pub(crate) mod hailo_yolo_detect;
 pub(crate) mod hailo_yolo_labels;
 pub(crate) mod hailo_yolo_postprocess;
@@ -60,17 +62,21 @@ pub mod mcp_client;
 pub mod mcp_native;
 pub mod md_viewer;
 pub mod mdns;
+pub mod mesh_inference;
 pub mod migration_stats;
 pub mod misc_admin;
 pub mod monthly_report;
 pub mod nai_bridge;
 pub mod ocr;
+pub mod ocr_jobs;
 pub mod pages;
 pub mod prompt_library;
 pub mod prompt_sim;
 pub mod prompt_syntax;
 pub mod ratings;
 pub mod recipe;
+pub mod s2t;
+pub mod s2t_runner;
 pub mod scan_admin;
 pub mod scan_errors;
 pub mod scan_history;
@@ -114,6 +120,8 @@ pub mod webhook;
 pub(crate) mod xmp_data;
 pub mod zip_files;
 
+#[cfg(test)]
+mod genesis_lan_cowork_convergence_tests;
 #[cfg(test)]
 mod lan_cowork_split_integration_tests;
 

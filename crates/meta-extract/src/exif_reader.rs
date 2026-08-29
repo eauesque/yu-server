@@ -42,8 +42,10 @@ fn read_exif_tags_from_reader(reader: &mut (impl BufRead + Seek)) -> HashMap<Str
 fn decode_user_comment(data: &[u8]) -> String {
     if let Some(data) = data.strip_prefix(b"UNICODE\0") {
         let units = data
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| u16::from_le_bytes(pair))
             .collect::<Vec<_>>();
         return String::from_utf16_lossy(&units)
             .trim_end_matches('\0')

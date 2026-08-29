@@ -30,11 +30,15 @@ impl OllamaEngine {
             || message.contains("Cannot connect")
     }
 
-    async fn call_api_once(&self, messages: &serde_json::Value) -> Result<String, EngineError> {
+    async fn call_api_once(
+        &self,
+        messages: &serde_json::Value,
+        json_schema: Option<&serde_json::Value>,
+    ) -> Result<String, EngineError> {
         let client = build_pinned_client(&self.base_url, true, TIMEOUT).await?;
         let response = client
             .post(format!("{}/api/chat", self.base_url.trim_end_matches('/')))
-            .json(&json!({"model": self.model, "messages": messages, "stream": true}))
+            .json(&build_request_body(&self.model, messages, json_schema))
             .send()
             .await
             .map_err(|error| Self::classify_transport_error(&error, &self.base_url))?;
@@ -93,10 +97,14 @@ impl OllamaEngine {
         }
     }
 
-    async fn call_api(&self, messages: &serde_json::Value) -> Result<String, EngineError> {
+    async fn call_api(
+        &self,
+        messages: &serde_json::Value,
+        json_schema: Option<&serde_json::Value>,
+    ) -> Result<String, EngineError> {
         let mut last_error = None;
         for attempt in 0..=MAX_RETRIES {
-            match self.call_api_once(messages).await {
+            match self.call_api_once(messages, json_schema).await {
                 Ok(response) => return Ok(response),
                 Err(error) if Self::is_non_retryable(&error.to_string()) => return Err(error),
                 Err(error) => {
@@ -129,7 +137,7 @@ impl AnalysisEngine for OllamaEngine {
             {"role": "system", "content": system},
             {"role": "user", "content": prompts::build_image_prompt(&ctx.existing_tags, ctx.existing_prompt.as_deref(), &ctx.language, ctx.mode), "images": [image_data]},
         ]);
-        let raw = self.call_api(&messages).await?;
+        let raw = self.call_api(&messages, ctx.json_schema.as_ref()).await?;
         if ctx.mode == AnalyzeMode::Ocr {
             return Ok(AnalysisResult {
                 raw_response: raw,
@@ -152,13 +160,29 @@ impl AnalysisEngine for OllamaEngine {
         if prompt_texts.is_empty() {
             return Ok(json!({"error": "No prompts to analyze"}));
         }
-        let raw = self.call_api(&json!([{"role": "user", "content": prompts::build_trends_prompt(&prompt_texts, &self.language)}])).await?;
+        let raw = self.call_api(&json!([{"role": "user", "content": prompts::build_trends_prompt(&prompt_texts, &self.language)}]), None).await?;
         Ok(parse_trends_result(&raw))
     }
 
     fn name(&self) -> String {
         format!("Ollama Vision ({})", self.model)
     }
+}
+
+/// Build the /api/chat payload. Split out so the schema wiring can be tested
+/// without a live Ollama: the two call sites differ only in whether a schema
+/// is present.
+fn build_request_body(
+    model: &str,
+    messages: &serde_json::Value,
+    json_schema: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut payload = json!({"model": model, "messages": messages, "stream": true});
+    if let Some(schema) = json_schema {
+        // Ollama enforces this at token-generation time; it is not a hint.
+        payload["format"] = schema.clone();
+    }
+    payload
 }
 
 fn encode_image_for_ollama(image_path: &Path) -> Result<String, EngineError> {
@@ -196,7 +220,107 @@ fn encode_image_for_ollama(image_path: &Path) -> Result<String, EngineError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+    use axum::{extract::Json, routing::post, Router};
+
+    async fn capture_ollama_payload(ctx: &AnalyzeContext) -> serde_json::Value {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let sender = Arc::new(Mutex::new(Some(sender)));
+        let app = Router::new().route(
+            "/api/chat",
+            post({
+                let sender = Arc::clone(&sender);
+                move |Json(payload): Json<serde_json::Value>| {
+                    let sender = Arc::clone(&sender);
+                    async move {
+                        sender
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .unwrap()
+                            .send(payload)
+                            .unwrap();
+                        "{\"message\":{\"content\":\"{}\"},\"done\":true}\n"
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let image_path = std::env::temp_dir().join(format!(
+            "yu-server-ollama-schema-{}.png",
+            std::process::id()
+        ));
+        image::RgbaImage::new(1, 1).save(&image_path).unwrap();
+        let engine = OllamaEngine {
+            base_url: format!("http://{address}"),
+            model: "m".into(),
+            language: "ja".into(),
+        };
+        engine.analyze_image(&image_path, ctx).await.unwrap();
+        std::fs::remove_file(image_path).unwrap();
+        server.abort();
+        receiver.await.unwrap()
+    }
+
+    #[test]
+    fn request_body_omits_format_when_no_schema() {
+        // The pre-existing behaviour, pinned: analyze_prompt_trends (ollama.rs:155)
+        // has no context and must keep sending exactly what it sends today.
+        let msgs = json!([{"role": "user", "content": "x"}]);
+        let body = build_request_body("m", &msgs, None);
+        assert!(
+            body.get("format").is_none(),
+            "format must be absent without a schema"
+        );
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["messages"], msgs);
+    }
+
+    #[test]
+    fn request_body_carries_format_when_schema_present() {
+        let msgs = json!([]);
+        let schema = json!({"type": "object", "properties": {"full_text": {"type": "string"}}});
+        let body = build_request_body("m", &msgs, Some(&schema));
+        assert_eq!(body["format"], schema, "the schema goes in verbatim");
+        assert_eq!(
+            body["stream"], true,
+            "adding a schema must not change streaming"
+        );
+    }
+
+    #[tokio::test]
+    async fn analyze_image_forwards_the_context_schema() {
+        // Pin the seam itself: a pure-function test alone passes even when
+        // analyze_image drops the field on the floor.
+        //
+        // The schema below is deliberately distinctive. An earlier version used
+        // `{"type": "object"}`, which is also the plausible hard-coded default —
+        // so a version of analyze_image that ignored ctx and always sent that
+        // constant stayed green. A test that passes under both the correct and
+        // the broken implementation pins nothing.
+        let sentinel = json!({
+            "type": "object",
+            "properties": {"__forwarded_from_ctx": {"type": "string"}},
+            "required": ["__forwarded_from_ctx"],
+        });
+        let ctx = AnalyzeContext {
+            existing_tags: vec![],
+            existing_prompt: None,
+            mode: AnalyzeMode::Ocr,
+            language: "ja".into(),
+            json_schema: Some(sentinel.clone()),
+        };
+        let captured = capture_ollama_payload(&ctx).await;
+        assert_eq!(
+            captured["format"], sentinel,
+            "analyze_image must forward ctx.json_schema verbatim, not a default"
+        );
+    }
 
     #[test]
     fn retries_only_match_the_python_error_substrings() {

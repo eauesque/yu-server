@@ -34,6 +34,9 @@ pub struct AnalyzeContext {
     pub existing_prompt: Option<String>,
     pub mode: AnalyzeMode,
     pub language: String,
+    /// OCR passes a JSON schema here; ollama enforces it at generation time.
+    /// `None` keeps the pre-existing behaviour byte-for-byte.
+    pub json_schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

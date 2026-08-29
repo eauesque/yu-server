@@ -461,7 +461,12 @@ async fn run_detect_worker_stops_at_file_boundary_when_cancelled() {
         0.25,
         cancel,
     ));
-    tokio::time::timeout(std::time::Duration::from_secs(1), gate.started.notified())
+    // A watchdog, not a performance assertion: it exists so a worker that never
+    // starts fails the test instead of hanging the suite. One second is roughly
+    // the time a healthy run takes under load, so it fired on healthy runs
+    // (2026-08-13: one in six full-suite runs). A hung worker never starts at
+    // all, so a wide budget still catches it.
+    tokio::time::timeout(std::time::Duration::from_secs(30), gate.started.notified())
         .await
         .expect("first inference should start");
     assert!(state.job_manager.cancel_job(HAILO_YOLO_JOB_ID));

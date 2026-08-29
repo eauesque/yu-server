@@ -1,4 +1,5 @@
 pub mod file;
+pub mod genesis;
 pub mod migrate;
 pub mod tag;
 

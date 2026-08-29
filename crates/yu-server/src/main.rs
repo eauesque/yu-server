@@ -31,6 +31,7 @@
 mod analysis_engines;
 mod approval_gate;
 mod auth;
+mod compat_info;
 mod config_io;
 mod csrf;
 mod ext_config;
@@ -42,8 +43,12 @@ mod infer_manager;
 mod jobs;
 mod logs;
 mod mcp;
+mod ocr;
 mod pages;
 mod pages_boss;
+mod tagger_batch;
+mod tagger_peer_client;
+mod work_steal;
 pub(crate) use ::lan_cowork::path_guard;
 mod prompt_sim_core;
 mod routes;
@@ -54,7 +59,10 @@ mod secret_store;
 mod security;
 mod sse;
 mod state;
+#[cfg(test)]
+mod testing;
 mod watcher;
+mod wd_profile_wire;
 
 /// Guards every test in this crate that mutates a process-global env var
 /// (`HOME`, `HAILO_HEF_DIR`, etc.) -- the default parallel test-execution
@@ -158,6 +166,11 @@ struct Cli {
     /// Windows では python3 が存在しない場合があるため env で上書き可能。
     #[arg(long, env = "YU_PYTHON_EXECUTABLE", default_value = "python3")]
     python_executable: String,
+    /// Print machine-readable compatibility information and exit.
+    /// The launcher uses this to decide whether this binary may be used,
+    /// without opening the database.
+    #[arg(long)]
+    compat_info: bool,
 }
 
 fn env_truthy(name: &str) -> bool {
@@ -189,12 +202,127 @@ fn parse_ip_set(s: &str) -> HashSet<String> {
 }
 
 /// Mirror Python: resolve_profile_config() — merge a named profile into config.
-/// Returns (merged_config, optional_db_override).
+/// Create the database if standalone needs one, then refuse a database this
+/// binary cannot use.
+///
+/// Ordering matters twice over. It runs before the pools because the read-only
+/// pool opens with `create_if_missing(false)`, and it runs before
+/// `apply_standalone_schema` / `ensure_local_identity` / the Rust migrations,
+/// all of which write. Gating after any of them would mean rejecting a database
+/// this process had already modified.
+///
+/// Only standalone reaches here. In hybrid, Python owns `schema_version` and its
+/// migration chain, so a version this binary does not expect is Python's business
+/// and not grounds for refusing to start -- gating there would take the server
+/// down the moment Python moved a version ahead.
+async fn standalone_db_preflight(
+    db_path: &str,
+    db_key: &str,
+    profile_requested_but_missing: bool,
+) -> Result<(), String> {
+    // A SQLite URI has no parent to check and no file to claim. Leave it to the
+    // normal open path.
+    if tagdb_core::is_sqlite_uri(db_path) {
+        return Ok(());
+    }
+
+    if !Path::new(db_path).exists() {
+        if profile_requested_but_missing {
+            return Err(format!(
+                "refusing to create a database: the requested profile was not found, so the \
+                 path fell back to the default ({db_path}). Creating one here would look \
+                 exactly like losing your library. Check the profile name."
+            ));
+        }
+        if db_key.is_empty() {
+            return Err(format!(
+                "refusing to create a database at {db_path} without --db-key (or YU_DB_KEY).\n\
+                 The Python version opens tags.db through SQLCipher unconditionally, so an \
+                 unencrypted database created here could never be opened by it again.\n\
+                 The launcher is expected to supply the key."
+            ));
+        }
+        match tagdb_core::create_fresh_database(db_path, db_key).await {
+            Ok(tagdb_core::GenesisOutcome::Created) => {
+                tracing::info!("created a new database at {db_path}");
+                return Ok(());
+            }
+            // Another process won the race and has, or is building, a database.
+            // Fall through to the version check.
+            Ok(tagdb_core::GenesisOutcome::Skipped) => {}
+            Err(err) => return Err(format!("{err}")),
+        }
+    }
+
+    check_schema_version(db_path, db_key).await
+}
+
+/// Refuse a database whose Python schema version is not the one this binary was
+/// built against. Standalone cannot migrate: the Python migration chain was
+/// deliberately not ported.
+async fn check_schema_version(db_path: &str, db_key: &str) -> Result<(), String> {
+    let expected = tagdb_core::EXPECTED_PYTHON_SCHEMA_VERSION;
+    let pool = if db_key.is_empty() {
+        tagdb_core::connect_readonly(db_path).await
+    } else {
+        tagdb_core::connect_encrypted_readonly(db_path, db_key)
+            .await
+            .map_err(tagdb_core::TagdbError::Db)
+    };
+    let pool = match pool {
+        Ok(pool) => pool,
+        Err(err) => {
+            return Err(format!(
+                "cannot read the schema version of {db_path}: {err}\n\
+                 The database may be encrypted with a different key, or damaged. \
+                 Nothing has been modified."
+            ))
+        }
+    };
+
+    // `SELECT version` would return an arbitrary one of the ~90 rows: the table
+    // records every applied migration, not just the current one.
+    let found: Result<Option<i64>, _> =
+        sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+            .fetch_one(&pool)
+            .await;
+    pool.close().await;
+
+    match found {
+        Ok(Some(version)) if version == expected => Ok(()),
+        Ok(Some(version)) if version < expected => Err(format!(
+            "this database is at schema v{version}, but this build needs v{expected}.\n\
+             Path: {db_path}\n\
+             Standalone cannot migrate. Start the Python version once to bring it up to \
+             v{expected}, then start again."
+        )),
+        Ok(Some(version)) => Err(format!(
+            "this database is at schema v{version}, which is newer than this build (v{expected}).\n\
+             Path: {db_path}\n\
+             Use a newer build, or restore a database at v{expected}. Nothing has been modified."
+        )),
+        Ok(None) | Err(_) => Err(format!(
+            "cannot determine the schema version of {db_path}: the schema_version table is \
+             missing or unreadable.\n\
+             This does not look like a yu database. Nothing has been modified."
+        )),
+    }
+}
+
+/// Returns (merged_config, optional_db_override, profile_was_found).
+///
+/// The third element exists because the first two cannot distinguish "no such
+/// profile" from "the profile exists but sets no db". Both yield `None`, and
+/// the caller falls back to the default database path either way. That is
+/// harmless while the server only opens existing databases, but genesis must
+/// refuse the first case: a mistyped `--profile` would otherwise create an
+/// empty new library at the default path, which a user cannot tell apart from
+/// having lost everything.
 fn merge_profile(
     config: &serde_json::Value,
     name: &str,
     config_path: &Path,
-) -> (serde_json::Value, Option<String>) {
+) -> (serde_json::Value, Option<String>, bool) {
     let profiles_dir = config_path
         .parent()
         .unwrap_or(Path::new("."))
@@ -211,7 +339,7 @@ fn merge_profile(
     };
     let Some(prof) = prof else {
         tracing::warn!("profile '{}' not found, ignoring", name);
-        return (config.clone(), None);
+        return (config.clone(), None, false);
     };
     const SKIP: &[&str] = &[
         "label",
@@ -259,10 +387,10 @@ fn merge_profile(
             || db.starts_with("/sys")
         {
             tracing::error!("profile '{}' unsafe db path '{}', ignoring", name, db);
-            return (merged, None);
+            return (merged, None, true);
         }
     }
-    (merged, prof_db)
+    (merged, prof_db, true)
 }
 
 /// Scan raw argv for a flag value without invoking clap (used before Cli::parse()).
@@ -585,6 +713,15 @@ async fn main() {
         Cli::parse_from(merged)
     };
 
+    // Answer without opening the database: the launcher calls --compat-info to
+    // decide whether this binary is usable, and at that moment it has not
+    // passed the encryption key. Must run before standalone_db_preflight and
+    // check_schema_version, the first functions below that touch the DB.
+    if cli.compat_info {
+        println!("{}", compat_info::render_compat_info());
+        return;
+    }
+
     let config_path = cli.config.clone().unwrap_or_else(|| {
         // Prefer config.toml (new); fall back to config.json (legacy).
         let toml = PathBuf::from("config.toml");
@@ -640,6 +777,7 @@ async fn main() {
     let project_root = cli
         .project_root
         .unwrap_or_else(|| std::env::current_dir().expect("failed to resolve project root"));
+    let data_dir = secret_store::data_dir(&project_root);
 
     // CLI --pin / YU_PIN > YU_TAURI_PIN (Tauri-injected) > config.json["server"]["pin"].
     let effective_pin = cli
@@ -696,7 +834,7 @@ async fn main() {
     let infer_standalone = env_truthy("YU_INFER_STANDALONE");
 
     // Mirror Python: resolve_profile_config() — merge named profile, optionally override db_path.
-    let (app_config, db_path, active_profile) = {
+    let (app_config, db_path, active_profile, profile_requested_but_missing) = {
         let name = cli.profile.clone().or_else(|| {
             app_config
                 .get("active_profile")
@@ -704,10 +842,10 @@ async fn main() {
                 .map(|s| s.to_string())
         });
         if let Some(ref n) = name {
-            let (merged, prof_db) = merge_profile(&app_config, n, &config_path);
-            (merged, prof_db.unwrap_or(db_path), Some(n.clone()))
+            let (merged, prof_db, found) = merge_profile(&app_config, n, &config_path);
+            (merged, prof_db.unwrap_or(db_path), Some(n.clone()), !found)
         } else {
-            (app_config, db_path, None)
+            (app_config, db_path, None, false)
         }
     };
 
@@ -802,6 +940,21 @@ async fn main() {
             .unwrap_or_else(|| env_default_true("TAGDB_PIN_BOSS_LOGIN_UI")),
     };
 
+    // Standalone (Python absent) is the only mode that may create the database:
+    // in hybrid, Python owns creation and its whole migration chain. This runs
+    // before every other writer -- before the pools, because the read-only pool
+    // also opens with create_if_missing(false), and before
+    // apply_standalone_schema / ensure_local_identity below, which would
+    // otherwise write into a database this binary has not yet accepted.
+    if standalone {
+        if let Err(err) =
+            standalone_db_preflight(&db_path, &cli.db_key, profile_requested_but_missing).await
+        {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    }
+
     let pool = if cli.db_key.is_empty() {
         tagdb_core::connect(&db_path)
             .await
@@ -826,9 +979,6 @@ async fn main() {
     )
     .await
     .expect("failed to connect to vectors database");
-    tagdb_core::apply_pending_rust_migrations(&pool)
-        .await
-        .expect("failed to apply Rust migrations");
     // standalone (Python absent) is the sole owner of the LAN Cowork peer-family
     // schema; create it here. In hybrid, Python solely owns/migrates these tables
     // and their schema_version, so we deliberately do NOT touch them (avoids
@@ -845,6 +995,21 @@ async fn main() {
             .await
             .expect("failed to bootstrap LAN Cowork local identity");
     }
+    // A refusal here (the database is at a Rust schema this build does not know)
+    // is a user-facing condition, not a bug: print the message and stop. A panic
+    // would bury it under a backtrace.
+    if let Err(err) =
+        tagdb_core::apply_pending_rust_migrations_with_data_dir(&pool, Some(&data_dir)).await
+    {
+        match err {
+            tagdb_core::TagdbError::IncompatibleSchema(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+            other => panic!("failed to apply Rust migrations: {other}"),
+        }
+    }
+    let infer_supervisor_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (infer_client, infer_child) = if !config.infer_standalone {
         let infer_auth_token = infer_auth::generate_infer_auth_token();
         let infer_instance_id = uuid::Uuid::new_v4().to_string();
@@ -893,12 +1058,25 @@ async fn main() {
         {
             Some(child) => {
                 let base_url = format!("http://127.0.0.1:{infer_port}");
+                let child_handle = std::sync::Arc::new(std::sync::Mutex::new(child));
+                tokio::spawn(infer_manager::supervise(
+                    std::sync::Arc::clone(&child_handle),
+                    yu_infer_binary.clone(),
+                    infer_port,
+                    scan_roots.clone(),
+                    infer_auth_token.clone(),
+                    infer_instance_id.clone(),
+                    vdevice_group_id.clone(),
+                    config.cache_dir.join("wd_tagger"),
+                    routes::clip_model::model_dir(&config.cache_dir),
+                    std::sync::Arc::clone(&infer_supervisor_stop),
+                ));
                 (
                     Some(crate::infer_client::InferClient::new(
                         base_url,
                         infer_auth_token,
                     )),
-                    Some(std::sync::Mutex::new(child)),
+                    Some(child_handle),
                 )
             }
             None => {
@@ -1027,7 +1205,7 @@ async fn main() {
         .route("/api/preview/{file_id}", get(routes::files::serve_preview))
         .route(
             "/api/thumbnail/{file_id}",
-            get(routes::files::serve_preview),
+            get(routes::files::serve_thumbnail),
         )
         .route(
             "/api/thumbnails/batch",
@@ -1355,6 +1533,8 @@ async fn main() {
             get(routes::file_detail::get_file_detail),
         )
         .route("/api/sweeps/history", get(routes::sweeps::history))
+        .route("/api/sweep/info/{file_id}", get(routes::sweeps::info))
+        .route("/api/sweep/files/{sweep_id}", get(routes::sweeps::files))
         .route(
             "/api/wd-tagger/tags/batch",
             delete(routes::tag_reads::delete_wd_tags_batch),
@@ -1730,19 +1910,23 @@ async fn main() {
             get(routes::auto_stubs::gateway_local_status),
         )
         .route("/api/ocr/npu", get(routes::auto_stubs::ocr_npu))
-        .route("/api/ocr/profiles", get(routes::auto_stubs::ocr_profiles))
+        .route("/api/ocr/profiles", get(routes::ocr::ocr_profiles_list))
         .route(
             "/api/ocr/profiles/fetch",
-            post(routes::auto_stubs::ocr_profiles_fetch),
+            post(routes::ocr::ocr_profiles_fetch),
         )
-        // OCR detail stubs (Phase D)
-        .route("/api/ocr/{file_id}", post(routes::auto_stubs::ocr_run))
+        // `/api/ocr/cancel` must be declared before `/api/ocr/{file_id}`:
+        // matchit prefers a static segment over a parameter, but keeping them
+        // adjacent makes the dependency visible. Without this route the cancel
+        // handler is unreachable and the run_id check it performs is dead.
+        .route("/api/ocr/cancel", post(routes::ocr_jobs::ocr_cancel))
+        .route("/api/ocr/{file_id}", post(routes::ocr_jobs::ocr_single))
         .route(
             "/api/ocr/result/{file_id}",
             get(routes::ocr::ocr_result_get).delete(routes::ocr::ocr_result_delete),
         )
         .route("/api/ocr/engines", get(routes::ocr::ocr_engines))
-        .route("/api/ocr/batch", post(routes::auto_stubs::ocr_batch))
+        .route("/api/ocr/batch", post(routes::ocr_jobs::ocr_batch))
         .route(
             "/api/ocr/export/{file_id}",
             get(routes::auto_stubs::ocr_export),
@@ -1763,9 +1947,10 @@ async fn main() {
             "/api/ocr/overlay/{file_id}",
             get(routes::auto_stubs::ocr_overlay),
         )
+        .route("/api/ocr/benchmark", post(routes::ocr_jobs::ocr_benchmark))
         .route(
-            "/api/ocr/benchmark",
-            post(routes::auto_stubs::ocr_benchmark),
+            "/api/ocr/benchmark/report/{report_id}",
+            get(routes::ocr::ocr_benchmark_report),
         )
         .route(
             "/api/ocr/benchmark/cases",
@@ -1773,14 +1958,15 @@ async fn main() {
         )
         .route(
             "/api/ocr/profiles/{model_prefix}",
-            put(routes::auto_stubs::ocr_profiles_update),
+            put(routes::ocr::ocr_profiles_update),
         )
         .route(
             "/api/ocr/video/{file_id}",
-            post(routes::auto_stubs::ocr_video),
+            post(routes::ocr_jobs::ocr_video),
         )
-        .route("/api/ocr/pdf/{file_id}", post(routes::auto_stubs::ocr_pdf))
-        // Profiles stubs (Phase D)
+        .route("/api/ocr/pdf/{file_id}", post(routes::ocr_jobs::ocr_pdf))
+        // Profiles (Rust native — full implementation, not stubs; see the
+        // `profiles_tests` module in auto_stubs.rs)
         .route(
             "/api/profiles",
             get(routes::auto_stubs::profiles_list).post(routes::auto_stubs::profiles_create),
@@ -2613,7 +2799,22 @@ async fn main() {
         )
         .route(
             "/ext/hailo-genai/api/vlm/generate",
-            post(routes::auto_stubs::hailo_genai_vlm_generate),
+            // Without this the handler's `body: Bytes` is truncated by axum's
+            // 2 MiB DefaultBodyLimit, so an ordinary phone photo is rejected
+            // before either the native path or the Python proxy sees it, and
+            // the 16 MiB image cap inside the handler is unreachable.
+            // The layer must exceed the image cap, not equal it: the body also
+            // carries the multipart framing and the accompanying text fields
+            // (prompt, model, system_prompt, generation settings), and Python
+            // rejects only when the *image part* exceeds 16 MiB. 1 MiB of room
+            // covers those; a request past this outer bound gets axum's
+            // generic 413 rather than the handler's message, which is the
+            // intended backstop.
+            post(routes::auto_stubs::hailo_genai_vlm_generate).layer(
+                axum::extract::DefaultBodyLimit::max(
+                    routes::auto_stubs::VLM_MAX_IMAGE_UPLOAD_BYTES + 1024 * 1024,
+                ),
+            ),
         )
         // hailo-genai chat: list/get/delete/rename/new/active/send are all
         // native Rust. new/active/send are migrated together as a single
@@ -2635,11 +2836,16 @@ async fn main() {
         )
         .route(
             "/ext/hailo-genai/api/chat/send",
-            post(routes::hailo_genai_chat::chat_send),
+            // The multipart body includes framing and text fields in addition
+            // to the image part, so this outer cap needs headroom above the
+            // native 16 MiB image limit. Requests beyond it get axum's 413.
+            post(routes::hailo_genai_chat::chat_send).layer(axum::extract::DefaultBodyLimit::max(
+                routes::auto_stubs::VLM_MAX_IMAGE_UPLOAD_BYTES + 1024 * 1024,
+            )),
         )
         .route(
             "/ext/hailo-genai/api/chat/search",
-            post(routes::auto_stubs::hailo_genai_chat_search),
+            post(routes::hailo_web_search::chat_search),
         )
         .route(
             "/ext/hailo-genai/api/chat/conversations/{conversation_id}",
@@ -2694,15 +2900,15 @@ async fn main() {
         )
         .route(
             "/ext/hailo-semantic/api/caption/start",
-            post(routes::auto_stubs::hailo_semantic_caption_start),
+            post(routes::caption_runner::start_handler),
         )
         .route(
             "/ext/hailo-semantic/api/caption/status",
-            get(routes::auto_stubs::hailo_semantic_caption_status),
+            get(routes::caption_runner::status_handler),
         )
         .route(
             "/ext/hailo-semantic/api/caption/stop",
-            post(routes::auto_stubs::hailo_semantic_caption_stop),
+            post(routes::caption_runner::stop_handler),
         )
         // hailo-yolo extension API — native handlers where supported
         .route(
@@ -2749,19 +2955,25 @@ async fn main() {
         )
         .route(
             "/ext/hailo-genai/api/s2t/transcribe",
-            post(routes::auto_stubs::hailo_genai_s2t_transcribe),
+            // Same DefaultBodyLimit reasoning as the VLM image route: multer
+            // itself has no cap, so without this layer axum's own 2 MiB
+            // default truncates `body: Bytes` before the 32 MiB audio limit
+            // inside the handler is ever reachable.
+            post(routes::s2t::transcribe).layer(axum::extract::DefaultBodyLimit::max(
+                routes::s2t::S2T_MAX_AUDIO_UPLOAD_BYTES + 1024 * 1024,
+            )),
         )
         .route(
             "/ext/hailo-genai/api/s2t/transcribe-video",
-            post(routes::auto_stubs::hailo_genai_s2t_transcribe_video),
+            post(routes::s2t::transcribe_video),
         )
         .route(
             "/ext/hailo-genai/api/s2t/batch-transcribe",
-            post(routes::auto_stubs::hailo_genai_s2t_batch_transcribe),
+            post(routes::s2t_runner::start_handler),
         )
         .route(
             "/ext/hailo-genai/api/s2t/transcript/{file_id}",
-            get(routes::auto_stubs::hailo_genai_s2t_transcript),
+            get(routes::s2t::transcript),
         )
         .route(
             "/ext/hailo-genai/v1/models",
@@ -2773,7 +2985,9 @@ async fn main() {
         )
         .route(
             "/ext/hailo-genai/v1/audio/transcriptions",
-            post(routes::auto_stubs::hailo_genai_v1_audio_transcriptions),
+            post(routes::s2t::openai_transcriptions).layer(axum::extract::DefaultBodyLimit::max(
+                routes::s2t::S2T_MAX_AUDIO_UPLOAD_BYTES + 1024 * 1024,
+            )),
         )
         .route(
             "/ext/hailo-genai/v1/embeddings",
@@ -2822,19 +3036,19 @@ async fn main() {
         // mesh inference
         .route(
             "/api/mesh-inference/bulk",
-            post(routes::misc_admin::mesh_bulk),
+            post(routes::mesh_inference::mesh_bulk),
         )
         .route(
             "/api/mesh-inference/refresh",
-            post(routes::misc_admin::mesh_refresh),
+            post(routes::mesh_inference::mesh_refresh),
         )
         .route(
             "/api/mesh-inference/state",
-            get(routes::misc_admin::mesh_state),
+            get(routes::mesh_inference::mesh_state),
         )
         .route(
             "/api/mesh-inference/toggle",
-            post(routes::misc_admin::mesh_toggle),
+            post(routes::mesh_inference::mesh_toggle),
         )
         // open folder
         .route(
@@ -3094,7 +3308,8 @@ async fn main() {
         .route("/share", get(routes::misc_admin::page_share))
         .route("/tauri-shell", get(routes::misc_admin::page_tauri_shell))
         .route("/crypto-tools", get(routes::misc_admin::page_crypto_tools))
-        .route("/help", get(routes::misc_admin::page_help))
+        .route("/help", get(routes::help::page_help))
+        .route("/help/{section}", get(routes::help::page_help_section))
         .route("/backends", get(routes::misc_admin::page_backends))
         .route("/local/status", get(routes::misc_admin::page_local_status))
         .route("/groups", get(routes::misc_admin::page_groups))
@@ -3228,6 +3443,7 @@ async fn main() {
     )
     .with_graceful_shutdown(async move {
         wait_shutdown_signal().await;
+        infer_supervisor_stop.store(true, std::sync::atomic::Ordering::Release);
         if let Some(stream) = &shutdown_state.hailo_yolo_stream {
             stream.shutdown().await;
         }

@@ -746,53 +746,6 @@ pub async fn sns_config_post(
     unavailable()
 }
 
-/// GET /api/mesh-inference/state
-pub async fn mesh_state(
-    State(s): State<SharedState>,
-    auth: Option<Extension<AuthContext>>,
-) -> Response {
-    if let Some(r) = gate(&s, auth.as_ref()) {
-        return r;
-    }
-    Json(
-        json!({"ok": true, "data": {"enabled": false, "backends": [], "status": "not_configured"}}),
-    )
-    .into_response()
-}
-
-/// POST /api/mesh-inference/toggle
-pub async fn mesh_toggle(
-    State(s): State<SharedState>,
-    auth: Option<Extension<AuthContext>>,
-) -> Response {
-    if let Some(r) = gate(&s, auth.as_ref()) {
-        return r;
-    }
-    unavailable()
-}
-
-/// POST /api/mesh-inference/bulk
-pub async fn mesh_bulk(
-    State(s): State<SharedState>,
-    auth: Option<Extension<AuthContext>>,
-) -> Response {
-    if let Some(r) = gate(&s, auth.as_ref()) {
-        return r;
-    }
-    unavailable()
-}
-
-/// POST /api/mesh-inference/refresh
-pub async fn mesh_refresh(
-    State(s): State<SharedState>,
-    auth: Option<Extension<AuthContext>>,
-) -> Response {
-    if let Some(r) = gate(&s, auth.as_ref()) {
-        return r;
-    }
-    unavailable()
-}
-
 /// GET /api/collections/{id}/export
 pub async fn collections_export(
     State(s): State<SharedState>,
@@ -1831,19 +1784,6 @@ pub async fn page_crypto_tools(
 /// GET /tauri-shell
 pub async fn page_tauri_shell(State(_s): State<SharedState>) -> Response {
     unavailable()
-}
-
-/// GET /help
-pub async fn page_help(
-    State(s): State<SharedState>,
-    Extension(CspNonce(nonce)): Extension<CspNonce>,
-) -> Response {
-    crate::frontend::render(
-        &s,
-        "help.html",
-        serde_json::json!({"csp_nonce": nonce, "dist_v": s.dist_v, "active": "help"}),
-    )
-    .into_response()
 }
 
 /// GET /backends

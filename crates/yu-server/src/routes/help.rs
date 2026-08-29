@@ -1,14 +1,15 @@
 use std::path::Path;
 
 use axum::{
-    extract::{Path as AxumPath, Query, State},
-    http::StatusCode,
+    extract::{Extension, Path as AxumPath, Query, State},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::security::CspNonce;
 use crate::state::SharedState;
 
 #[derive(Debug, Deserialize)]
@@ -20,17 +21,19 @@ pub struct HelpQuery {
 
 pub async fn help_toc(
     State(_state): State<SharedState>,
+    headers: HeaderMap,
     Query(params): Query<HelpQuery>,
 ) -> Response {
-    let lang = detect_lang(params.lang.as_deref());
+    let lang = detect_lang(params.lang.as_deref(), accept_language(&headers));
     api_success(json!({"toc": build_toc(lang), "lang": lang}))
 }
 
 pub async fn help_search(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Query(params): Query<HelpQuery>,
 ) -> Response {
-    let lang = detect_lang(params.lang.as_deref());
+    let lang = detect_lang(params.lang.as_deref(), accept_language(&headers));
     let query = params.q.unwrap_or_default().trim().to_string();
     if query.is_empty() {
         return api_error("Query parameter 'q' is required", StatusCode::BAD_REQUEST);
@@ -47,10 +50,11 @@ pub async fn help_search(
 /// GET /api/help/content/{section}
 pub async fn help_content(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Query(params): Query<HelpQuery>,
     AxumPath(section): AxumPath<String>,
 ) -> Response {
-    let lang = detect_lang(params.lang.as_deref());
+    let lang = detect_lang(params.lang.as_deref(), accept_language(&headers));
     let docs_dir = state.config.project_root.join("docs");
 
     let Some((cat, sec)) = all_sections().find(|(_, s)| s.slug == section) else {
@@ -624,12 +628,41 @@ const SEARCH_ALIASES: &[(&str, &[&str])] = &[
     ("bsky", &["social"]),
 ];
 
-fn detect_lang(lang: Option<&str>) -> &'static str {
-    match lang.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("en") => "en",
-        Some("ja") => "ja",
-        _ => "ja",
+/// `?lang=` first, then `Accept-Language`, then ja — matching the Python
+/// `detect_lang()` in core/help_api/help_data.py.
+fn detect_lang(lang: Option<&str>, accept: Option<&str>) -> &'static str {
+    if let Some(explicit) = supported_lang(lang) {
+        return explicit;
     }
+    for part in accept.unwrap_or("").split(',') {
+        let code = part.split(';').next().unwrap_or("");
+        let code = code
+            .trim()
+            .split('-')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let code = if code == "jp" { "ja".to_string() } else { code };
+        if let Some(matched) = supported_lang(Some(&code)) {
+            return matched;
+        }
+    }
+    "ja"
+}
+
+fn supported_lang(lang: Option<&str>) -> Option<&'static str> {
+    match lang.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("en") => Some("en"),
+        Some("ja") => Some("ja"),
+        _ => None,
+    }
+}
+
+/// Reads the raw Accept-Language header; non-UTF-8 values are ignored.
+fn accept_language(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::ACCEPT_LANGUAGE)
+        .and_then(|value| value.to_str().ok())
 }
 
 fn title(section: Section, lang: &str) -> &'static str {
@@ -831,6 +864,98 @@ fn api_error(message: &str, status: StatusCode) -> Response {
     (status, Json(json!({"ok": false, "error": message}))).into_response()
 }
 
+/// GET /help — help top page. Server-renders the TOC and the first
+/// user-guide section, matching the Python `help_index` route.
+pub async fn page_help(
+    State(state): State<SharedState>,
+    Extension(CspNonce(nonce)): Extension<CspNonce>,
+    headers: HeaderMap,
+    Query(params): Query<HelpQuery>,
+) -> Response {
+    let lang = detect_lang(params.lang.as_deref(), accept_language(&headers));
+    let first = USER_SECTIONS.first().map(|s| s.slug).unwrap_or("");
+    let content_html = if first.is_empty() {
+        String::new()
+    } else {
+        section_html(&state, first, lang).unwrap_or_default()
+    };
+    render_help(
+        &state,
+        &nonce,
+        lang,
+        first,
+        if first.is_empty() { "" } else { "user" },
+        &content_html,
+        StatusCode::OK,
+    )
+}
+
+/// GET /help/{section} — deep link target for the TOC and search results.
+pub async fn page_help_section(
+    State(state): State<SharedState>,
+    Extension(CspNonce(nonce)): Extension<CspNonce>,
+    headers: HeaderMap,
+    Query(params): Query<HelpQuery>,
+    AxumPath(section): AxumPath<String>,
+) -> Response {
+    let lang = detect_lang(params.lang.as_deref(), accept_language(&headers));
+    let Some((category, _)) = all_sections().find(|(_, s)| s.slug == section) else {
+        return render_help(
+            &state,
+            &nonce,
+            lang,
+            "",
+            "",
+            "<p>セクションが見つかりません。</p>",
+            StatusCode::NOT_FOUND,
+        );
+    };
+    let content_html = section_html(&state, &section, lang)
+        .unwrap_or_else(|| "<p>コンテンツが見つかりません。</p>".to_string());
+    render_help(
+        &state,
+        &nonce,
+        lang,
+        &section,
+        category.slug,
+        &content_html,
+        StatusCode::OK,
+    )
+}
+
+fn section_html(state: &SharedState, slug: &str, lang: &str) -> Option<String> {
+    let docs_dir = state.config.project_root.join("docs");
+    read_section(&docs_dir, slug, lang).map(|md| md_to_html(&md))
+}
+
+fn render_help(
+    state: &SharedState,
+    nonce: &str,
+    lang: &str,
+    current_section: &str,
+    current_category: &str,
+    content_html: &str,
+    status: StatusCode,
+) -> Response {
+    match crate::frontend::render(
+        state,
+        "help.html",
+        json!({
+            "csp_nonce": nonce,
+            "dist_v": state.dist_v,
+            "active": "help",
+            "toc": build_toc(lang),
+            "current_section": current_section,
+            "current_category": current_category,
+            "current_lang": lang,
+            "content_html": content_html,
+        }),
+    ) {
+        Ok(html) => (status, html).into_response(),
+        Err(code) => code.into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -913,6 +1038,7 @@ mod tests {
         let root = temp_root("help-toc");
         let response = help_toc(
             State(test_state(root.clone()).await),
+            HeaderMap::new(),
             Query(HelpQuery {
                 q: None,
                 lang: Some("en".to_string()),
@@ -937,6 +1063,7 @@ mod tests {
         let root = temp_root("help-search-missing");
         let response = help_search(
             State(test_state(root.clone()).await),
+            HeaderMap::new(),
             Query(HelpQuery {
                 q: Some("   ".to_string()),
                 lang: None,
@@ -960,6 +1087,7 @@ mod tests {
         );
         let response = help_search(
             State(test_state(root.clone()).await),
+            HeaderMap::new(),
             Query(HelpQuery {
                 q: Some("port".to_string()),
                 lang: Some("en".to_string()),
@@ -1006,6 +1134,7 @@ mod tests {
         );
         let response = help_search(
             State(test_state(root.clone()).await),
+            HeaderMap::new(),
             Query(HelpQuery {
                 q: Some("API".to_string()),
                 lang: Some("ja".to_string()),
@@ -1022,5 +1151,162 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("API"));
+    }
+
+    /// ponytail: mirrors the contract of ui/default/templates/help.html
+    /// (toc loop, active marker, raw content_html). Kept as a fixture because
+    /// crates/ must not read files outside the workspace.
+    fn write_help_template(root: &Path) {
+        write_file(
+            &root.join("ui/default/templates/help.html"),
+            "<nav>{% for group in toc %}{% for item in group.sections %}\
+<a href=\"/help/{{ item.slug }}\" class=\"{{ 'active' if item.slug == current_section else '' }}\">{{ item.title }}</a>\
+{% endfor %}{% endfor %}</nav><main>{{ content_html | safe }}</main>",
+        );
+    }
+
+    async fn html_body(response: Response) -> String {
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn help_top_page_renders_toc_and_first_section() {
+        let root = temp_root("help-page-top");
+        write_help_template(&root);
+        let first = USER_SECTIONS[0].slug;
+        write_file(
+            &root.join(format!("docs/ja/help/user/{first}.md")),
+            "# 見出し\n\n本文です。\n",
+        );
+        let response = page_help(
+            State(test_state(root.clone()).await),
+            Extension(CspNonce("nonce".to_string())),
+            HeaderMap::new(),
+            Query(HelpQuery {
+                q: None,
+                lang: None,
+                limit: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = html_body(response).await;
+        assert!(html.contains(&format!("href=\"/help/{first}\"")), "{html}");
+        assert!(html.contains("class=\"active\""), "{html}");
+        assert!(html.contains("本文です。"), "{html}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn help_section_page_renders_requested_section() {
+        let root = temp_root("help-page-section");
+        write_help_template(&root);
+        write_file(
+            &root.join("docs/ja/help/user/search.md"),
+            "# 検索\n\n検索の説明。\n",
+        );
+        let response = page_help_section(
+            State(test_state(root.clone()).await),
+            Extension(CspNonce("nonce".to_string())),
+            HeaderMap::new(),
+            Query(HelpQuery {
+                q: None,
+                lang: None,
+                limit: None,
+            }),
+            AxumPath("search".to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = html_body(response).await;
+        assert!(html.contains("検索の説明。"), "{html}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn help_section_page_returns_404_for_unknown_section() {
+        let root = temp_root("help-page-404");
+        write_help_template(&root);
+        let response = page_help_section(
+            State(test_state(root.clone()).await),
+            Extension(CspNonce("nonce".to_string())),
+            HeaderMap::new(),
+            Query(HelpQuery {
+                q: None,
+                lang: None,
+                limit: None,
+            }),
+            AxumPath("no-such-section".to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let html = html_body(response).await;
+        assert!(html.contains("セクションが見つかりません"), "{html}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn help_section_page_reports_missing_content() {
+        let root = temp_root("help-page-empty");
+        write_help_template(&root);
+        let response = page_help_section(
+            State(test_state(root.clone()).await),
+            Extension(CspNonce("nonce".to_string())),
+            HeaderMap::new(),
+            Query(HelpQuery {
+                q: None,
+                lang: None,
+                limit: None,
+            }),
+            AxumPath("search".to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = html_body(response).await;
+        assert!(html.contains("コンテンツが見つかりません"), "{html}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn detect_lang_prefers_query_then_accept_language() {
+        assert_eq!(detect_lang(Some("en"), Some("ja,en;q=0.9")), "en");
+        assert_eq!(detect_lang(None, Some("en-US,en;q=0.9")), "en");
+        assert_eq!(detect_lang(None, Some("jp")), "ja");
+        assert_eq!(detect_lang(None, Some("fr-FR,de;q=0.8,en;q=0.5")), "en");
+        assert_eq!(detect_lang(None, Some("fr-FR,de;q=0.8")), "ja");
+        assert_eq!(detect_lang(None, None), "ja");
+    }
+
+    #[tokio::test]
+    async fn help_page_honours_accept_language_header() {
+        let root = temp_root("help-page-accept-lang");
+        write_help_template(&root);
+        let first = USER_SECTIONS[0].slug;
+        write_file(
+            &root.join(format!("docs/ja/help/user/{first}.md")),
+            "日本語本文\n",
+        );
+        write_file(
+            &root.join(format!("docs/en/help/user/{first}.md")),
+            "English body\n",
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT_LANGUAGE, "en-US,en;q=0.9".parse().unwrap());
+        let response = page_help(
+            State(test_state(root.clone()).await),
+            Extension(CspNonce("nonce".to_string())),
+            headers,
+            Query(HelpQuery {
+                q: None,
+                lang: None,
+                limit: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = html_body(response).await;
+        assert!(html.contains("English body"), "{html}");
+        fs::remove_dir_all(&root).ok();
     }
 }

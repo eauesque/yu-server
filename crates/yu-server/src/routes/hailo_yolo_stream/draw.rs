@@ -161,9 +161,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(&frame[(10 * 20 * 3)..(10 * 20 * 3 + 3)], &BOX_COLOR);
-        assert!(frame
-            .chunks_exact(3)
-            .any(|pixel| pixel == TEXT_COLOR.as_slice()));
+        assert!(frame.as_chunks::<3>().0.contains(&TEXT_COLOR));
         assert!(draw_detections(&mut frame[..3], 20, 20, &[]).is_err());
     }
 }

@@ -12,6 +12,9 @@ edition = "2021"
 name = "yu-infer"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 yu-infer           = { workspace = true }
 tokio              = { workspace = true }

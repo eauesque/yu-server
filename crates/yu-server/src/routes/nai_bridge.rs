@@ -20,14 +20,32 @@ use crate::{
 const EXT_NAME: &str = "builtin-nai-bridge";
 const NAI_IMAGE_BASE: &str = "https://image.novelai.net";
 const NAI_USER_AGENT: &str = "yu-ai-manager/1.0";
+// Seconds to wait for /ai/generate-image. NAI charges Anlas once the request
+// reaches its backend, so giving up early loses the image *and* the Anlas —
+// a generous ceiling is cheaper than a premature cut. V5 spends noticeably
+// longer in the tokenizer than V4.5, so 120s was no longer enough.
+// Mirror: extensions/builtin_nai_bridge/core_impl/nai_client.py
+// GENERATE_TIMEOUT_SEC.
+const GENERATE_TIMEOUT_SEC: u64 = 300;
 const MAX_VIBE_BYTES: usize = 32 * 1024 * 1024;
 
 static MODELS: &[(&str, &str)] = &[
+    ("nai-diffusion-5-full", "NAI Diffusion 5 Full"),
+    ("nai-diffusion-5-curated", "NAI Diffusion 5 Curated"),
     ("nai-diffusion-4-5-full", "NAI Diffusion 4.5 Full"),
     ("nai-diffusion-4-5-curated", "NAI Diffusion 4.5 Curated"),
     ("nai-diffusion-4-full", "NAI Diffusion 4 Full"),
     ("nai-diffusion-4-curated-preview", "NAI Diffusion 4 Curated"),
 ];
+
+// MODELS is ordered newest-first for the UI; the default is pinned so a newly
+// added model never silently becomes the default.
+const DEFAULT_MODEL: &str = "nai-diffusion-4-5-full";
+
+// Variety+ (skip_cfg_above_sigma) uses a lower cutoff on the V4 base models.
+// Anything newer (4.5, 5, ...) uses the higher one, so list the exceptions
+// rather than pattern-matching the version out of the model id.
+static V4_BASE_MODELS: &[&str] = &["nai-diffusion-4-full", "nai-diffusion-4-curated-preview"];
 
 static SAMPLERS: &[(&str, &str)] = &[
     ("k_euler_ancestral", "Euler Ancestral"),
@@ -108,6 +126,10 @@ fn api_err(msg: &str, status: StatusCode) -> Response {
     (status, Json(json!({"ok": false, "error": msg}))).into_response()
 }
 
+fn api_err_code(msg: &str, status: StatusCode, code: &str) -> Response {
+    (status, Json(json!({"ok": false, "error": msg, "code": code}))).into_response()
+}
+
 fn admin_guard(state: &SharedState, auth: Option<&Extension<AuthContext>>) -> Option<Response> {
     require_admin_scope(state.config.pin_auth_enabled, auth.map(|c| &c.0))
 }
@@ -171,6 +193,48 @@ fn extract_anlas(sub: &Value) -> i64 {
         .unwrap_or(0)
 }
 
+/// V5 Opus Usage Limit block from the subscription response, verbatim.
+///
+/// Shape: `{"percent": int, "isNegative": bool, "timeUntilNextPercent": int}`.
+/// Absent on non-Opus tiers or if NAI has not rolled it out to the account.
+/// Also `None` if present but "percent" is missing or not a number -- a
+/// block that cannot be evaluated for exhaustion must not be treated as
+/// "not exhausted".
+fn extract_usage(sub: &Value) -> Option<Value> {
+    let usage = sub.get("usage")?;
+    if !usage.is_object() {
+        return None;
+    }
+    usage.get("percent")?.as_f64()?;
+    Some(usage.clone())
+}
+
+/// Whether the V5 Opus Usage Limit is exhausted (would fall back to Anlas).
+fn usage_exhausted(usage: &Value) -> bool {
+    // Match extract_usage's as_f64 read: percent is guaranteed numeric by
+    // extract_usage, but as_i64 rejects a float like 0.0, which would
+    // silently fall back to the "not exhausted" default of 100 below and
+    // let a genuinely exhausted (fractional-percent) account through.
+    let percent = usage.get("percent").and_then(Value::as_f64).unwrap_or(100.0);
+    let is_negative = usage
+        .get("isNegative")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    percent <= 0.0 || is_negative
+}
+
+/// Whether a generation at this resolution/steps falls in the Opus free tier.
+///
+/// Mirrors NovelAI's Opus Usage Limit eligibility rule: normal resolution
+/// (<= Normal Square pixel count) and steps <= 28. Independent of model --
+/// callers must additionally check the model is V5, since the Usage Limit
+/// (and its free tier) is a V5-only mechanism. Mirror of
+/// `is_opus_free_generation` in `extensions/builtin_nai_bridge/core_impl/nai_cost.py`.
+fn is_opus_free_generation(width: u32, height: u32, steps: u32) -> bool {
+    const NORMAL_SQUARE_PX: u64 = 1024 * 1024;
+    steps <= 28 && (width as u64) * (height as u64) <= NORMAL_SQUARE_PX
+}
+
 async fn nai_generate_raw(
     client: &reqwest::Client,
     token: &str,
@@ -180,7 +244,7 @@ async fn nai_generate_raw(
         .post(format!("{NAI_IMAGE_BASE}/ai/generate-image"))
         .header("Authorization", format!("Bearer {token}"))
         .header("User-Agent", NAI_USER_AGENT)
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(GENERATE_TIMEOUT_SEC))
         .json(body)
         .send()
         .await
@@ -278,6 +342,7 @@ struct GenRequest {
     cfg_rescale: Option<f64>,
     n_samples: Option<u32>,
     quality_toggle: Option<bool>,
+    mode: Option<String>,
     uc_preset: Option<u64>,
     dynamic_thresholding: Option<bool>,
     uncond_scale: Option<f64>,
@@ -307,6 +372,247 @@ fn resolve_seed(seed: i64) -> u64 {
     } else {
         seed as u64
     }
+}
+
+/// Round a pixel dimension to the nearest multiple of 64.
+///
+/// Stable Diffusion derived models (NAI included) downscale by 8 in the VAE
+/// and again inside the UNet, so the API rejects dimensions that are not a
+/// multiple of 64. Mirrors `_snap64` in
+/// `extensions/builtin_nai_bridge/core_impl/nai_api_generate.py`.
+fn snap64(val: u32) -> u32 {
+    ((val + 32) / 64 * 64).max(64)
+}
+
+/// NovelAI undesired-content presets and quality tags, verbatim from the UI.
+///
+/// NovelAI's web UI expands both client side before sending: the UC preset
+/// text is prepended to the undesired content ("Added to the beginning of
+/// the UC") and the quality tags are appended to the prompt ("Added to the
+/// end of the prompt"). The `ucPreset` integer and `qualityToggle` boolean
+/// that travel alongside them are metadata, not instructions — a client
+/// that only sends those applies neither.
+///
+/// Mirror: `extensions/builtin_nai_bridge/core_impl/nai_uc_presets.py`.
+/// `tests/test_nai_uc_presets.py` fails if the two sides drift apart.
+const UC_HEAVY: u64 = 0;
+const UC_LIGHT: u64 = 1;
+const UC_NONE: u64 = 2;
+const UC_HUMAN_FOCUS: u64 = 3;
+const UC_FURRY_FOCUS: u64 = 4;
+
+const GEN_V5: &str = "v5";
+const GEN_V45: &str = "v45";
+const GEN_V4: &str = "v4";
+
+/// V5 undesired-content presets.
+static UC_PRESETS_V5: &[(u64, &str)] = &[
+    (
+        UC_HEAVY,
+        "lowres, artistic error, film grain, scan artifacts, worst quality, \
+bad quality, jpeg artifacts, very displeasing, chromatic aberration, \
+dithering, halftone, screentone, multiple views, logo, \
+too many watermarks, negative space, blank page",
+    ),
+    (
+        UC_LIGHT,
+        "lowres, bad hands, bad anatomy, artistic error, sepia, white haze, \
+worst quality, very displeasing, jpeg artifacts, 0::ai-generated::",
+    ),
+    (UC_NONE, ""),
+    (
+        UC_HUMAN_FOCUS,
+        "lowres, artistic error, film grain, scan artifacts, worst quality, \
+bad quality, jpeg artifacts, very displeasing, chromatic aberration, \
+dithering, halftone, screentone, multiple views, logo, \
+too many watermarks, negative space, blank page, @_@, \
+mismatched pupils, glowing eyes, bad anatomy",
+    ),
+    (
+        UC_FURRY_FOCUS,
+        "{worst quality}, distracting watermark, unfinished, bad quality, \
+{widescreen}, upscale, {sequence}, {{grandfathered content}}, \
+blurred foreground, chromatic aberration, sketch, everyone, \
+[sketch background], simple, [flat colors], ych (character), \
+outline, multiple scenes, [[horror (theme)]], comic",
+    ),
+];
+
+/// V4.5 undesired-content presets. Furry Focus is absent because V4.5's UC
+/// preset list no longer offers it — not for want of capturing it. The
+/// Anime/Furry switch does not change these texts: both modes show the same
+/// wording, so one table per generation is the whole story.
+static UC_PRESETS_V45: &[(u64, &str)] = &[
+    (
+        UC_HEAVY,
+        "blurry, lowres, upscaled, artistic error, film grain, scan artifacts, \
+worst quality, bad quality, jpeg artifacts, very displeasing, \
+chromatic aberration, halftone, multiple views, logo, \
+too many watermarks, negative space, blank page",
+    ),
+    (
+        UC_LIGHT,
+        "blurry, lowres, upscaled, artistic error, scan artifacts, \
+jpeg artifacts, logo, too many watermarks, negative space, blank page",
+    ),
+    (UC_NONE, ""),
+    (
+        UC_HUMAN_FOCUS,
+        "blurry, lowres, upscaled, artistic error, film grain, scan artifacts, \
+bad anatomy, bad hands, worst quality, bad quality, jpeg artifacts, \
+very displeasing, chromatic aberration, halftone, multiple views, \
+logo, too many watermarks, @_@, mismatched pupils, glowing eyes, \
+negative space, blank page",
+    ),
+];
+
+/// V4 undesired-content presets. V4 offers Heavy / Light / None only — no
+/// focus presets.
+static UC_PRESETS_V4: &[(u64, &str)] = &[
+    (
+        UC_HEAVY,
+        "blurry, lowres, error, film grain, scan artifacts, worst quality, \
+bad quality, jpeg artifacts, very displeasing, chromatic aberration, \
+logo, dated, signature, multiple views, gigantic breasts, \
+white blank page, blank page",
+    ),
+    (
+        UC_LIGHT,
+        "blurry, lowres, error, worst quality, bad quality, jpeg artifacts, \
+very displeasing, logo, dated, signature, white blank page, blank page",
+    ),
+    (UC_NONE, ""),
+];
+
+/// Quality Tags ("Standard"), appended to the end of the prompt.
+static QUALITY_TAGS: &[(&str, &str)] = &[
+    (GEN_V5, "very aesthetic, masterpiece, no text"),
+    (
+        GEN_V45,
+        "very aesthetic, masterpiece, no text, -0.8::feet::, rating:general",
+    ),
+    (
+        GEN_V4,
+        "rating:general, best quality, very aesthetic, absurdres",
+    ),
+];
+
+/// Generation key for `model`.
+///
+/// The V4 text was captured from one V4 model and is applied to both
+/// `nai-diffusion-4-full` and `nai-diffusion-4-curated-preview`.
+fn model_generation(model: &str) -> Option<&'static str> {
+    if model.starts_with("nai-diffusion-5") {
+        Some(GEN_V5)
+    } else if model.starts_with("nai-diffusion-4-5") {
+        Some(GEN_V45)
+    } else if model.starts_with("nai-diffusion-4") {
+        Some(GEN_V4)
+    } else {
+        None
+    }
+}
+
+fn uc_table(model: &str) -> Option<&'static [(u64, &'static str)]> {
+    match model_generation(model)? {
+        GEN_V5 => Some(UC_PRESETS_V5),
+        GEN_V45 => Some(UC_PRESETS_V45),
+        GEN_V4 => Some(UC_PRESETS_V4),
+        _ => None,
+    }
+}
+
+/// Prepend the UC preset to `negative_prompt`, mirroring the NovelAI UI.
+///
+/// Returns `(negative_prompt, uc_preset)`. The reported preset becomes
+/// [`UC_NONE`] whenever text was prepended, so the server cannot apply it a
+/// second time. A model whose generation has no recorded text is left alone,
+/// except that selector values that generation does not offer are reported as
+/// [`UC_NONE`] rather than forwarded — an unverified integer would ask for
+/// some undesired preset, not for none.
+fn expand_uc_preset(model: &str, uc_preset: u64, negative_prompt: &str) -> (String, u64) {
+    let Some(table) = uc_table(model) else {
+        let reported = if uc_preset == UC_HUMAN_FOCUS || uc_preset == UC_FURRY_FOCUS {
+            UC_NONE
+        } else {
+            uc_preset
+        };
+        return (negative_prompt.to_string(), reported);
+    };
+
+    let text = table
+        .iter()
+        .find(|(id, _)| *id == uc_preset)
+        .map(|(_, t)| *t)
+        .unwrap_or("");
+    if text.is_empty() {
+        // Unknown-for-this-generation or explicitly None: apply nothing.
+        return (negative_prompt.to_string(), UC_NONE);
+    }
+
+    let existing = negative_prompt.trim();
+    let merged = if existing.is_empty() {
+        text.to_string()
+    } else {
+        format!("{text}, {existing}")
+    };
+    (merged, UC_NONE)
+}
+
+/// Dataset mode. NovelAI folded the Furry model into the base model; the
+/// UI's Anime/Furry switch has no API flag of its own — Furry mode simply
+/// puts the `fur dataset` tag at the very start of the base prompt.
+const MODE_ANIME: &str = "anime";
+const MODE_FURRY: &str = "furry";
+
+static MODE_PREFIXES: &[(&str, &str)] = &[(MODE_ANIME, ""), (MODE_FURRY, "fur dataset")];
+
+/// Put the dataset-mode tag at the very start of `prompt`.
+///
+/// NovelAI documents that the tag only works from the start of the base
+/// prompt. An unknown mode is treated as Anime (no prefix) rather than
+/// guessed at.
+fn expand_mode_prefix(mode: &str, prompt: &str) -> String {
+    let prefix = MODE_PREFIXES
+        .iter()
+        .find(|(m, _)| *m == mode)
+        .map(|(_, p)| *p)
+        .unwrap_or("");
+    if prefix.is_empty() {
+        return prompt.to_string();
+    }
+    let existing = prompt.trim();
+    if existing.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}, {existing}")
+    }
+}
+
+/// Append the quality tags to `prompt`, mirroring the NovelAI UI.
+///
+/// Returns `(prompt, quality_toggle)`. The reported toggle becomes `false`
+/// once the tags are in the prompt so they cannot be applied twice. A model
+/// generation with no recorded tags is left untouched.
+fn expand_quality_tags(model: &str, quality_toggle: bool, prompt: &str) -> (String, bool) {
+    if !quality_toggle {
+        return (prompt.to_string(), false);
+    }
+    let tags = model_generation(model)
+        .and_then(|gen| QUALITY_TAGS.iter().find(|(g, _)| *g == gen))
+        .map(|(_, t)| *t)
+        .unwrap_or("");
+    if tags.is_empty() {
+        return (prompt.to_string(), quality_toggle);
+    }
+
+    let existing = prompt.trim();
+    let merged = if existing.is_empty() {
+        tags.to_string()
+    } else {
+        format!("{existing}, {tags}")
+    };
+    (merged, false)
 }
 
 fn build_char_captions(chars: Option<&[CharEntry]>) -> (Vec<Value>, Vec<Value>, bool) {
@@ -340,7 +646,7 @@ fn build_request_body(req: &GenRequest) -> (Value, u64, String) {
         .model
         .as_deref()
         .filter(|m| MODELS.iter().any(|(id, _)| id == m))
-        .unwrap_or(MODELS[0].0)
+        .unwrap_or(DEFAULT_MODEL)
         .to_string();
     let seed = resolve_seed(req.seed);
     let image_format = req
@@ -352,8 +658,8 @@ fn build_request_body(req: &GenRequest) -> (Value, u64, String) {
     let steps = req.steps.map(|s| s.clamp(1, 50)).unwrap_or(28);
     let scale = req.scale.unwrap_or(5.0).clamp(0.0, 10.0);
     let cfg_rescale = req.cfg_rescale.unwrap_or(0.0).clamp(0.0, 1.0);
-    let width = req.width.map(|w| w.clamp(64, 2048)).unwrap_or(832);
-    let height = req.height.map(|h| h.clamp(64, 2048)).unwrap_or(1216);
+    let width = snap64(req.width.map(|w| w.clamp(64, 2048)).unwrap_or(832));
+    let height = snap64(req.height.map(|h| h.clamp(64, 2048)).unwrap_or(1216));
     let sampler = req
         .sampler
         .as_deref()
@@ -368,6 +674,15 @@ fn build_request_body(req: &GenRequest) -> (Value, u64, String) {
         .to_string();
     let quality_toggle = req.quality_toggle.unwrap_or(true);
     let uc_preset = req.uc_preset.unwrap_or(0);
+    // NovelAI expands the UC preset and quality tags client side — prepending
+    // the preset to the undesired content and appending the tags to the
+    // prompt. Sending only the integer/boolean applies neither.
+    let (negative_prompt, uc_preset) = expand_uc_preset(&model, uc_preset, &req.negative_prompt);
+    // NovelAI's Furry mode is just the `fur dataset` tag at the very start of
+    // the base prompt, and the quality tags go at the very end.
+    let mode = req.mode.as_deref().unwrap_or(MODE_ANIME);
+    let prompt = expand_mode_prefix(mode, &req.prompt);
+    let (prompt, quality_toggle) = expand_quality_tags(&model, quality_toggle, &prompt);
     let dynamic_thresholding = req.dynamic_thresholding.unwrap_or(false);
     let uncond_scale = req.uncond_scale.unwrap_or(1.0);
     let variety_boost = req.variety_boost.unwrap_or(false);
@@ -375,11 +690,11 @@ fn build_request_body(req: &GenRequest) -> (Value, u64, String) {
     let (pos_chars, neg_chars, use_coords) = build_char_captions(req.characters.as_deref());
 
     let v4_prompt = json!({
-        "caption": { "base_caption": req.prompt, "char_captions": pos_chars },
+        "caption": { "base_caption": &prompt, "char_captions": pos_chars },
         "use_coords": use_coords, "use_order": true,
     });
     let v4_negative = json!({
-        "caption": { "base_caption": req.negative_prompt, "char_captions": neg_chars },
+        "caption": { "base_caption": &negative_prompt, "char_captions": neg_chars },
         "use_coords": use_coords, "use_order": true,
     });
 
@@ -391,17 +706,17 @@ fn build_request_body(req: &GenRequest) -> (Value, u64, String) {
         "skip_cfg_above_sigma": null, "dynamic_thresholding": dynamic_thresholding,
         "controlnet_strength": 1.0, "legacy": false, "add_original_image": true,
         "uncond_scale": uncond_scale, "qualityToggle": quality_toggle,
-        "ucPreset": uc_preset, "negative_prompt": req.negative_prompt,
+        "ucPreset": uc_preset, "negative_prompt": &negative_prompt,
         "params_version": 3, "v4_prompt": v4_prompt,
         "v4_negative_prompt": v4_negative, "use_coords": use_coords,
         "image_format": image_format,
     });
 
     if variety_boost {
-        let sigma = if model.contains("4-5") {
-            58.0_f64
-        } else {
+        let sigma = if V4_BASE_MODELS.contains(&model.as_str()) {
             19.0_f64
+        } else {
+            58.0_f64
         };
         parameters["skip_cfg_above_sigma"] = json!(sigma);
     }
@@ -467,7 +782,7 @@ fn build_request_body(req: &GenRequest) -> (Value, u64, String) {
     };
 
     let body = json!({
-        "input": req.prompt,
+        "input": &prompt,
         "model": model,
         "action": action,
         "parameters": parameters,
@@ -665,6 +980,7 @@ async fn test_connection(
             "ok": true,
             "anlas": extract_anlas(&sub),
             "tier": sub.get("tier").and_then(Value::as_i64).unwrap_or(0),
+            "usage": extract_usage(&sub),
         }))
         .into_response(),
         Err((status, e)) => api_err(&e, status),
@@ -680,7 +996,11 @@ async fn anlas(State(state): State<SharedState>, auth: Option<Extension<AuthCont
         Err(e) => return api_err(e, StatusCode::BAD_REQUEST),
     };
     match nai_get_subscription(&state.inference_client, &token).await {
-        Ok(sub) => api_ok(json!({"anlas": extract_anlas(&sub)})).into_response(),
+        Ok(sub) => api_ok(json!({
+            "anlas": extract_anlas(&sub),
+            "usage": extract_usage(&sub),
+        }))
+        .into_response(),
         Err((status, e)) => api_err(&e, status),
     }
 }
@@ -741,6 +1061,76 @@ async fn generate(
     let final_negative = req.negative_prompt.clone();
     let characters = req.characters.as_ref().map(|chars| json!(chars));
     let (body, seed, image_format) = build_request_body(&req);
+
+    // V5 Opus Usage Limit guard: only applies to V5 models, and only to
+    // requests that would actually draw from the free usage-limit tier
+    // (normal resolution, <=28 steps) -- a higher-res/step V5 request always
+    // costs Anlas regardless of the usage limit, so it is not gated here.
+    // Mirror of the guard in nai_api_generate.handle_generate (Python).
+    if cfg_bool(&ext_config(&state), "block_anlas_on_v5_limit", false) {
+        let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+        let params = body.get("parameters");
+        let width = params
+            .and_then(|p| p.get("width"))
+            .and_then(Value::as_u64)
+            .unwrap_or(832) as u32;
+        let height = params
+            .and_then(|p| p.get("height"))
+            .and_then(Value::as_u64)
+            .unwrap_or(1216) as u32;
+        let steps = params
+            .and_then(|p| p.get("steps"))
+            .and_then(Value::as_u64)
+            .unwrap_or(28) as u32;
+        if model_generation(model) == Some(GEN_V5) && is_opus_free_generation(width, height, steps)
+        {
+            // Fail closed on subscription-fetch failure: the user opted
+            // into this guard specifically to avoid spending Anlas, so a
+            // check that cannot complete must not silently let a spend
+            // through. Mirrors nai_api_generate.handle_generate (Python).
+            match nai_get_subscription(&state.inference_client, &token).await {
+                Ok(sub) => match extract_usage(&sub) {
+                    // "200 OK" alone is not enough: a subscription object
+                    // with no "usage" block is just as unverifiable as a
+                    // failed request (e.g. NAI hasn't rolled the field out
+                    // yet, or the shape changed) -- both must block, not
+                    // silently pass.
+                    Some(usage) if usage_exhausted(&usage) => {
+                        return api_err_code(
+                            "NAI V5 usage limit exhausted; generation blocked to avoid \
+                             spending Anlas (disable the block-on-limit option in Settings \
+                             to allow Anlas fallback).",
+                            StatusCode::LOCKED,
+                            "nai_usage_limit_blocked",
+                        );
+                    }
+                    Some(_) => {}
+                    None => {
+                        return api_err_code(
+                            "Could not verify NAI V5 usage limit; generation blocked to \
+                             avoid an unverified Anlas spend (disable the block-on-limit \
+                             option in Settings to allow generation without this check): \
+                             subscription response had no usage field",
+                            StatusCode::BAD_GATEWAY,
+                            "nai_usage_check_failed",
+                        );
+                    }
+                },
+                Err((_status, e)) => {
+                    return api_err_code(
+                        &format!(
+                            "Could not verify NAI V5 usage limit; generation blocked to \
+                             avoid an unverified Anlas spend (disable the block-on-limit \
+                             option in Settings to allow generation without this check): {e}"
+                        ),
+                        StatusCode::BAD_GATEWAY,
+                        "nai_usage_check_failed",
+                    );
+                }
+            }
+        }
+    }
+
     let zip = match nai_generate_raw(&state.inference_client, &token, &body).await {
         Ok(z) => z,
         Err(e) => return api_err(&e, StatusCode::BAD_GATEWAY),
@@ -1008,7 +1398,7 @@ async fn get_config(
     api_ok(json!({
         "api_token": masked,
         "auto_send": cfg_bool(&cfg, "auto_send", false),
-        "default_model": cfg_str(&cfg, "default_model", MODELS[0].0),
+        "default_model": cfg_str(&cfg, "default_model", DEFAULT_MODEL),
         "default_sampler": cfg_str(&cfg, "default_sampler", SAMPLERS[0].0),
         "default_noise_schedule": cfg_str(&cfg, "default_noise_schedule", NOISE_SCHEDULES[0].0),
         "save_folder": cfg_str(&cfg, "save_folder", ""),
@@ -1017,6 +1407,7 @@ async fn get_config(
         "default_image_format": cfg_str(&cfg, "default_image_format", "png"),
         "auto_import": cfg_bool(&cfg, "auto_import", true),
         "cache_max_size_mb": cfg_f64(&cfg, "cache_max_size_mb", 500.0),
+        "block_anlas_on_v5_limit": cfg_bool(&cfg, "block_anlas_on_v5_limit", false),
     }))
     .into_response()
 }
@@ -1034,6 +1425,7 @@ struct SaveConfigReq {
     default_image_format: Option<String>,
     auto_import: Option<bool>,
     cache_max_size_mb: Option<Value>,
+    block_anlas_on_v5_limit: Option<bool>,
 }
 
 async fn post_config(
@@ -1081,6 +1473,7 @@ async fn post_config(
     save_bool!(auto_send, "auto_send");
     save_bool!(auto_save, "auto_save");
     save_bool!(auto_import, "auto_import");
+    save_bool!(block_anlas_on_v5_limit, "block_anlas_on_v5_limit");
 
     if let Some(v) = &req.default_model {
         let v = v.trim();
@@ -1203,6 +1596,130 @@ mod tests {
         state::{AppState, Config, SharedState},
     };
 
+    #[test]
+    fn expand_mode_prefix_puts_the_furry_tag_at_the_very_start() {
+        assert_eq!(
+            expand_mode_prefix(MODE_FURRY, "1girl"),
+            "fur dataset, 1girl"
+        );
+        assert_eq!(expand_mode_prefix(MODE_ANIME, "1girl"), "1girl");
+        // Unknown mode is treated as Anime rather than guessed at.
+        assert_eq!(expand_mode_prefix("nonsense", "1girl"), "1girl");
+    }
+
+    #[test]
+    fn build_request_body_wires_uc_preset_and_snap64_into_the_payload() {
+        // Guards the call sites, not just the helpers: a payload built from a
+        // real GenRequest must carry the expanded UC text and 64-aligned size.
+        let req: GenRequest = serde_json::from_value(json!({
+            "prompt": "1girl",
+            "negative_prompt": "extra tag",
+            "model": "nai-diffusion-5-full",
+            "uc_preset": 4,
+            "mode": "furry",
+            "quality_toggle": true,
+            "width": 1250,
+            "height": 1177,
+        }))
+        .unwrap();
+        let (body, _seed, _fmt) = build_request_body(&req);
+        let params = &body["parameters"];
+
+        let furry = UC_PRESETS_V5
+            .iter()
+            .find(|(i, _)| *i == UC_FURRY_FOCUS)
+            .unwrap()
+            .1;
+        let expected = format!("{furry}, extra tag");
+        assert_eq!(params["negative_prompt"], json!(expected));
+        assert_eq!(
+            params["v4_negative_prompt"]["caption"]["base_caption"],
+            json!(expected)
+        );
+        assert_eq!(params["ucPreset"], json!(UC_NONE));
+        assert_eq!(params["width"], json!(1280));
+        assert_eq!(params["height"], json!(1152));
+
+        // `fur dataset` leads and the quality tags trail.
+        let tags = QUALITY_TAGS.iter().find(|(g, _)| *g == GEN_V5).unwrap().1;
+        let expected_prompt = format!("fur dataset, 1girl, {tags}");
+        assert_eq!(body["input"], json!(expected_prompt));
+        assert_eq!(
+            params["v4_prompt"]["caption"]["base_caption"],
+            json!(expected_prompt)
+        );
+        assert_eq!(params["qualityToggle"], json!(false));
+    }
+
+    #[test]
+    fn expand_uc_preset_prepends_v5_text_and_reports_none() {
+        let (neg, uc) = expand_uc_preset("nai-diffusion-5-full", UC_HEAVY, "extra tag");
+        assert!(neg.ends_with(", extra tag"));
+        assert!(neg.starts_with("lowres, artistic error, film grain"));
+        assert_eq!(uc, UC_NONE);
+    }
+
+    #[test]
+    fn expand_uc_preset_without_existing_negative_has_no_separator() {
+        let (neg, _) = expand_uc_preset("nai-diffusion-5-curated", UC_LIGHT, "   ");
+        assert_eq!(
+            neg,
+            UC_PRESETS_V5
+                .iter()
+                .find(|(i, _)| *i == UC_LIGHT)
+                .unwrap()
+                .1
+        );
+    }
+
+    #[test]
+    fn expand_uc_preset_leaves_unrecorded_generations_alone() {
+        let (neg, uc) = expand_uc_preset("nai-diffusion-3", UC_HEAVY, "extra tag");
+        assert_eq!(neg, "extra tag");
+        assert_eq!(uc, UC_HEAVY);
+    }
+
+    #[test]
+    fn expand_uc_preset_uses_each_generations_own_wording() {
+        let (v5, _) = expand_uc_preset("nai-diffusion-5-full", UC_HEAVY, "");
+        let (v45, _) = expand_uc_preset("nai-diffusion-4-5-full", UC_HEAVY, "");
+        let (v4, _) = expand_uc_preset("nai-diffusion-4-full", UC_HEAVY, "");
+        assert_ne!(v5, v45);
+        assert_ne!(v45, v4);
+        assert_ne!(v5, v4);
+    }
+
+    #[test]
+    fn expand_uc_preset_does_not_forward_ids_a_generation_lacks() {
+        // V4 has no focus presets; V4.5 has Human Focus but not Furry Focus.
+        for (model, preset) in [
+            ("nai-diffusion-4-full", UC_HUMAN_FOCUS),
+            ("nai-diffusion-4-full", UC_FURRY_FOCUS),
+            ("nai-diffusion-4-5-full", UC_FURRY_FOCUS),
+        ] {
+            let (neg, uc) = expand_uc_preset(model, preset, "extra tag");
+            assert_eq!(neg, "extra tag");
+            assert_eq!(uc, UC_NONE);
+        }
+    }
+
+    #[test]
+    fn expand_uc_preset_applies_nothing_for_unknown_ids() {
+        let (neg, uc) = expand_uc_preset("nai-diffusion-5-full", 99, "extra tag");
+        assert_eq!(neg, "extra tag");
+        assert_eq!(uc, UC_NONE);
+    }
+
+    #[test]
+    fn snap64_rounds_to_nearest_multiple_of_64() {
+        // NAI rejects dimensions that are not a multiple of 64.
+        assert_eq!(snap64(1248), 1280);
+        assert_eq!(snap64(1176), 1152);
+        assert_eq!(snap64(1216), 1216);
+        assert_eq!(snap64(1), 64);
+        assert_eq!(snap64(2048), 2048);
+    }
+
     async fn test_state(root: &tempfile::TempDir) -> SharedState {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -1250,6 +1767,8 @@ mod tests {
                     .expect("clip index test default"),
             ),
             clip_indexer: std::sync::Arc::new(crate::routes::clip_indexer::ClipIndexer::new()),
+            caption_runner: std::sync::Arc::new(crate::routes::caption_runner::CaptionRunner::new()),
+            s2t_runner: std::sync::Arc::new(crate::routes::s2t_runner::S2tRunner::new()),
             clip_runtime_cache: crate::state::TtlCache::new(crate::state::CLIP_RUNTIME_CACHE_TTL),
             inference_client: reqwest::Client::new(),
             python_client: reqwest::Client::new(),
@@ -1269,7 +1788,7 @@ mod tests {
             version: "0.0.0".to_string(),
             start_time: std::time::Instant::now(),
             scheduler_state: std::sync::OnceLock::new(),
-            wd_infer: std::sync::OnceLock::new(),
+            wd_infer: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             infer_client: None,
             infer_child: None,
             scan_manager: std::sync::OnceLock::new(),
@@ -1337,6 +1856,86 @@ mod tests {
     #[test]
     fn test_extract_anlas_missing() {
         assert_eq!(extract_anlas(&json!({})), 0);
+    }
+
+    #[test]
+    fn test_extract_usage_present() {
+        let sub = json!({"usage": {"percent": 2, "isNegative": false, "timeUntilNextPercent": 7888}});
+        let usage = extract_usage(&sub).unwrap();
+        assert_eq!(usage["percent"], 2);
+    }
+
+    #[test]
+    fn test_extract_usage_missing() {
+        assert_eq!(extract_usage(&json!({})), None);
+        assert_eq!(extract_usage(&json!({"tier": 3})), None);
+    }
+
+    #[test]
+    fn test_extract_usage_malformed_missing_percent() {
+        // "usage" present as an object but without a numeric "percent"
+        // cannot be evaluated for exhaustion -- must be unverifiable, not
+        // "not exhausted".
+        assert_eq!(
+            extract_usage(&json!({"usage": {"isNegative": false}})),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_usage_malformed_percent_wrong_type() {
+        assert_eq!(extract_usage(&json!({"usage": {"percent": "2"}})), None);
+        assert_eq!(extract_usage(&json!({"usage": {"percent": null}})), None);
+        assert_eq!(extract_usage(&json!({"usage": {"percent": true}})), None);
+    }
+
+    #[test]
+    fn test_usage_exhausted_by_percent() {
+        assert!(usage_exhausted(
+            &json!({"percent": 0, "isNegative": false})
+        ));
+        assert!(!usage_exhausted(
+            &json!({"percent": 2, "isNegative": false})
+        ));
+    }
+
+    #[test]
+    fn test_usage_exhausted_by_fractional_percent() {
+        // Regression: usage_exhausted used to read percent via as_i64,
+        // which rejects a float like 0.0 and silently fell back to the
+        // "not exhausted" default of 100 -- exactly the exhausted case a
+        // fractional percent would represent.
+        assert!(usage_exhausted(
+            &json!({"percent": 0.0, "isNegative": false})
+        ));
+        assert!(!usage_exhausted(
+            &json!({"percent": 0.5, "isNegative": false})
+        ));
+    }
+
+    #[test]
+    fn test_usage_exhausted_by_is_negative() {
+        // Percent could still read positive while isNegative flags the
+        // account as over its limit -- treat either signal as exhausted.
+        assert!(usage_exhausted(
+            &json!({"percent": 5, "isNegative": true})
+        ));
+    }
+
+    #[test]
+    fn test_is_opus_free_generation_normal_res_low_steps() {
+        assert!(is_opus_free_generation(832, 1216, 28));
+        assert!(is_opus_free_generation(1024, 1024, 28));
+    }
+
+    #[test]
+    fn test_is_opus_free_generation_excludes_high_steps() {
+        assert!(!is_opus_free_generation(832, 1216, 29));
+    }
+
+    #[test]
+    fn test_is_opus_free_generation_excludes_high_resolution() {
+        assert!(!is_opus_free_generation(1536, 1024, 28));
     }
 
     #[test]
@@ -1408,6 +2007,26 @@ mod tests {
         let (b4, _, _) = build_request_body(&req4);
         assert_eq!(b45["parameters"]["skip_cfg_above_sigma"], json!(58.0_f64));
         assert_eq!(b4["parameters"]["skip_cfg_above_sigma"], json!(19.0_f64));
+    }
+
+    #[test]
+    fn test_build_request_body_variety_boost_sigma_v5() {
+        // A newer model generation must get the 58 cutoff, not the V4 fallback.
+        for model in ["nai-diffusion-5-full", "nai-diffusion-5-curated"] {
+            let req = serde_json::from_value::<GenRequest>(json!({
+                "prompt": "x",
+                "model": model,
+                "variety_boost": true,
+            }))
+            .unwrap();
+            let (body, _, _) = build_request_body(&req);
+            assert_eq!(body["model"], json!(model));
+            assert_eq!(
+                body["parameters"]["skip_cfg_above_sigma"],
+                json!(58.0_f64),
+                "sigma wrong for {model}"
+            );
+        }
     }
 
     #[test]
@@ -1502,8 +2121,8 @@ mod tests {
         let (status, body) = get_json(test_app(state, None), "/ext/nai-bridge/api/models").await;
         assert_eq!(status, StatusCode::OK);
         let models = body["models"].as_array().unwrap();
-        assert_eq!(models.len(), 4);
-        assert_eq!(models[0]["id"], json!("nai-diffusion-4-5-full"));
+        assert_eq!(models.len(), 6);
+        assert_eq!(models[0]["id"], json!("nai-diffusion-5-full"));
     }
 
     #[tokio::test]

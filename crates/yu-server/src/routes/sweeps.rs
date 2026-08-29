@@ -1,12 +1,12 @@
 //! Native GET /api/sweeps/history; Python source: routes/sweep_routes.py and routes/sweep_route_helpers.py.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path as RoutePath, Query, State},
     response::{IntoResponse, Response},
     Json,
 };
@@ -395,6 +395,404 @@ fn api_error(message: &str) -> Response {
         .into_response()
 }
 
+/// Python `api_success(payload)` merges `payload` at the TOP level and leaves
+/// `data` null — it is not the same shape as `api_success(data=...)`, which
+/// `api_success_data` above covers. The sweep view reads `d.meta` / `d.matches`
+/// directly off the root, so the distinction is load-bearing.
+fn api_success_payload(payload: Value) -> Response {
+    let mut body = json!({"ok": true, "error": null, "data": null});
+    if let (Some(target), Some(extra)) = (body.as_object_mut(), payload.as_object()) {
+        for (k, v) in extra {
+            target.insert(k.clone(), v.clone());
+        }
+    }
+    Json(body).into_response()
+}
+
+fn api_error_status(message: &str, status: axum::http::StatusCode) -> Response {
+    (status, Json(json!({"ok": false, "error": message}))).into_response()
+}
+
+fn api_error_coded(message: &str, status: axum::http::StatusCode, code: &str) -> Response {
+    (
+        status,
+        Json(json!({"ok": false, "error": message, "code": code})),
+    )
+        .into_response()
+}
+
+const IMAGE_SUFFIXES: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
+/// Python `SWEEP_FOLDER_SCAN_IMAGE_LIMIT`. Counts image *candidates*, so a
+/// folder holding non-images does not eat into the budget.
+const SWEEP_FOLDER_SCAN_IMAGE_LIMIT: usize = 1000;
+const FILE_ID_CHUNK_SIZE: usize = 500;
+
+fn lowercase_extension(path: &std::path::Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+fn is_sweep_image(path: &std::path::Path) -> bool {
+    IMAGE_SUFFIXES.contains(&lowercase_extension(path).as_str())
+}
+
+/// Mirrors Python `read_sweep_attrs`: read the file's XMP packet and take the
+/// `sweep` namespace. Any failure yields an empty map — a file without XMP is
+/// an ordinary outcome here, not an error.
+fn read_sweep_attrs(path: &std::path::Path) -> BTreeMap<String, String> {
+    let raw = match lowercase_extension(path).as_str() {
+        "png" => xmp_core::io::png::read_xmp(path),
+        "jpg" | "jpeg" => xmp_core::io::jpeg::read_xmp(path),
+        "webp" => xmp_core::io::webp::read_xmp(path),
+        _ => None,
+    };
+    raw.map(|xml| xmp_core::parse(&xml).get_attrs("sweep"))
+        .unwrap_or_default()
+}
+
+fn int_attr(attrs: &BTreeMap<String, String>, key: &str, default: i64) -> i64 {
+    attrs
+        .get(key)
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(default)
+}
+
+/// Python `_json_value`: parse as JSON, and on failure return the raw string.
+fn json_value_str(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+}
+
+/// Python `_json_list`: JSON-parse, keep it only if it really is a list.
+fn json_list(raw: &str) -> Value {
+    if raw.is_empty() {
+        return Value::Array(Vec::new());
+    }
+    match json_value_str(raw) {
+        Value::Array(items) => Value::Array(items),
+        _ => Value::Array(Vec::new()),
+    }
+}
+
+/// Python `_float_or_str`. Non-finite floats stay strings: Python's `float()`
+/// accepts "inf"/"nan" but the resulting JSON is not valid JSON, so emitting
+/// the raw string is the only faithful-and-valid option.
+fn float_or_str(raw: &str) -> Value {
+    match raw.parse::<f64>() {
+        Ok(parsed) if parsed.is_finite() => json!(parsed),
+        _ => Value::String(raw.to_string()),
+    }
+}
+
+fn optional_string(raw: Option<&String>) -> Value {
+    raw.map(|s| Value::String(s.clone())).unwrap_or(Value::Null)
+}
+
+fn axis_attrs_to_meta(attrs: &BTreeMap<String, String>, axis: usize) -> Option<Value> {
+    let prefix = format!("axis_{axis}_");
+    let param = attrs
+        .get(&format!("{prefix}param"))
+        .filter(|value| !value.is_empty())?;
+    let series_raw = attrs
+        .get(&format!("{prefix}series"))
+        .cloned()
+        .unwrap_or_default();
+    let value_raw = attrs.get(&format!("{prefix}value"));
+    let (series, value) = if param == "_macros" {
+        // Python: `_json_value(value_raw) if value_raw else value_raw` — an
+        // empty string is falsy there, so it survives as "" rather than null.
+        let value = match value_raw {
+            Some(raw) if !raw.is_empty() => json_value_str(raw),
+            other => optional_string(other),
+        };
+        (json_list(&series_raw), value)
+    } else {
+        let series: Vec<Value> = series_raw
+            .split(',')
+            .filter(|part| !part.is_empty())
+            .map(float_or_str)
+            .collect();
+        (Value::Array(series), optional_string(value_raw))
+    };
+    Some(json!({
+        "param": param,
+        "index": int_attr(attrs, &format!("{prefix}index"), 0),
+        "total": int_attr(attrs, &format!("{prefix}total"), 0),
+        "value": value,
+        "series": series,
+    }))
+}
+
+/// Mirrors Python `attrs_to_meta`. `None` means "this file carries no sweep",
+/// which the route turns into a 404 with code `no_sweep_xmp`.
+fn attrs_to_meta(attrs: &BTreeMap<String, String>) -> Option<Value> {
+    let id = attrs.get("id").filter(|value| !value.is_empty())?;
+    let axis_count = int_attr(attrs, "axis_count", 1).max(0) as usize;
+    let axes: Vec<Value> = (0..axis_count)
+        .filter_map(|axis| axis_attrs_to_meta(attrs, axis))
+        .collect();
+    let mut out = json!({
+        "id": id,
+        "bridge": attrs.get("bridge").cloned().unwrap_or_default(),
+        "axes": axes,
+        "base_seed": int_attr(attrs, "base_seed", -1),
+        "created_at": int_attr(attrs, "created_at", 0),
+    });
+    if let Some(template) = attrs.get("prompt_template") {
+        out["prompt_template"] = json!(template);
+    }
+    if let Some(template) = attrs.get("negative_template") {
+        out["negative_template"] = json!(template);
+    }
+    Some(out)
+}
+
+fn sweep_record(path: &str, attrs: &BTreeMap<String, String>) -> Value {
+    let mut record = json!({ "path": path });
+    for axis in 0..3 {
+        let index_key = format!("axis_{axis}_index");
+        if !attrs.contains_key(&index_key) {
+            continue;
+        }
+        let value_key = format!("axis_{axis}_value");
+        let raw_value = attrs.get(&value_key);
+        let is_macros = attrs
+            .get(&format!("axis_{axis}_param"))
+            .is_some_and(|param| param == "_macros");
+        let value = match raw_value {
+            Some(raw) if is_macros && !raw.is_empty() => json_value_str(raw),
+            other => optional_string(other),
+        };
+        if let Some(object) = record.as_object_mut() {
+            object.insert(index_key.clone(), json!(int_attr(attrs, &index_key, -1)));
+            object.insert(value_key, value);
+        }
+    }
+    record
+}
+
+fn record_axis_index(record: &Value, axis: usize) -> i64 {
+    record
+        .get(format!("axis_{axis}_index"))
+        .and_then(Value::as_i64)
+        .unwrap_or(-1)
+}
+
+/// Blocking: reads XMP from up to `SWEEP_FOLDER_SCAN_IMAGE_LIMIT` files.
+/// Callers must put this on a blocking thread.
+fn scan_folder_for_sweep(folder: &std::path::Path, sweep_id: &str) -> Vec<Value> {
+    scan_folder_for_sweep_limited(folder, sweep_id, SWEEP_FOLDER_SCAN_IMAGE_LIMIT)
+}
+
+/// The limit is a parameter so a test can reach it without staging a thousand
+/// files. Production always passes `SWEEP_FOLDER_SCAN_IMAGE_LIMIT`.
+fn scan_folder_for_sweep_limited(
+    folder: &std::path::Path,
+    sweep_id: &str,
+    limit: usize,
+) -> Vec<Value> {
+    let mut matches: Vec<Value> = Vec::new();
+    let entries = match std::fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(?error, ?folder, "sweep folder scan: read_dir failed");
+            return matches;
+        }
+    };
+    let mut image_candidates = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) || !is_sweep_image(&path) {
+            continue;
+        }
+        if image_candidates >= limit {
+            tracing::warn!(limit, ?folder, "sweep folder scan reached image limit");
+            break;
+        }
+        image_candidates += 1;
+        let attrs = read_sweep_attrs(&path);
+        if attrs.get("id").map(String::as_str) != Some(sweep_id) {
+            continue;
+        }
+        matches.push(sweep_record(&path.to_string_lossy(), &attrs));
+    }
+    matches.sort_by(|a, b| {
+        (
+            record_axis_index(a, 0),
+            record_axis_index(a, 1),
+            record_axis_index(a, 2),
+            a.get("path").and_then(Value::as_str).unwrap_or(""),
+        )
+            .cmp(&(
+                record_axis_index(b, 0),
+                record_axis_index(b, 1),
+                record_axis_index(b, 2),
+                b.get("path").and_then(Value::as_str).unwrap_or(""),
+            ))
+    });
+    matches
+}
+
+/// Python `resolve_path`: a path containing `!` denotes a file inside an
+/// archive, which has no on-disk XMP to read, so it is treated as absent.
+async fn resolve_path(pool: &SqlitePool, file_id: i64) -> Result<Option<String>, sqlx::Error> {
+    let row = sqlx::query("SELECT path FROM files WHERE id=?")
+        .bind(file_id)
+        .fetch_optional(pool)
+        .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let path: String = row.try_get("path")?;
+    Ok(if path.contains('!') { None } else { Some(path) })
+}
+
+async fn attach_file_ids(pool: &SqlitePool, matches: &mut [Value]) -> Result<(), sqlx::Error> {
+    if matches.is_empty() {
+        return Ok(());
+    }
+    let mut unique: Vec<String> = Vec::new();
+    for record in matches.iter() {
+        if let Some(path) = record.get("path").and_then(Value::as_str) {
+            if !unique.iter().any(|seen| seen == path) {
+                unique.push(path.to_string());
+            }
+        }
+    }
+    let mut by_path: HashMap<String, i64> = HashMap::new();
+    for chunk in unique.chunks(FILE_ID_CHUNK_SIZE) {
+        let placeholders = vec!["?"; chunk.len()].join(",");
+        let sql = format!("SELECT id, path FROM files WHERE path IN ({placeholders})");
+        let mut query = sqlx::query(&sql);
+        for path in chunk {
+            query = query.bind(path);
+        }
+        for row in query.fetch_all(pool).await? {
+            by_path.insert(row.try_get("path")?, row.try_get("id")?);
+        }
+    }
+    for record in matches.iter_mut() {
+        let file_id = record
+            .get("path")
+            .and_then(Value::as_str)
+            .and_then(|path| by_path.get(path))
+            .copied();
+        if let Some(object) = record.as_object_mut() {
+            object.insert(
+                "file_id".to_string(),
+                file_id.map(|id| json!(id)).unwrap_or(Value::Null),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// GET /api/sweep/info/{file_id} — Python `routes/sweep_routes.py::api_sweep_info`.
+pub async fn info(
+    State(state): State<SharedState>,
+    RoutePath(file_id): RoutePath<i64>,
+) -> Response {
+    let path = match resolve_path(&state.db_read, file_id).await {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            return api_error_status(
+                "file not found or not on disk",
+                axum::http::StatusCode::NOT_FOUND,
+            )
+        }
+        Err(error) => {
+            tracing::error!(?error, "sweep info: resolve_path failed");
+            return api_error("Failed to resolve file path");
+        }
+    };
+    if !is_sweep_image(std::path::Path::new(&path)) {
+        return api_error_status(
+            "unsupported file type for XMP",
+            axum::http::StatusCode::BAD_REQUEST,
+        );
+    }
+    let read_path = path.clone();
+    let attrs = match tokio::task::spawn_blocking(move || {
+        read_sweep_attrs(std::path::Path::new(&read_path))
+    })
+    .await
+    {
+        Ok(attrs) => attrs,
+        Err(error) => {
+            tracing::error!(?error, "sweep info: XMP read task failed");
+            return api_error("Failed to read sweep metadata");
+        }
+    };
+    match attrs_to_meta(&attrs) {
+        Some(meta) => api_success_payload(json!({"meta": meta, "path": path})),
+        None => api_error_coded(
+            "no sweep metadata in this file",
+            axum::http::StatusCode::NOT_FOUND,
+            "no_sweep_xmp",
+        ),
+    }
+}
+
+/// GET /api/sweep/files/{sweep_id} — Python `api_sweep_files`. The `file_id`
+/// query parameter is a folder hint, not the subject of the lookup.
+pub async fn files(
+    State(state): State<SharedState>,
+    RoutePath(sweep_id): RoutePath<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if sweep_id.is_empty() {
+        return api_error_status("sweep_id is required", axum::http::StatusCode::BAD_REQUEST);
+    }
+    let Some(hint_raw) = params.get("file_id").filter(|value| !value.is_empty()) else {
+        return api_error_status(
+            "file_id query parameter is required as folder hint",
+            axum::http::StatusCode::BAD_REQUEST,
+        );
+    };
+    let Ok(hint_id) = hint_raw.trim().parse::<i64>() else {
+        return api_error_status(
+            "file_id must be an integer",
+            axum::http::StatusCode::BAD_REQUEST,
+        );
+    };
+    let hint_path = match resolve_path(&state.db_read, hint_id).await {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            return api_error_status("hint file not found", axum::http::StatusCode::NOT_FOUND)
+        }
+        Err(error) => {
+            tracing::error!(?error, "sweep files: resolve_path failed");
+            return api_error("Failed to resolve hint file path");
+        }
+    };
+    let folder = std::path::Path::new(&hint_path)
+        .parent()
+        .map(|parent| parent.to_path_buf())
+        .unwrap_or_default();
+    let scan_folder = folder.clone();
+    let scan_id = sweep_id.clone();
+    let mut matches =
+        match tokio::task::spawn_blocking(move || scan_folder_for_sweep(&scan_folder, &scan_id))
+            .await
+        {
+            Ok(matches) => matches,
+            Err(error) => {
+                tracing::error!(?error, "sweep files: folder scan task failed");
+                return api_error("Failed to scan sweep folder");
+            }
+        };
+    if let Err(error) = attach_file_ids(&state.db_read, &mut matches).await {
+        tracing::error!(?error, "sweep files: attach_file_ids failed");
+        return api_error("Failed to resolve sweep file ids");
+    }
+    api_success_payload(json!({
+        "sweep_id": sweep_id,
+        "folder": folder.to_string_lossy(),
+        "matches": matches,
+    }))
+}
+
 pub async fn history(
     State(state): State<SharedState>,
     Query(params): Query<HashMap<String, String>>,
@@ -493,5 +891,315 @@ mod tests {
             .contains(&"s.first_file_id IS NOT NULL".to_string()));
         assert!(filters.where_sql.contains(&"s.axis_count = ?".to_string()));
         assert!(filters.where_sql.contains(&"s.created_at >= ?".to_string()));
+    }
+
+    // --- /api/sweep/info and /api/sweep/files (ported from Python) ---
+
+    fn attrs(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn meta_requires_a_non_empty_id() {
+        assert!(attrs_to_meta(&attrs(&[])).is_none());
+        assert!(attrs_to_meta(&attrs(&[("id", "")])).is_none());
+        assert!(attrs_to_meta(&attrs(&[("id", "s1")])).is_some());
+    }
+
+    #[test]
+    fn meta_defaults_match_python() {
+        let meta = attrs_to_meta(&attrs(&[("id", "s1")])).unwrap();
+        assert_eq!(meta["base_seed"], -1);
+        assert_eq!(meta["created_at"], 0);
+        assert_eq!(meta["bridge"], "");
+        // axis_count defaults to 1, but with no axis_0_param the axis drops out.
+        assert_eq!(meta["axes"].as_array().unwrap().len(), 0);
+        // Optional templates stay absent rather than becoming null.
+        assert!(meta.get("prompt_template").is_none());
+    }
+
+    #[test]
+    fn unparsable_ints_fall_back_to_the_default() {
+        // Python's int("3.5") raises, so the default wins. A silent 3 here
+        // would be a divergence.
+        let meta = attrs_to_meta(&attrs(&[("id", "s1"), ("base_seed", "3.5")])).unwrap();
+        assert_eq!(meta["base_seed"], -1);
+    }
+
+    #[test]
+    fn negative_axis_count_yields_no_axes() {
+        // Python range(-2) is empty; a naive `as usize` cast would wrap and
+        // try to build billions of axes.
+        let meta = attrs_to_meta(&attrs(&[
+            ("id", "s1"),
+            ("axis_count", "-2"),
+            ("axis_0_param", "cfg"),
+        ]))
+        .unwrap();
+        assert_eq!(meta["axes"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn plain_axis_series_splits_on_comma_and_parses_numbers() {
+        let meta = attrs_to_meta(&attrs(&[
+            ("id", "s1"),
+            ("axis_0_param", "cfg"),
+            ("axis_0_series", "1,2.5,,abc"),
+            ("axis_0_value", "2.5"),
+            ("axis_0_index", "1"),
+            ("axis_0_total", "3"),
+        ]))
+        .unwrap();
+        let axis = &meta["axes"][0];
+        assert_eq!(axis["param"], "cfg");
+        assert_eq!(axis["index"], 1);
+        assert_eq!(axis["total"], 3);
+        // Empty segments are dropped; non-numeric parts stay strings.
+        assert_eq!(axis["series"], json!([1.0, 2.5, "abc"]));
+        // A plain axis keeps `value` as the raw string, never a number.
+        assert_eq!(axis["value"], "2.5");
+    }
+
+    #[test]
+    fn macros_axis_decodes_json_but_keeps_empty_string() {
+        let decoded = attrs_to_meta(&attrs(&[
+            ("id", "s1"),
+            ("axis_0_param", "_macros"),
+            ("axis_0_series", r#"[{"a":1}]"#),
+            ("axis_0_value", r#"{"a":1}"#),
+        ]))
+        .unwrap();
+        assert_eq!(decoded["axes"][0]["series"], json!([{"a": 1}]));
+        assert_eq!(decoded["axes"][0]["value"], json!({"a": 1}));
+
+        // Python's `if value_raw` is false for "", so it survives as "".
+        let empty = attrs_to_meta(&attrs(&[
+            ("id", "s1"),
+            ("axis_0_param", "_macros"),
+            ("axis_0_value", ""),
+        ]))
+        .unwrap();
+        assert_eq!(empty["axes"][0]["value"], "");
+    }
+
+    #[test]
+    fn malformed_macros_json_falls_back_to_the_raw_string() {
+        let meta = attrs_to_meta(&attrs(&[
+            ("id", "s1"),
+            ("axis_0_param", "_macros"),
+            ("axis_0_series", "not json"),
+            ("axis_0_value", "not json"),
+        ]))
+        .unwrap();
+        // A non-list parse result becomes [], not the raw string.
+        assert_eq!(meta["axes"][0]["series"], json!([]));
+        assert_eq!(meta["axes"][0]["value"], "not json");
+    }
+
+    #[test]
+    fn sweep_record_only_emits_axes_that_are_present() {
+        let record = sweep_record(
+            "/img/a.png",
+            &attrs(&[("axis_0_index", "2"), ("axis_0_value", "7")]),
+        );
+        assert_eq!(record["path"], "/img/a.png");
+        assert_eq!(record["axis_0_index"], 2);
+        assert_eq!(record["axis_0_value"], "7");
+        assert!(record.get("axis_1_index").is_none());
+    }
+
+    #[test]
+    fn sweep_record_index_defaults_to_minus_one() {
+        let record = sweep_record("/img/a.png", &attrs(&[("axis_0_index", "oops")]));
+        assert_eq!(record["axis_0_index"], -1);
+        assert_eq!(record["axis_0_value"], Value::Null);
+    }
+
+    #[test]
+    fn image_suffix_check_is_case_insensitive_and_rejects_others() {
+        assert!(is_sweep_image(std::path::Path::new("/a/b.PNG")));
+        assert!(is_sweep_image(std::path::Path::new("/a/b.jpeg")));
+        assert!(!is_sweep_image(std::path::Path::new("/a/b.gif")));
+        assert!(!is_sweep_image(std::path::Path::new("/a/b")));
+    }
+
+    #[tokio::test]
+    async fn success_payload_merges_at_the_top_level_and_leaves_data_null() {
+        // The sweep view reads `d.meta` off the root. Nesting it under `data`
+        // would return HTTP 200 and still break the page, so assert the body,
+        // not the status — the status alone cannot fail here.
+        let response = api_success_payload(json!({"meta": {"id": "s1"}, "path": "/x.png"}));
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["error"], Value::Null);
+        assert_eq!(body["data"], Value::Null, "payload must not land in `data`");
+        assert_eq!(body["meta"]["id"], "s1");
+        assert_eq!(body["path"], "/x.png");
+    }
+
+    #[tokio::test]
+    async fn folder_scan_matches_only_the_requested_sweep_and_sorts_by_axis() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, sweep: &str, index: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, minimal_png()).unwrap();
+            xmp_core::io::png::write_xmp(&path, &sweep_xmp(sweep, index)).unwrap();
+            path
+        };
+        write("b.png", "target", "2");
+        write("a.png", "target", "1");
+        write("c.png", "other", "0");
+        std::fs::write(dir.path().join("note.txt"), b"not an image").unwrap();
+
+        let matches = scan_folder_for_sweep(dir.path(), "target");
+        assert_eq!(matches.len(), 2, "only the target sweep's images match");
+        // Sorted by axis_0_index, so a.png (1) precedes b.png (2).
+        assert_eq!(matches[0]["axis_0_index"], 1);
+        assert_eq!(matches[1]["axis_0_index"], 2);
+    }
+
+    #[test]
+    fn folder_scan_on_a_missing_directory_returns_empty_not_an_error() {
+        let matches = scan_folder_for_sweep(
+            std::path::Path::new("/nonexistent-sweep-folder-xyz"),
+            "target",
+        );
+        assert!(matches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn folder_scan_budget_counts_images_only_and_stops_there() {
+        // Two claims from the comment on the constant, both measured here:
+        // (1) non-images do not consume the budget, (2) the scan really stops.
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..4 {
+            let path = dir.path().join(format!("{i}.png"));
+            let xmp = sweep_xmp("target", &i.to_string());
+            std::fs::write(&path, minimal_png()).unwrap();
+            xmp_core::io::png::write_xmp(&path, &xmp).unwrap();
+        }
+        for i in 0..10 {
+            std::fs::write(dir.path().join(format!("{i}.txt")), b"filler").unwrap();
+        }
+
+        // read_dir order is not guaranteed, so assert on the count, not on which.
+        let limited = scan_folder_for_sweep_limited(dir.path(), "target", 2);
+        assert_eq!(limited.len(), 2, "scan must stop at the image budget");
+        let unlimited = scan_folder_for_sweep_limited(dir.path(), "target", 4);
+        assert_eq!(
+            unlimited.len(),
+            4,
+            "10 non-image files must not eat the budget"
+        );
+    }
+
+    async fn files_table_pool(rows: &[(i64, &str)]) -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                <sqlx::sqlite::SqliteConnectOptions as std::str::FromStr>::from_str(
+                    "sqlite::memory:",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT NOT NULL);")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (id, path) in rows {
+            sqlx::query("INSERT INTO files(id, path) VALUES (?, ?)")
+                .bind(id)
+                .bind(path)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        pool
+    }
+
+    #[tokio::test]
+    async fn resolve_path_hides_files_that_live_inside_an_archive() {
+        // Python returns None when the path contains "!", because an entry
+        // inside a zip has no on-disk XMP to read. Dropping this check would
+        // hand a bogus path to the XMP reader.
+        let pool = files_table_pool(&[(1, "/img/a.png"), (2, "/img/bundle.zip!inner.png")]).await;
+        assert_eq!(
+            resolve_path(&pool, 1).await.unwrap(),
+            Some("/img/a.png".to_string())
+        );
+        assert_eq!(resolve_path(&pool, 2).await.unwrap(), None);
+        assert_eq!(resolve_path(&pool, 999).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn attach_file_ids_fills_known_paths_and_nulls_the_rest() {
+        let pool = files_table_pool(&[(11, "/img/a.png"), (12, "/img/b.png")]).await;
+        let mut matches = vec![
+            json!({"path": "/img/a.png"}),
+            json!({"path": "/img/missing.png"}),
+            json!({"path": "/img/b.png"}),
+        ];
+        attach_file_ids(&pool, &mut matches).await.unwrap();
+        assert_eq!(matches[0]["file_id"], 11);
+        assert_eq!(
+            matches[1]["file_id"],
+            Value::Null,
+            "a path absent from the DB must be null, not omitted"
+        );
+        assert_eq!(matches[2]["file_id"], 12);
+    }
+
+    fn sweep_xmp(sweep_id: &str, axis_index: &str) -> String {
+        format!(
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF
+               xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+               xmlns:sweep="http://ns.yu-ai-manager/sweep/1.0/">
+               <rdf:Description sweep:id="{sweep_id}" sweep:axis_0_index="{axis_index}"/>
+               </rdf:RDF></x:xmpmeta>"#
+        )
+    }
+
+    /// Smallest PNG the XMP writer will accept: signature + IHDR + IEND.
+    fn minimal_png() -> Vec<u8> {
+        let mut out = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        let ihdr_body = {
+            let mut b = Vec::new();
+            b.extend_from_slice(b"IHDR");
+            b.extend_from_slice(&1u32.to_be_bytes()); // width
+            b.extend_from_slice(&1u32.to_be_bytes()); // height
+            b.extend_from_slice(&[8, 6, 0, 0, 0]); // bit depth, colour type, ...
+            b
+        };
+        out.extend_from_slice(&((ihdr_body.len() - 4) as u32).to_be_bytes());
+        out.extend_from_slice(&ihdr_body);
+        out.extend_from_slice(&crc32(&ihdr_body).to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(b"IEND");
+        out.extend_from_slice(&crc32(b"IEND").to_be_bytes());
+        out
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffffu32;
+        for byte in data {
+            crc ^= *byte as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
     }
 }

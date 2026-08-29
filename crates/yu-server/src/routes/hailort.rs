@@ -205,7 +205,11 @@ pub async fn llm_generate(
         infer_client.llm_generate(
             body.hef_path,
             body.prompt,
-            body.timeout_ms.map(|value| value.min(MAX_TIMEOUT_MS)),
+            Some(
+                body.timeout_ms
+                    .map(|value| value.min(MAX_TIMEOUT_MS))
+                    .unwrap_or(crate::infer_client::DEFAULT_GENERATE_TIMEOUT_MS),
+            ),
         ),
     )
     .await

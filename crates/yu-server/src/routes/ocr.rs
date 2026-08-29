@@ -7,6 +7,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::Row;
+use std::time::Duration;
 
 use crate::{
     auth::{scope::require_admin_scope, AuthContext},
@@ -26,6 +27,51 @@ pub async fn ocr_engines(
     }
     // ponytail: ai_servers is not wired here yet; Phase 2 can read config.
     Json(json!({"engines": [], "manga_ocr_available": false})).into_response()
+}
+
+/// GET /api/ocr/benchmark/report/{report_id}
+pub async fn ocr_benchmark_report(
+    State(state): State<SharedState>,
+    auth_context: Option<Extension<AuthContext>>,
+    Path(report_id): Path<String>,
+) -> Response {
+    if let Some(resp) = require_admin_scope(
+        state.config.pin_auth_enabled,
+        auth_context.as_ref().map(|e| &e.0),
+    ) {
+        return resp;
+    }
+    if report_id.contains('/') || report_id.contains('\\') || report_id.contains("..") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "invalid_report_id"})),
+        )
+            .into_response();
+    }
+    let reports = state
+        .config
+        .project_root
+        .join("extensions/builtin_ocr/benchmarks/reports");
+    match std::fs::read(reports.join(format!("{report_id}.json"))) {
+        Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(report) => Json(report).into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": "invalid_report"})),
+            )
+                .into_response(),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"ok": false, "error": "report_not_found"})),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "error": "report_read_failed"})),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -349,5 +395,531 @@ pub async fn ocr_result_delete(
             )
                 .into_response()
         }
+    }
+}
+
+/// PUT /api/ocr/profiles/{model_prefix}
+///
+/// Ports `core/ocr_api/benchmark_ops.py::api_ocr_profile_update`.
+///
+/// Storage is the extension's own `profiles/model_profiles.json`, NOT the
+/// unrelated `profiles_dir()` in auto_stubs.rs (which resolves
+/// TAGDB_PROFILES_DIR / project_root/profiles and belongs to a different
+/// feature). Writing there would silently split the store in two.
+///
+/// The Python side clamps each score to 0..=100 via `max(0, min(100, int(v)))`
+/// and drops non-numeric values; the file carries `{version, updated_at,
+/// profiles}` and the reader also accepts a bare mapping. Both behaviours are
+/// reproduced here so a file written by either side stays readable by the other.
+pub async fn ocr_profiles_update(
+    State(state): State<SharedState>,
+    Path(model_prefix): Path<String>,
+    auth_context: Option<Extension<AuthContext>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Some(resp) = require_admin_scope(
+        state.config.pin_auth_enabled,
+        auth_context.as_ref().map(|e| &e.0),
+    ) {
+        return resp;
+    }
+
+    let scores = body.get("scores").and_then(|v| v.as_object());
+    let Some(scores) = scores.filter(|m| !m.is_empty()) else {
+        // Python: `if not scores: return api_error("scores is required", 400)`.
+        // An empty object takes this branch there too, so it does here.
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "scores is required"})),
+        )
+            .into_response();
+    };
+
+    // Same clamp and same "numbers only" filter as update_model_profile().
+    let mut clamped = serde_json::Map::new();
+    for (k, v) in scores {
+        if let Some(n) = v.as_f64() {
+            let i = n.trunc() as i64;
+            clamped.insert(k.clone(), json!(i.clamp(0, 100)));
+        }
+    }
+
+    let path = ocr_profiles_path(&state);
+    let mut store = read_ocr_profiles(&path);
+    store.insert(
+        model_prefix.clone(),
+        serde_json::Value::Object(clamped.clone()),
+    );
+
+    if let Err(e) = write_ocr_profiles(&path, &store) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("failed to save profiles: {e}")})),
+        )
+            .into_response();
+    }
+
+    Json(json!({"model": model_prefix, "scores": clamped})).into_response()
+}
+
+/// GET /api/ocr/profiles
+pub async fn ocr_profiles_list(
+    State(state): State<SharedState>,
+    auth_context: Option<Extension<AuthContext>>,
+) -> Response {
+    if let Some(resp) = require_admin_scope(
+        state.config.pin_auth_enabled,
+        auth_context.as_ref().map(|e| &e.0),
+    ) {
+        return resp;
+    }
+
+    let local = read_ocr_profiles(&ocr_profiles_path(&state));
+    let mut profiles = builtin_ocr_profiles();
+    profiles.extend(local.clone());
+    let mut profiles = profiles.into_iter().collect::<Vec<_>>();
+    profiles.sort_unstable_by(|(model, _), (other, _)| model.cmp(other));
+
+    Json(
+        json!({"profiles": profiles.into_iter().map(|(model, scores)| {
+        json!({
+            "model": model,
+            "scores": scores,
+            "source": if local.contains_key(&model) { "local" } else { "builtin" },
+        })
+    }).collect::<Vec<_>>() }),
+    )
+    .into_response()
+}
+
+/// POST /api/ocr/profiles/fetch
+pub async fn ocr_profiles_fetch(
+    State(state): State<SharedState>,
+    auth_context: Option<Extension<AuthContext>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Response {
+    ocr_profiles_fetch_with_policy(
+        state,
+        auth_context,
+        body.map(|Json(body)| body).unwrap_or_default(),
+        false,
+    )
+    .await
+}
+
+async fn ocr_profiles_fetch_with_policy(
+    state: SharedState,
+    auth_context: Option<Extension<AuthContext>>,
+    body: serde_json::Value,
+    allow_local: bool,
+) -> Response {
+    if let Some(resp) = require_admin_scope(
+        state.config.pin_auth_enabled,
+        auth_context.as_ref().map(|e| &e.0),
+    ) {
+        return resp;
+    }
+
+    let url = body
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if url.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "error": "url is required"})),
+        )
+            .into_response();
+    }
+    if let Some(error) = crate::routes::analysis_net::validate_openai_compat_url(url, allow_local) {
+        let status = if error == "Blocked address" || error.to_lowercase().contains("http/https") {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return (status, Json(json!({"ok": false, "error": error}))).into_response();
+    }
+
+    let fetched = async {
+        let client = crate::analysis_engines::http_client::build_pinned_client(
+            url,
+            allow_local,
+            Duration::from_secs(15),
+        )
+        .await?;
+        let response = client
+            .get(url)
+            .header(reqwest::header::USER_AGENT, "YU-AI-Manager")
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(|error| {
+                crate::analysis_engines::EngineError::msg(format!(
+                    "Failed to fetch profiles: {error}"
+                ))
+            })?
+            .error_for_status()
+            .map_err(|error| {
+                crate::analysis_engines::EngineError::msg(format!(
+                    "Failed to fetch profiles: {error}"
+                ))
+            })?;
+        let body =
+            crate::analysis_engines::http_client::read_response_capped(response, 1_048_576).await?;
+        serde_json::from_str::<serde_json::Value>(&body).map_err(|error| {
+            crate::analysis_engines::EngineError::msg(format!("Failed to fetch profiles: {error}"))
+        })
+    }
+    .await;
+
+    let data = match fetched {
+        Ok(data) => data,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": error.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let profiles = match data {
+        serde_json::Value::Object(mut data) => match data.remove("profiles") {
+            Some(serde_json::Value::Object(profiles)) => profiles,
+            Some(_) => return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": "Invalid profile format: expected JSON object"})),
+            )
+                .into_response(),
+            None => data,
+        },
+        _ => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "error": "Invalid profile format: expected JSON object"})),
+            )
+                .into_response()
+        }
+    };
+
+    let mut fetched = serde_json::Map::new();
+    for (model, scores) in profiles {
+        let Some(scores) = scores.as_object() else {
+            continue;
+        };
+        let mut clamped = serde_json::Map::new();
+        for (name, score) in scores {
+            if let Some(score) = score.as_f64() {
+                clamped.insert(name.clone(), json!((score.trunc() as i64).clamp(0, 100)));
+            }
+        }
+        fetched.insert(model, serde_json::Value::Object(clamped));
+    }
+
+    let path = ocr_profiles_path(&state);
+    let existing = read_ocr_profiles(&path);
+    let new_models = fetched
+        .keys()
+        .filter(|model| !existing.contains_key(*model))
+        .count();
+    let updated_models = fetched.len() - new_models;
+    let mut merged = existing;
+    merged.extend(fetched.clone());
+    if let Err(error) = write_ocr_profiles(&path, &merged) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "error": format!("failed to save profiles: {error}")})),
+        )
+            .into_response();
+    }
+
+    let fetched_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    Json(json!({
+        "profiles": fetched,
+        "source": url,
+        "fetched_at": fetched_at,
+        "model_count": fetched.len(),
+        "merged_count": merged.len(),
+        "new_models": new_models,
+        "updated_models": updated_models,
+    }))
+    .into_response()
+}
+
+fn builtin_ocr_profiles() -> serde_json::Map<String, serde_json::Value> {
+    serde_json::from_value(json!({
+        "openbmb/minicpm-v4.5": {
+            "ocr": 97, "ocr_document": 90, "ocr_manga": 70,
+            "caption": 95, "tag": 93, "nsfw": 60,
+        },
+        "openbmb/minicpm-o4.5": {
+            "ocr": 95, "ocr_document": 92, "ocr_manga": 65,
+            "caption": 93, "tag": 90,
+        },
+        "huihui_ai/qwen2.5-vl-abliterated": {
+            "ocr": 80, "ocr_document": 75, "ocr_manga": 50,
+            "caption": 85, "tag": 85, "nsfw": 95,
+        },
+        "huihui_ai/qwen3-vl-abliterated": {
+            "ocr": 85, "ocr_document": 80, "ocr_manga": 55,
+            "caption": 88, "tag": 88, "nsfw": 95,
+        },
+        "qwen2.5vl": {
+            "ocr": 80, "ocr_document": 78, "ocr_manga": 50,
+            "caption": 85, "tag": 85,
+        },
+        "llama3.2-vision": {
+            "ocr": 70, "ocr_document": 65, "ocr_manga": 30,
+            "caption": 80, "tag": 78,
+        },
+    }))
+    .expect("builtin OCR profiles are objects")
+}
+
+fn ocr_profiles_path(state: &SharedState) -> std::path::PathBuf {
+    state
+        .config
+        .project_root
+        .join("extensions/builtin_ocr/profiles/model_profiles.json")
+}
+
+/// Read the profile map, tolerating both the wrapped and the bare shape.
+fn read_ocr_profiles(path: &std::path::Path) -> serde_json::Map<String, serde_json::Value> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return serde_json::Map::new();
+    };
+    let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) else {
+        // Python logs and returns {} rather than failing the request.
+        return serde_json::Map::new();
+    };
+    match data.get("profiles") {
+        Some(profiles) => profiles.as_object().cloned().unwrap_or_default(),
+        None => data.as_object().cloned().unwrap_or_default(),
+    }
+}
+
+fn write_ocr_profiles(
+    path: &std::path::Path,
+    profiles: &serde_json::Map<String, serde_json::Value>,
+) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let updated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let doc = json!({
+        "version": 1,
+        "updated_at": updated_at,
+        "profiles": profiles,
+    });
+    std::fs::write(path, serde_json::to_string_pretty(&doc)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::semantic_test_state_with_root;
+    use axum::{body::to_bytes, http::header::LOCATION, routing::get, Router};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    async fn body_json(response: Response) -> serde_json::Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn test_state(root: &tempfile::TempDir) -> SharedState {
+        semantic_test_state_with_root(false, String::new(), root.path().to_path_buf()).await
+    }
+
+    async fn test_server(app: Router) -> Option<(String, tokio::task::JoinHandle<()>)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
+        let address = listener.local_addr().ok()?;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Some((format!("http://{address}/"), server))
+    }
+
+    #[tokio::test]
+    async fn ocr_profiles_roundtrip_returns_written_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(&root).await;
+        let updated = ocr_profiles_update(
+            State(state.clone()),
+            Path("test-model".to_string()),
+            None,
+            Json(json!({"scores": {"ocr": 91}})),
+        )
+        .await;
+        assert_eq!(updated.status(), StatusCode::OK);
+
+        let body = body_json(ocr_profiles_list(State(state), None).await).await;
+        assert_eq!(body["profiles"].as_array().unwrap().len(), 7);
+        assert!(body["profiles"].as_array().unwrap().iter().any(|profile| {
+            profile == &json!({"model": "test-model", "scores": {"ocr": 91}, "source": "local"})
+        }));
+    }
+
+    #[tokio::test]
+    async fn ocr_profiles_keeps_builtins_when_one_is_overridden_locally() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(&root).await;
+        let path = ocr_profiles_path(&state);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"profiles":{"qwen2.5vl":{"ocr":99}}}"#).unwrap();
+
+        let body = body_json(ocr_profiles_list(State(state), None).await).await;
+        let profiles = body["profiles"].as_array().unwrap();
+        assert_eq!(profiles.len(), 6);
+        assert_eq!(profiles[0]["model"], "huihui_ai/qwen2.5-vl-abliterated");
+        assert_eq!(profiles[5]["model"], "qwen2.5vl");
+        assert!(profiles.iter().all(|profile| {
+            profile["source"]
+                == if profile["model"] == "qwen2.5vl" {
+                    "local"
+                } else {
+                    "builtin"
+                }
+        }));
+        assert_eq!(
+            profiles[5],
+            json!({"model": "qwen2.5vl", "scores": {"ocr": 99}, "source": "local"})
+        );
+    }
+
+    #[tokio::test]
+    async fn ocr_profiles_tolerates_missing_or_malformed_local_file() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(&root).await;
+        let missing = ocr_profiles_list(State(state.clone()), None).await;
+        assert_eq!(missing.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(missing).await["profiles"]
+                .as_array()
+                .unwrap()
+                .len(),
+            6
+        );
+
+        let path = ocr_profiles_path(&state);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "{bad json").unwrap();
+        let malformed = ocr_profiles_list(State(state), None).await;
+        assert_eq!(malformed.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(malformed).await["profiles"]
+                .as_array()
+                .unwrap()
+                .len(),
+            6
+        );
+    }
+
+    #[tokio::test]
+    async fn ocr_profiles_fetch_merges_and_returns_seven_keys() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(&root).await;
+        let path = ocr_profiles_path(&state);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"profiles":{"existing":{"ocr":1},"kept":{"ocr":2}}}"#,
+        )
+        .unwrap();
+        let Some((url, server)) = test_server(Router::new().route(
+            "/",
+            get(|| async {
+                Json(json!({"profiles":{"existing":{"ocr":101},"new":{"ocr":-2,"skip":"x"}}}))
+            }),
+        ))
+        .await
+        else {
+            return;
+        };
+
+        let response = ocr_profiles_fetch_with_policy(state, None, json!({"url": url}), true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body.as_object().unwrap().len(), 7);
+        assert_eq!(body["model_count"], 2);
+        assert_eq!(body["merged_count"], 3);
+        assert_eq!(body["new_models"], 1);
+        assert_eq!(body["updated_models"], 1);
+        assert_eq!(
+            body["profiles"],
+            json!({"existing":{"ocr":100},"new":{"ocr":0}})
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ocr_profiles_fetch_does_not_follow_redirects() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(&root).await;
+        let target_hits = Arc::new(AtomicUsize::new(0));
+        let target_hits_for_route = target_hits.clone();
+        let Some((url, server)) = test_server(
+            Router::new()
+                .route(
+                    "/",
+                    get(|| async { (StatusCode::FOUND, [(LOCATION, "/target")]) }),
+                )
+                .route(
+                    "/target",
+                    get(move || {
+                        let target_hits = target_hits_for_route.clone();
+                        async move {
+                            target_hits.fetch_add(1, Ordering::SeqCst);
+                            Json(json!({"redirected":{"ocr":50}}))
+                        }
+                    }),
+                ),
+        )
+        .await
+        else {
+            return;
+        };
+
+        let response = ocr_profiles_fetch_with_policy(state, None, json!({"url": url}), true).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ocr_profiles_fetch_rejects_oversized_response() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(&root).await;
+        let Some((url, server)) =
+            test_server(Router::new().route("/", get(|| async { "x".repeat(1_048_577) }))).await
+        else {
+            return;
+        };
+
+        let response = ocr_profiles_fetch_with_policy(state, None, json!({"url": url}), true).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_json(response).await["error"], "response_too_large");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ocr_profiles_fetch_rejects_loopback() {
+        let root = tempfile::tempdir().unwrap();
+        let response = ocr_profiles_fetch(
+            State(test_state(&root).await),
+            None,
+            Some(Json(json!({"url":"http://127.0.0.1:8080/profiles.json"}))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(response).await,
+            json!({"ok":false,"error":"Blocked address"})
+        );
     }
 }

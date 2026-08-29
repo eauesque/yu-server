@@ -407,7 +407,7 @@ impl DetectPipeline {
             ));
         }
         let mut rgb = frame.bytes.to_vec();
-        for pixel in rgb.chunks_exact_mut(3) {
+        for pixel in rgb.as_chunks_mut::<3>().0 {
             pixel.swap(0, 2);
         }
         let image = image::RgbImage::from_raw(frame.width, frame.height, rgb)
@@ -555,7 +555,14 @@ pub(super) mod tests {
     };
     use super::*;
 
-    const TEST_TIMEOUT: Duration = Duration::from_secs(15);
+    /// Watchdog for a hung test, not a budget for a slow one. These tests run
+    /// ~4s idle and ~6.5s under moderate CPU load (measured 2026-08-29), and a
+    /// full-suite run alongside continuous cargo builds pushed
+    /// source_count_policy_skips_real_requests_and_status_is_stable to 15s --
+    /// the deadline fired on a healthy run. A genuinely hung test never
+    /// finishes, so a wide budget still catches it while a tight one only
+    /// manufactures flakes.
+    const TEST_TIMEOUT: Duration = Duration::from_secs(60);
     const FRAME_SIZE: usize = INPUT_SIZE as usize * INPUT_SIZE as usize * 3;
 
     #[derive(Clone, Default)]
@@ -680,7 +687,7 @@ pub(super) mod tests {
 
     pub(crate) fn red_bgr(width: u32, height: u32) -> Arc<Bytes> {
         let mut bytes = vec![0; width as usize * height as usize * 3];
-        for pixel in bytes.chunks_exact_mut(3) {
+        for pixel in bytes.as_chunks_mut::<3>().0 {
             pixel[2] = 255;
         }
         Arc::new(Bytes::from(bytes))
@@ -688,7 +695,7 @@ pub(super) mod tests {
 
     fn blue_bgr(width: u32, height: u32) -> Arc<Bytes> {
         let mut bytes = vec![0; width as usize * height as usize * 3];
-        for pixel in bytes.chunks_exact_mut(3) {
+        for pixel in bytes.as_chunks_mut::<3>().0 {
             pixel[0] = 255;
         }
         Arc::new(Bytes::from(bytes))
@@ -768,7 +775,7 @@ pub(super) mod tests {
                 .decode(body["input_base64"].as_str().unwrap())
                 .unwrap();
             assert_eq!(input.len(), FRAME_SIZE);
-            assert!(input.chunks_exact(3).all(|pixel| pixel == [255, 0, 0]));
+            assert!(input.as_chunks::<3>().0.iter().all(|&p| p == [255, 0, 0]));
             assert_eq!(body["orig_w"], INPUT_SIZE);
             assert_eq!(body["orig_h"], INPUT_SIZE);
             assert_eq!(body["scale"], 1.0);
@@ -895,7 +902,7 @@ pub(super) mod tests {
             let latest = STANDARD
                 .decode(requests.last().unwrap()["input_base64"].as_str().unwrap())
                 .unwrap();
-            assert!(latest.chunks_exact(3).all(|pixel| pixel == [0, 0, 255]));
+            assert!(latest.as_chunks::<3>().0.iter().all(|&p| p == [0, 0, 255]));
             server.abort();
         });
     }
@@ -943,7 +950,7 @@ pub(super) mod tests {
             let latest = STANDARD
                 .decode(requests.last().unwrap()["input_base64"].as_str().unwrap())
                 .unwrap();
-            assert!(latest.chunks_exact(3).all(|pixel| pixel == [0, 0, 255]));
+            assert!(latest.as_chunks::<3>().0.iter().all(|&p| p == [0, 0, 255]));
             server.abort();
         });
     }

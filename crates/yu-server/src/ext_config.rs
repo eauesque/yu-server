@@ -46,6 +46,45 @@ pub fn save_extension_value(
     crate::config_io::write(config_path, &config)
 }
 
+/// Insert or remove `<section>.<key>` at the top level of config.json,
+/// creating the section when needed. `Some(value)` writes, `None` removes.
+/// Returns whether the key was present beforehand, which Python's
+/// `revoke_permissions` reports.
+///
+/// This is a sibling of `save_extension_value`, which only ever writes under
+/// `extensions.<name>`. Permission grants live in their own top-level
+/// `extension_permissions` section
+/// (`core/extensions_core/validation/extension_permissions.py`), so they need
+/// a helper that is not hard-wired to the `extensions` key.
+pub fn save_section_entry(
+    config_path: &Path,
+    section: &str,
+    key: &str,
+    value: Option<Value>,
+) -> Result<bool, std::io::Error> {
+    let mut config = read_config(config_path)?;
+    if !config.is_object() {
+        config = json!({});
+    }
+    let root = config.as_object_mut().expect("object set above");
+    let entry = root.entry(section).or_insert_with(|| json!({}));
+    if !entry.is_object() {
+        *entry = json!({});
+    }
+    let map = entry.as_object_mut().expect("object set above");
+    let existed = map.contains_key(key);
+    match value {
+        Some(v) => {
+            map.insert(key.to_string(), v);
+        }
+        None => {
+            map.remove(key);
+        }
+    }
+    crate::config_io::write(config_path, &config)?;
+    Ok(existed)
+}
+
 /// Resolve an extension's `enabled` flag exactly as Python's manifest loader
 /// does (`core/extensions_core/lifecycle/extensions_loader_manifest.py::load_manifest`):
 /// a per-extension override recorded in the user's config.json under

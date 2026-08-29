@@ -1,3 +1,4 @@
+mod scrub;
 pub mod ring;
 pub mod routes;
 pub mod tracing_layer;

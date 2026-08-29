@@ -125,7 +125,7 @@ pub(crate) fn legacy_server_entry(config: &Value) -> Option<Value> {
     let ai = config.get("ai_analysis")?;
     // Python `_legacy_to_entry` bails on a falsy ai_config, so an empty object
     // yields no legacy entry rather than a synthesised claude_api default.
-    if !ai.as_object().is_some_and(|fields| !fields.is_empty()) {
+    if ai.as_object().is_none_or(|fields| fields.is_empty()) {
         return None;
     }
     let engine = ai
@@ -1117,6 +1117,7 @@ async fn build_analyze_context(
         existing_prompt,
         mode,
         language: language.to_string(),
+        json_schema: None,
     }
 }
 

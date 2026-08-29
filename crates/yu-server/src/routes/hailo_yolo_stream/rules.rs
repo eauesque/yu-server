@@ -698,6 +698,11 @@ where
     results
 }
 
+/// Deliberate differences from the frozen golden fixture. Lives in
+/// `rules/golden_overrides.rs`; test-only.
+#[cfg(test)]
+mod golden_overrides;
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -734,16 +739,52 @@ mod tests {
         }
     }
 
+    use super::golden_overrides::Overrides;
+
+    /// Every expected value the golden tests compare against gets an id, so a
+    /// deliberate change can name exactly one of them in the overrides file.
+    /// Ids are collected per test and checked against the overrides, which is
+    /// what makes a stale entry fail instead of silently overriding nothing.
+    fn golden_ids(vectors: &Value) -> Vec<String> {
+        let mut ids = Vec::new();
+        for case in vectors["rule_cases"].as_array().unwrap() {
+            let label = case["label"].as_str().unwrap();
+            ids.push(format!("rule_cases/{label}/serialized_rule"));
+            for index in 0..case["steps"].as_array().unwrap().len() {
+                ids.push(format!("rule_cases/{label}/steps/{index}/expected"));
+            }
+        }
+        for case in vectors["engine_cases"].as_array().unwrap() {
+            let label = case["label"].as_str().unwrap();
+            ids.push(format!("engine_cases/{label}/expected"));
+        }
+        for key in ["expected_get", "expected_list", "removed_beta", "removed_missing"] {
+            ids.push(format!("crud_case/{key}"));
+        }
+        ids.push("action_case/expected".to_string());
+        ids
+    }
+
     #[test]
     fn python_rule_vectors_match() {
         let vectors: Value = serde_json::from_str(include_str!(
             "../../../tests/fixtures/yolo_rule_vectors.json"
         ))
         .unwrap();
+        let overrides = Overrides::load();
+        overrides.assert_every_override_was_used(&golden_ids(&vectors));
         for case in vectors["rule_cases"].as_array().unwrap() {
+            let label = case["label"].as_str().unwrap();
             let mut rust_rule = rule(case["rule"].clone());
-            assert_eq!(Value::Object(rust_rule.to_dict()), case["serialized_rule"]);
-            for step in case["steps"].as_array().unwrap() {
+            assert_eq!(
+                Value::Object(rust_rule.to_dict()),
+                overrides.expected(
+                    &format!("rule_cases/{label}/serialized_rule"),
+                    &case["serialized_rule"]
+                ),
+                "{label}"
+            );
+            for (index, step) in case["steps"].as_array().unwrap().iter().enumerate() {
                 let detections = step["detections"].as_array().unwrap();
                 let actual = rust_rule.matches(
                     step["source_id"].as_str().unwrap(),
@@ -753,9 +794,11 @@ mod tests {
                 );
                 assert_eq!(
                     serde_json::to_value(actual).unwrap(),
-                    step["expected"],
-                    "{}",
-                    case["label"]
+                    overrides.expected(
+                        &format!("rule_cases/{label}/steps/{index}/expected"),
+                        &step["expected"]
+                    ),
+                    "{label}"
                 );
             }
         }
@@ -784,7 +827,13 @@ mod tests {
                 timestamp(case["now"].as_str().unwrap()),
                 Duration::from_secs_f64(case["monotonic"].as_f64().unwrap()),
             );
-            assert_eq!(serde_json::to_value(actual).unwrap(), case["expected"]);
+            let label = case["label"].as_str().unwrap();
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                Overrides::load()
+                    .expected(&format!("engine_cases/{label}/expected"), &case["expected"]),
+                "{label}"
+            );
         }
     }
 
@@ -1087,16 +1136,23 @@ mod tests {
         engine.add_rule(rule(case["add"][0].clone()));
         engine.add_rule(rule(case["add"][1].clone()));
         engine.update_rule("alpha", rule(case["update"].clone()));
+        let overrides = Overrides::load();
         assert_eq!(
             serde_json::to_value(engine.get_rule("alpha")).unwrap(),
-            case["expected_get"]
+            overrides.expected("crud_case/expected_get", &case["expected_get"])
         );
         assert_eq!(
             serde_json::to_value(engine.list_rules()).unwrap(),
-            case["expected_list"]
+            overrides.expected("crud_case/expected_list", &case["expected_list"])
         );
-        assert_eq!(engine.remove_rule("beta"), case["removed_beta"]);
-        assert_eq!(engine.remove_rule("missing"), case["removed_missing"]);
+        assert_eq!(
+            engine.remove_rule("beta"),
+            overrides.expected("crud_case/removed_beta", &case["removed_beta"])
+        );
+        assert_eq!(
+            engine.remove_rule("missing"),
+            overrides.expected("crud_case/removed_missing", &case["removed_missing"])
+        );
         engine.load_rules(
             case["load"]
                 .as_array()
@@ -1198,6 +1254,9 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(serde_json::to_value(actual).unwrap(), case["expected"]);
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            Overrides::load().expected("action_case/expected", &case["expected"])
+        );
     }
 }

@@ -82,6 +82,22 @@ pub(crate) async fn call_clip_image(
     state: &SharedState,
     path: &Path,
 ) -> Result<Vec<f32>, ClipCallError> {
+    let image_base64 = read_image_as_base64(state, path).await?;
+    let client = state
+        .infer_client
+        .as_ref()
+        .ok_or(ClipCallError::Unavailable)?;
+    let value = client
+        .infer_clip_image(image_base64)
+        .await
+        .map_err(ClipCallError::Infer)?;
+    parse_vector(value)
+}
+
+pub(crate) async fn read_image_as_base64(
+    state: &SharedState,
+    path: &Path,
+) -> Result<String, ClipCallError> {
     let path = validate_scan_path(state, path).ok_or(ClipCallError::PathRejected)?;
     let data = tokio::fs::read(path)
         .await
@@ -93,16 +109,8 @@ pub(crate) async fn call_clip_image(
             "image exceeds 16 MiB local read limit".to_string(),
         ));
     }
-    let client = state
-        .infer_client
-        .as_ref()
-        .ok_or(ClipCallError::Unavailable)?;
     use base64::Engine as _;
-    let value = client
-        .infer_clip_image(base64::engine::general_purpose::STANDARD.encode(data))
-        .await
-        .map_err(ClipCallError::Infer)?;
-    parse_vector(value)
+    Ok(base64::engine::general_purpose::STANDARD.encode(data))
 }
 
 fn validate_scan_path(state: &SharedState, path: &Path) -> Option<std::path::PathBuf> {
@@ -211,10 +219,15 @@ pub async fn search_handler(
             return internal_error("Search failed");
         }
     };
+    // Apply the allow-list only here -- NOT `.take(limit)` yet. A soft-deleted
+    // file is only discovered once `get_file_paths_by_ids` excludes it below,
+    // so truncating to `limit` before that point can drop it from a set that
+    // already had fewer than `limit` matches, permanently losing valid
+    // lower-ranked candidates that `candidate_limit`'s over-fetch existed to
+    // cover. `limit` is applied to `results` instead, after path resolution.
     let matches: Vec<_> = matches
         .into_iter()
         .filter(|(file_id, _)| allowed.as_ref().is_none_or(|ids| ids.contains(file_id)))
-        .take(limit)
         .collect();
     let paths = match vector_store::get_file_paths_by_ids(
         &state.db_read,
@@ -228,16 +241,8 @@ pub async fn search_handler(
             return internal_error("Search failed");
         }
     };
-    let results: Vec<Value> = matches
-        .into_iter()
-        .map(|(file_id, score)| {
-            json!({
-                "file_id": file_id,
-                "path": paths.get(&file_id).cloned().unwrap_or_default(),
-                "score": (score * 10_000.0).round() / 10_000.0,
-            })
-        })
-        .collect();
+    let mut results = build_search_results(matches, &paths);
+    results.truncate(limit);
     let indexed_count = state
         .clip_index
         .active_meta()
@@ -499,6 +504,27 @@ fn parse_threshold(value: Option<&str>) -> Result<f32, &'static str> {
 fn candidate_limit(limit: usize, has_filter: bool) -> usize {
     limit.saturating_mul(if has_filter { 4 } else { 2 })
 }
+
+/// A `file_id` absent from `paths` means `get_file_paths_by_ids` excluded it
+/// (soft-deleted since the CLIP vector was indexed) -- drop the result
+/// rather than surface it with an empty `path`, which would otherwise read
+/// as a real, openable file to any client.
+fn build_search_results(
+    matches: Vec<(i64, f32)>,
+    paths: &std::collections::HashMap<i64, String>,
+) -> Vec<Value> {
+    matches
+        .into_iter()
+        .filter_map(|(file_id, score)| {
+            let path = paths.get(&file_id)?;
+            Some(json!({
+                "file_id": file_id,
+                "path": path,
+                "score": (score * 10_000.0).round() / 10_000.0,
+            }))
+        })
+        .collect()
+}
 fn bad_request(message: impl Into<String>) -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -524,6 +550,43 @@ fn internal_error(message: impl Into<String>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncating_after_path_resolution_recovers_the_full_limit_despite_gaps() {
+        // Regression for truncating `matches` to `limit` before soft-deleted
+        // candidates are known and excluded: with limit=3 and 2 of the top 5
+        // candidates soft-deleted, the old order (`.take(3)` on raw matches,
+        // *then* drop invalid ones) would yield only [1, 3] -- one short of
+        // the limit even though candidate 5 was available to fill the gap.
+        let mut paths = std::collections::HashMap::new();
+        paths.insert(1, "a.png".to_string());
+        // file_id 2 and 4 simulate soft-deleted matches: present in the
+        // index, absent from `paths`.
+        paths.insert(3, "c.png".to_string());
+        paths.insert(5, "e.png".to_string());
+        let matches = vec![(1, 0.9), (2, 0.85), (3, 0.8), (4, 0.75), (5, 0.7)];
+        let mut results = build_search_results(matches, &paths);
+        results.truncate(3);
+        assert_eq!(
+            results
+                .iter()
+                .map(|r| r["file_id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 3, 5]
+        );
+    }
+
+    #[test]
+    fn build_search_results_drops_matches_missing_a_path() {
+        let mut paths = std::collections::HashMap::new();
+        paths.insert(1, "a.png".to_string());
+        // file_id 2 is intentionally absent -- simulates get_file_paths_by_ids
+        // excluding a soft-deleted file that is still in the CLIP index.
+        let results = build_search_results(vec![(1, 0.9), (2, 0.5)], &paths);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["file_id"], 1);
+        assert_eq!(results[0]["path"], "a.png");
+    }
 
     #[test]
     fn validates_numeric_boundaries() {

@@ -480,8 +480,10 @@ fn read_ids(path: &Path) -> Result<Vec<i64>, ClipIndexError> {
         return Err(ClipIndexError::InvalidIdsLength(bytes.len()));
     }
     Ok(bytes
-        .chunks_exact(std::mem::size_of::<i64>())
-        .map(|bytes| i64::from_le_bytes(bytes.try_into().expect("fixed-size chunk")))
+        .as_chunks::<{ std::mem::size_of::<i64>() }>()
+        .0
+        .iter()
+        .map(|&bytes| i64::from_le_bytes(bytes))
         .collect())
 }
 

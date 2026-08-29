@@ -268,7 +268,13 @@ pub async fn run_agent_prompt_based(
     max_rounds: usize,
 ) -> Value {
     // Native yu-infer calls clear_context() before every generation (yu-hailo-infer v0.2.0,
-    // verified on hardware); clear-context is not ported because sidecar group_id design is TODO(index) item 2.
+    // verified on hardware). `/api/llm/clear-context` is not ported for a different
+    // reason than this comment used to give: the sidecar group_id design is no longer
+    // outstanding -- yu-hailo-infer v0.2.0 passes `params.group_id` to
+    // `VDevice::create_shared` (shim.cpp:50-71). Measured 2026-08-22: that route only
+    // touches Python-process-local model state (llm_control.async_clear_llm_context),
+    // and the sidecar clears context itself before every generation, so there is no
+    // native target to port it to. See HAILO_RUST_MIGRATION_REMAINING_WORK.md.
     let mut messages = vec![
         json!({"role":"system", "content": build_tool_system_prompt(tools, system_prompt)}),
         json!({"role":"user", "content": message}),

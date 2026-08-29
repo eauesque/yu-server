@@ -18,6 +18,29 @@ use crate::auth::{scope::require_admin_scope, AuthContext};
 use crate::prompt_sim_core::read_config_json;
 use crate::state::SharedState;
 
+/// Strips the Windows `\\?\` verbatim path prefix (and `\\?\UNC\` for network
+/// shares) that `std::fs::canonicalize` returns. Without this, a file registered
+/// here is stored under a different string than the raw path the scanner/watcher
+/// write for the same file, so the `files.path` UNIQUE constraint never catches
+/// the duplicate and the same file ends up as two rows. No-op on non-Windows.
+/// See docs/development/development_docs/WINDOWS_VERBATIM_PATH_PITFALL.md.
+#[cfg(windows)]
+fn de_verbatim(path: &Path) -> std::path::PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        std::path::PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        std::path::PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+#[cfg(not(windows))]
+fn de_verbatim(path: &Path) -> std::path::PathBuf {
+    path.to_path_buf()
+}
+
 fn admin(s: &SharedState, auth: Option<&Extension<AuthContext>>) -> Option<Response> {
     require_admin_scope(s.config.pin_auth_enabled, auth.map(|e| &e.0))
 }
@@ -366,7 +389,8 @@ pub async fn register_path(
             .into_response();
     }
 
-    let canonical = canonical.to_string_lossy().to_string();
+    let verbatim = canonical.to_string_lossy().to_string();
+    let canonical = de_verbatim(&canonical).to_string_lossy().to_string();
     let mtime = meta
         .as_ref()
         .and_then(|m| m.modified().ok())
@@ -374,6 +398,30 @@ pub async fn register_path(
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
     let size = meta.map(|m| m.len() as i64).unwrap_or(0);
+
+    // A row may already exist under the pre-fix verbatim form (`\\?\D:\...`)
+    // from before de_verbatim() was added above. INSERT OR IGNORE alone would
+    // not catch that — it only matches path values byte-for-byte — so this
+    // file would silently get a second, de-verbatim'd row. Check both forms
+    // first and treat either as "already registered".
+    if verbatim != canonical {
+        if let Some(existing_id) =
+            sqlx::query_scalar::<_, i64>("SELECT id FROM files WHERE path = ?")
+                .bind(&verbatim)
+                .fetch_optional(&s.db_read)
+                .await
+                .unwrap_or(None)
+        {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "already_registered",
+                    "id": existing_id,
+                })),
+            )
+                .into_response();
+        }
+    }
 
     // INSERT OR IGNORE atomically avoids TOCTOU between a separate SELECT and INSERT
     let result = sqlx::query(
@@ -2073,5 +2121,23 @@ mod tests {
             Err(_) => {}
             Ok(HostCheck::IpLiteralOk) => panic!("example.com is not an IP literal"),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn de_verbatim_strips_windows_prefixes() {
+        assert_eq!(
+            de_verbatim(Path::new(r"\\?\D:\images\a.png")),
+            std::path::PathBuf::from(r"D:\images\a.png")
+        );
+        assert_eq!(
+            de_verbatim(Path::new(r"\\?\UNC\server\share\a.png")),
+            std::path::PathBuf::from(r"\\server\share\a.png")
+        );
+        // already-raw paths pass through unchanged
+        assert_eq!(
+            de_verbatim(Path::new(r"D:\images\a.png")),
+            std::path::PathBuf::from(r"D:\images\a.png")
+        );
     }
 }

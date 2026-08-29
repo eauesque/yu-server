@@ -795,8 +795,8 @@ fn blake2b_compress(h: &mut [u64; 8], block: &[u8; 128], counter: u128, last: bo
         [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
     ];
     let mut m = [0_u64; 16];
-    for (idx, chunk) in block.chunks_exact(8).enumerate() {
-        m[idx] = u64::from_le_bytes(chunk.try_into().expect("block chunk length"));
+    for (idx, chunk) in block.as_chunks::<8>().0.iter().enumerate() {
+        m[idx] = u64::from_le_bytes(*chunk);
     }
     let mut v = [0_u64; 16];
     v[..8].copy_from_slice(h);

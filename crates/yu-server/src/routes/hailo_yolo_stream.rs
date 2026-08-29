@@ -237,7 +237,6 @@ async fn resolve_snapshot(project_root: &Path, filename: &str) -> Option<std::pa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
     use tempfile::tempdir;
 
     async fn write(path: &Path, contents: &[u8]) {
@@ -294,8 +293,11 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_snapshot_blocks_an_outward_symlink_placed_inside_the_directory() {
+        use std::os::unix::fs::symlink;
+
         run_bounded_test(TEST_TIMEOUT, async {
             let root = tempdir().unwrap();
             let snapshots = root.path().join("detections").join("snapshots");
@@ -318,8 +320,11 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn list_recordings_filters_sorts_and_skips_stat_failures() {
+        use std::os::unix::fs::symlink;
+
         run_bounded_test(TEST_TIMEOUT, async {
             let root = tempdir().unwrap();
             let videos = root.path().join("detections").join("videos");

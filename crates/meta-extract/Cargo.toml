@@ -3,6 +3,9 @@ name = "meta-extract"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [dependencies]
 thiserror = { workspace = true }
 serde_json = { workspace = true }

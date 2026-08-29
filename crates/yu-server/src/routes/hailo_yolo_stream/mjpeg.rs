@@ -53,7 +53,7 @@ pub(crate) fn encode_jpeg(
     quality: u8,
 ) -> Result<Bytes, String> {
     let mut rgb = bytes.to_vec();
-    for pixel in rgb.chunks_exact_mut(3) {
+    for pixel in rgb.as_chunks_mut::<3>().0 {
         pixel.swap(0, 2);
     }
     let mut jpeg = Vec::new();
@@ -555,7 +555,9 @@ mod tests {
     use super::super::{detect::tests as detect_tests, run_bounded_paused_test, run_bounded_test};
     use super::*;
 
-    const TEST_TIMEOUT: Duration = Duration::from_secs(15);
+    /// Same reasoning as detect.rs: a watchdog against a hung test, not a
+    /// budget for a slow one.
+    const TEST_TIMEOUT: Duration = Duration::from_secs(60);
     const WIDTH: u32 = 32;
     const HEIGHT: u32 = 24;
 
@@ -634,10 +636,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(frame.bytes.first().copied().unwrap_or_default());
-            let boxed = frame
-                .bytes
-                .chunks_exact(3)
-                .any(|pixel| pixel == [0, 255, 0]);
+            let boxed = frame.bytes.as_chunks::<3>().0.contains(&[0, 255, 0]);
             self.boxed.lock().unwrap().push(boxed);
             self.wait_if_blocked(self.blocked.lock().unwrap())?;
             Ok(Bytes::from_static(if boxed {
@@ -882,8 +881,9 @@ mod tests {
                 .await
                 .unwrap()
                 .bytes
-                .chunks_exact(3)
-                .any(|pixel| pixel == [0, 255, 0]));
+                .as_chunks::<3>()
+                .0
+                .contains(&[0, 255, 0]));
             assert!(!status_tx.is_closed());
             hub.shutdown().await;
             server.abort();

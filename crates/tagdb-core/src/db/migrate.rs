@@ -1,5 +1,6 @@
 use crate::TagdbError;
-use sqlx::SqlitePool;
+use sqlx::{Row, SqliteConnection, SqlitePool};
+use std::path::Path;
 
 struct Migration {
     version: i64,
@@ -33,9 +34,34 @@ static MIGRATIONS: &[Migration] = &[
         description: "requeue NovelAI metadata for canonical parsing",
         sql: include_str!("../migrations/005_requeue_nai_meta_reextraction.sql"),
     },
+    Migration {
+        version: 6,
+        description: "persist mesh inference eligibility",
+        sql: include_str!("../migrations/006_mesh_inference.sql"),
+    },
 ];
 
+/// Highest version in [`MIGRATIONS`].
+///
+/// Used both by the downgrade guard below and by tests, which assert against
+/// this rather than a literal so that adding a migration does not break
+/// unrelated assertions.
+fn latest_migration_version() -> i64 {
+    MIGRATIONS
+        .iter()
+        .map(|m| m.version)
+        .max()
+        .expect("MIGRATIONS must not be empty")
+}
+
 pub async fn apply_pending_rust_migrations(pool: &SqlitePool) -> Result<(), TagdbError> {
+    apply_pending_rust_migrations_with_data_dir(pool, None).await
+}
+
+pub async fn apply_pending_rust_migrations_with_data_dir(
+    pool: &SqlitePool,
+    data_dir: Option<&Path>,
+) -> Result<(), TagdbError> {
     let mut conn = pool.acquire().await?;
     sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
 
@@ -57,6 +83,26 @@ pub async fn apply_pending_rust_migrations(pool: &SqlitePool) -> Result<(), Tagd
                 .fetch_one(&mut *conn)
                 .await?;
 
+        // Downgrade guard. The loop below skips every migration whose version is
+        // `<= current`, so a database written by a newer binary looks fully
+        // migrated to an older one: it would skip everything, report success, and
+        // then run against a schema it does not know. Nothing else notices --
+        // the Python-side version gate only covers `schema_version`, which is a
+        // different table with a different owner.
+        //
+        // This applies in hybrid as well as standalone: `rust_schema_version` is
+        // Rust's own table in both modes, so an older binary is equally unable to
+        // reason about it. Checked before anything is written, so a refusal
+        // leaves the database untouched.
+        let latest = latest_migration_version();
+        if current > latest {
+            return Err(TagdbError::IncompatibleSchema(format!(
+                "this database has Rust schema v{current}, which is newer than this build \
+                 knows (v{latest}). It was written by a later version of yu-server.\n\
+                 Use that version, or restore a database at v{latest}. Nothing has been modified."
+            )));
+        }
+
         for m in MIGRATIONS {
             if m.version <= current {
                 continue;
@@ -64,6 +110,9 @@ pub async fn apply_pending_rust_migrations(pool: &SqlitePool) -> Result<(), Tagd
 
             tracing::info!("Applying Rust migration {}: {}", m.version, m.description);
             sqlx::raw_sql(m.sql).execute(&mut *conn).await?;
+            if m.version == 6 {
+                apply_mesh_inference_migration(&mut conn, data_dir).await?;
+            }
             sqlx::query(
                 "INSERT OR IGNORE INTO rust_schema_version(version, applied_at, description) \
                  VALUES(?, CAST(strftime('%s','now') AS INTEGER), ?)",
@@ -73,6 +122,22 @@ pub async fn apply_pending_rust_migrations(pool: &SqlitePool) -> Result<(), Tagd
             .execute(&mut *conn)
             .await?;
         }
+
+        // Deliberately NOT a versioned migration.
+        //
+        // Migration 6 adds peers.inference_types, but it returns early when the
+        // peers table does not exist yet -- while the loop records version 6
+        // regardless. A database where Rust started before peers existed (hybrid,
+        // where apply_standalone_schema does not run and Python creates peers
+        // later) would therefore keep a 13-column peers table forever, because
+        // `m.version <= current` skips migration 6 on every later run.
+        //
+        // A version-7 migration would inherit exactly the same defect: it too can
+        // run before peers exists, record its version, and never fire again. The
+        // repair has to be tied to the table appearing, not to a version marker,
+        // so it runs unconditionally on every startup. Cost is one sqlite_master
+        // lookup plus one PRAGMA; it is idempotent and only ever adds a column.
+        repair_peers_inference_types(&mut conn).await?;
 
         sqlx::query(
             "
@@ -98,6 +163,94 @@ pub async fn apply_pending_rust_migrations(pool: &SqlitePool) -> Result<(), Tagd
             Err(e)
         }
     }
+}
+
+async fn apply_mesh_inference_migration(
+    conn: &mut SqliteConnection,
+    data_dir: Option<&Path>,
+) -> Result<(), TagdbError> {
+    let peer_table_exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'peers'",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if peer_table_exists == 0 {
+        return Ok(());
+    }
+    repair_peers_inference_types(&mut *conn).await?;
+
+    let Some(data_dir) = data_dir else {
+        return Ok(());
+    };
+    let Ok(payload) = std::fs::read_to_string(data_dir.join("mesh_inference_state.json")) else {
+        return Ok(());
+    };
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&payload) else {
+        return Ok(());
+    };
+    let Some(disabled) = (payload.get("version").and_then(serde_json::Value::as_i64) == Some(1))
+        .then(|| payload.get("disabled"))
+        .flatten()
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(());
+    };
+
+    for (peer_id, inference_types) in disabled {
+        if !valid_peer_id(peer_id) {
+            continue;
+        }
+        let Some(inference_types) = inference_types.as_array() else {
+            continue;
+        };
+        for inference_type in inference_types.iter().filter_map(serde_json::Value::as_str) {
+            sqlx::query(
+                "INSERT OR IGNORE INTO peer_inference_disabled (peer_id, inference_type) VALUES (?, ?)",
+            )
+            .bind(peer_id)
+            .bind(inference_type)
+            .execute(&mut *conn)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Add `peers.inference_types` if the table exists and the column does not.
+///
+/// Called from two places: migration 6 (its original home, which also imports
+/// the JSON overlay) and unconditionally at the end of every migration run.
+/// The unconditional call is what covers databases where migration 6 recorded
+/// its version while returning early because `peers` did not exist yet.
+/// Guarded on both the table and the column, so it is idempotent.
+async fn repair_peers_inference_types(conn: &mut SqliteConnection) -> Result<(), TagdbError> {
+    let peer_table_exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'peers'",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if peer_table_exists == 0 {
+        return Ok(());
+    }
+    let columns = sqlx::query("PRAGMA table_info(peers)")
+        .fetch_all(&mut *conn)
+        .await?;
+    if !columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "inference_types")
+    {
+        sqlx::query("ALTER TABLE peers ADD COLUMN inference_types TEXT NOT NULL DEFAULT '[]'")
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+fn valid_peer_id(peer_id: &str) -> bool {
+    (1..=64).contains(&peer_id.len())
+        && peer_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
 }
 
 #[cfg(test)]
@@ -147,7 +300,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(ver, 5);
+        assert_eq!(ver, latest_migration_version());
 
         let old_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version")
             .fetch_one(&pool)
@@ -174,7 +327,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(count, 5);
+        assert_eq!(count, latest_migration_version());
     }
 
     #[tokio::test]
@@ -199,7 +352,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(count, 5);
+        assert_eq!(count, latest_migration_version());
     }
 
     #[tokio::test]
@@ -224,7 +377,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(rust_ver, 5);
+        assert_eq!(rust_ver, latest_migration_version());
 
         let old_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM schema_version WHERE version IN (84, 85)")
@@ -253,6 +406,72 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(exists, 1);
+    }
+
+    #[tokio::test]
+    async fn migration_86_schema_is_convergent_and_imports_legacy_overlay() {
+        let (_db_file, pool) = pool_with_schema_version().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        sqlx::query("CREATE TABLE peers (peer_id TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        std::fs::write(
+            data_dir.path().join("mesh_inference_state.json"),
+            r#"{"version":1,"disabled":{"peer":["tagger",3,"clip"],"../bad":["yolo"]}}"#,
+        )
+        .unwrap();
+
+        apply_pending_rust_migrations_with_data_dir(&pool, Some(data_dir.path()))
+            .await
+            .unwrap();
+
+        let columns = sqlx::query("PRAGMA table_info(peers)")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(columns
+            .iter()
+            .any(|row| row.get::<String, _>("name") == "inference_types"));
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT peer_id, inference_type FROM peer_inference_disabled ORDER BY 1, 2",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("peer".into(), "clip".into()),
+                ("peer".into(), "tagger".into())
+            ]
+        );
+        let primary_key: Vec<(String, i64)> =
+            sqlx::query("PRAGMA table_info(peer_inference_disabled)")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|row| {
+                    let order = row.get::<i64, _>("pk");
+                    (order > 0).then(|| (row.get("name"), order))
+                })
+                .collect();
+        assert_eq!(
+            primary_key,
+            vec![("peer_id".into(), 1), ("inference_type".into(), 2)]
+        );
+
+        apply_pending_rust_migrations_with_data_dir(&pool, Some(data_dir.path()))
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM peer_inference_disabled")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            2
+        );
     }
 
     #[tokio::test]

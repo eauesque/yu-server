@@ -191,7 +191,7 @@ pub fn signal_stop(paths: &WorkerIpcPaths) -> bool {
         let status = std::process::Command::new("taskkill")
             .args(["/F", "/PID", &pid.to_string()])
             .status();
-        return status.map(|s| s.success()).unwrap_or(false);
+        status.map(|s| s.success()).unwrap_or(false)
     }
 
     #[cfg(not(any(unix, windows)))]

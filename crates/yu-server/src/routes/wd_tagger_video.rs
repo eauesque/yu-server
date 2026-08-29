@@ -75,11 +75,70 @@ async fn extract_frame(video_path: &Path, out: &Path, timestamp: &str) -> bool {
     matches!(output, Ok(Ok(output)) if output.status.success()) && out.exists()
 }
 
+/// Parses ffmpeg `showinfo` stderr for scene-change timestamps.
+///
+/// Split out from the ffmpeg call so the parsing and the max-scene thinning can
+/// be tested without a video. Mirrors `_detect_scene_changes` in
+/// `core/files_core/video_keyframes.py`, including its even-sampling step when
+/// more scenes are found than `max_scenes`.
+pub(crate) fn parse_scene_timestamps(stderr: &str, max_scenes: usize) -> Vec<f64> {
+    let mut timestamps = Vec::new();
+    let mut rest = stderr;
+    while let Some(at) = rest.find("pts_time:") {
+        rest = &rest[at + "pts_time:".len()..];
+        let value: String = rest
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        if let Ok(seconds) = value.parse::<f64>() {
+            timestamps.push(seconds);
+        }
+    }
+    if max_scenes > 0 && timestamps.len() > max_scenes {
+        let step = timestamps.len() as f64 / max_scenes as f64;
+        timestamps = (0..max_scenes)
+            .map(|index| timestamps[(index as f64 * step) as usize])
+            .collect();
+    }
+    timestamps
+}
+
+async fn detect_scene_changes(video_path: &Path, threshold: f64, max_scenes: usize) -> Vec<f64> {
+    let output = tokio::process::Command::new("ffmpeg")
+        .arg("-i")
+        .arg(video_path)
+        .arg("-vf")
+        .arg(format!("select='gt(scene,{threshold})',showinfo"))
+        .arg("-f")
+        .arg("null")
+        .arg("-")
+        .output()
+        .await;
+    match output {
+        Ok(output) => parse_scene_timestamps(&String::from_utf8_lossy(&output.stderr), max_scenes),
+        Err(error) => {
+            tracing::debug!(%error, path = %video_path.display(), "scene detection failed");
+            Vec::new()
+        }
+    }
+}
+
 pub(crate) async fn extract_keyframes(
     video_path: &Path,
     dir: &Path,
     count: u32,
     strategy: &str,
+) -> Vec<PathBuf> {
+    extract_keyframes_with_threshold(video_path, dir, count, strategy, 0.4).await
+}
+
+pub(crate) async fn extract_keyframes_with_threshold(
+    video_path: &Path,
+    dir: &Path,
+    count: u32,
+    strategy: &str,
+    scene_threshold: f64,
 ) -> Vec<PathBuf> {
     let duration_ms = get_video_duration_ms(video_path).await;
 
@@ -96,6 +155,25 @@ pub(crate) async fn extract_keyframes(
         } else {
             Vec::new()
         };
+    }
+
+    // Python tries scene detection first and falls through to uniform when it
+    // finds nothing (video_keyframes.py: "scene": ... fallback to uniform).
+    if strategy == "scene" {
+        let positions = detect_scene_changes(video_path, scene_threshold, count as usize).await;
+        if !positions.is_empty() {
+            let mut frames = Vec::new();
+            for (index, position) in positions.iter().enumerate() {
+                let timestamp = seconds_to_timestamp(*position);
+                let out = dir.join(format!("frame_{index}.jpg"));
+                if extract_frame(video_path, &out, &timestamp).await {
+                    frames.push(out);
+                }
+            }
+            if !frames.is_empty() {
+                return frames;
+            }
+        }
     }
 
     match duration_ms {
@@ -194,7 +272,9 @@ pub(crate) fn merge_tag_results(mut results: Vec<TagResult>) -> TagResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_native_video_format, merge_tag_results, seconds_to_timestamp};
+    use super::{
+        is_native_video_format, merge_tag_results, parse_scene_timestamps, seconds_to_timestamp,
+    };
     use infer_core::engine::{TagPrediction, TagResult};
 
     fn prediction(tag: &str, confidence: f32, category: &str) -> TagPrediction {
@@ -218,6 +298,38 @@ mod tests {
         tags.iter()
             .find(|prediction| prediction.tag == tag && prediction.category == category)
             .map(|prediction| prediction.confidence)
+    }
+
+    #[test]
+    fn scene_parsing_reads_every_pts_time_in_ffmpeg_showinfo_output() {
+        let stderr = "\
+[Parsed_showinfo_1 @ 0x1] n:0 pts:0 pts_time:0 duration:1\n\
+[Parsed_showinfo_1 @ 0x1] n:1 pts:900 pts_time:1.25 duration:1\n\
+[Parsed_showinfo_1 @ 0x1] n:2 pts:1800 pts_time:12.5 duration:1\n";
+        assert_eq!(parse_scene_timestamps(stderr, 8), vec![0.0, 1.25, 12.5]);
+    }
+
+    #[test]
+    fn scene_parsing_thins_to_max_scenes_by_even_sampling() {
+        // Mirrors Python's `step = len(timestamps) / max_scenes` indexing, which
+        // keeps the first element and strides from there -- not a head-take.
+        let stderr: String = (0..10)
+            .map(|index| format!("pts_time:{index}.0 \n"))
+            .collect();
+        let thinned = parse_scene_timestamps(&stderr, 4);
+        assert_eq!(thinned, vec![0.0, 2.0, 5.0, 7.0]);
+    }
+
+    #[test]
+    fn scene_parsing_returns_empty_when_ffmpeg_found_no_scenes() {
+        assert!(parse_scene_timestamps("no matches here", 8).is_empty());
+        assert!(parse_scene_timestamps("", 8).is_empty());
+    }
+
+    #[test]
+    fn scene_parsing_keeps_everything_when_under_the_cap() {
+        let stderr = "pts_time:1.5 pts_time:2.5 ";
+        assert_eq!(parse_scene_timestamps(stderr, 8), vec![1.5, 2.5]);
     }
 
     #[test]

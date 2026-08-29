@@ -253,7 +253,16 @@ pub async fn get_file_paths_by_ids(
 ) -> Result<std::collections::HashMap<i64, String>, VectorStoreError> {
     let mut paths = std::collections::HashMap::new();
     for ids in dedupe_ids(file_ids).chunks(IN_CHUNK_SIZE) {
-        let (query, binds) = in_query("SELECT id, path FROM files WHERE id IN", ids);
+        // `AND is_deleted = 0` matches every Python original this helper's
+        // callers port (video_audio lookups, s2t's file_id lookup) --
+        // without it, a soft-deleted file's path is still handed to
+        // whatever caller asked (captioning, CLIP indexing, transcription),
+        // silently reading and re-annotating a file the rest of the app
+        // treats as gone.
+        let (query, binds) = in_query(
+            "SELECT id, path FROM files WHERE is_deleted = 0 AND id IN",
+            ids,
+        );
         let mut query = sqlx::query(&query);
         for file_id in binds {
             query = query.bind(file_id);
@@ -291,8 +300,10 @@ fn decode_f16(blob: &[u8]) -> Result<Vec<f32>, VectorStoreError> {
         return Err(VectorStoreError::InvalidBlobLength(blob.len()));
     }
     Ok(blob
-        .chunks_exact(2)
-        .map(|bytes| f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&bytes| f16::from_bits(u16::from_le_bytes(bytes)).to_f32())
         .collect())
 }
 
@@ -363,6 +374,23 @@ mod tests {
             delete_all_vectors(&vectors, DEFAULT_MODEL).await.unwrap(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn get_file_paths_by_ids_excludes_soft_deleted_files() {
+        let tags = pool().await;
+        sqlx::query("INSERT INTO files (id, path, is_deleted) VALUES (1, 'a.png', 0)")
+            .execute(&tags)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO files (id, path, is_deleted) VALUES (2, 'b.png', 1)")
+            .execute(&tags)
+            .await
+            .unwrap();
+        let paths = get_file_paths_by_ids(&tags, &[1, 2]).await.unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths.get(&1).map(String::as_str), Some("a.png"));
+        assert!(!paths.contains_key(&2));
     }
 
     #[tokio::test]

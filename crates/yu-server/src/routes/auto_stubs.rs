@@ -130,17 +130,11 @@ pub async fn tools_cache_info() -> impl IntoResponse {
 
 /// GET /api/ocr/npu
 pub async fn ocr_npu() -> impl IntoResponse {
-    Json(json!({"available": false}))
-}
-
-/// GET /api/ocr/profiles
-pub async fn ocr_profiles() -> impl IntoResponse {
-    Json(json!([]))
-}
-
-/// POST /api/ocr/profiles/fetch
-pub async fn ocr_profiles_fetch() -> impl IntoResponse {
-    Json(json!({"ok": true}))
+    // Python proxy calls found (replace with 501 stub).
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({"ok": false, "error": "ocr_not_implemented"})),
+    )
 }
 
 /// GET /api/tools/debug-log
@@ -658,7 +652,11 @@ async fn fwd_ext_post_passthrough(
 
 /// GET /api/ocr/benchmark/cases
 pub async fn ocr_benchmark_cases() -> impl IntoResponse {
-    Json(json!({"cases": [], "total": 0}))
+    // Python proxy calls found (replace with 501 stub).
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({"ok": false, "error": "ocr_not_implemented"})),
+    )
 }
 
 // TODO(ocr): 以下は infer-core が OCR モデルに対応後に実装する
@@ -1502,6 +1500,8 @@ mod standalone_tests {
                     .expect("clip index test default"),
             ),
             clip_indexer: std::sync::Arc::new(crate::routes::clip_indexer::ClipIndexer::new()),
+            caption_runner: std::sync::Arc::new(crate::routes::caption_runner::CaptionRunner::new()),
+            s2t_runner: std::sync::Arc::new(crate::routes::s2t_runner::S2tRunner::new()),
             clip_runtime_cache: crate::state::TtlCache::new(crate::state::CLIP_RUNTIME_CACHE_TTL),
             inference_client: reqwest::Client::new(),
             python_client: reqwest::Client::new(),
@@ -1523,7 +1523,7 @@ mod standalone_tests {
             version: "0.0.0".to_string(),
             start_time: std::time::Instant::now(),
             scheduler_state: std::sync::OnceLock::new(),
-            wd_infer: std::sync::OnceLock::new(),
+            wd_infer: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             infer_client: None,
             infer_child: None,
             scan_manager: std::sync::OnceLock::new(),
@@ -1905,7 +1905,7 @@ async fn hailo_genai_llm_generate_native(
             Some(model_name_to_hef_path(&model)),
             messages,
             Vec::new(),
-            None,
+            Some(crate::infer_client::DEFAULT_GENERATE_TIMEOUT_MS),
             Some(temperature),
             None,
             None,
@@ -1946,14 +1946,24 @@ pub async fn hailo_genai_vlm_generate(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    // The native yu-infer path currently only covers the JSON `file_id`
-    // input shape (used by e.g. "analyze this image" flows). Multipart
-    // image uploads and text-only (no image) generation continue to use
-    // the Python proxy unchanged — yu-infer's VLM requires at least one
-    // image frame per request (see router.rs `VlmGenerateStreamRequest`).
+    // Two native input shapes are covered: the JSON `file_id` body (used by
+    // e.g. "analyze this image" flows) and the multipart upload the extension
+    // UI posts (`_genai_script_media.html` builds a FormData with `prompt` and
+    // an `image` part). Text-only generation — no image at all — still goes to
+    // the Python proxy, because yu-infer's VLM requires at least one frame per
+    // request and rejects a frameless one (see router.rs
+    // `VlmGenerateStreamRequest`, whose `frames` doc states the model needs at
+    // least one). Both native paths return `None` to defer rather than
+    // answering, so any shape they do not fully handle still reaches Python.
     if let Some(infer_client) = s.infer_client.as_ref() {
         if content_type.starts_with("application/json") {
             if let Some(response) = hailo_genai_vlm_generate_native(&s, infer_client, &body).await {
+                return response;
+            }
+        } else if content_type.starts_with("multipart/form-data") {
+            if let Some(response) =
+                hailo_genai_vlm_generate_multipart_native(&s, infer_client, &headers, &body).await
+            {
                 return response;
             }
         }
@@ -2075,37 +2085,284 @@ async fn hailo_genai_vlm_generate_native(
     let do_sample = value.get("do_sample").and_then(|v| v.as_bool());
     let seed = value.get("seed").and_then(|v| v.as_u64()).map(|v| v as u32);
 
+    Some(
+        vlm_stream_native(
+            infer_client,
+            VlmNativeRequest {
+                hef_path,
+                model,
+                prompt,
+                system_prompt,
+                frame_b64,
+                temperature,
+                top_p,
+                top_k,
+                frequency_penalty,
+                max_generated_tokens,
+                do_sample,
+                seed,
+            },
+        )
+        .await,
+    )
+}
+
+/// Everything the native VLM path needs once the single image frame has been
+/// resolved, whichever input shape carried it.
+struct VlmNativeRequest {
+    hef_path: Option<String>,
+    /// The model name as the caller wrote it. Only used for error messages;
+    /// `hef_path` is what actually goes upstream.
+    model: String,
+    prompt: String,
+    system_prompt: String,
+    frame_b64: String,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<u32>,
+    frequency_penalty: Option<f32>,
+    max_generated_tokens: Option<u32>,
+    do_sample: Option<bool>,
+    seed: Option<u32>,
+}
+
+async fn vlm_stream_native(
+    infer_client: &crate::infer_client::InferClient,
+    request: VlmNativeRequest,
+) -> Response {
     let upstream = match infer_client
         .vlm_generate_stream(
-            hef_path,
-            prompt,
-            Some(system_prompt),
-            vec![frame_b64],
-            None,
-            temperature,
-            top_p,
-            top_k,
-            frequency_penalty,
-            max_generated_tokens,
-            do_sample,
-            seed,
+            request.hef_path,
+            request.prompt,
+            Some(request.system_prompt),
+            vec![request.frame_b64],
+            Some(crate::infer_client::DEFAULT_GENERATE_TIMEOUT_MS),
+            request.temperature,
+            request.top_p,
+            request.top_k,
+            request.frequency_penalty,
+            request.max_generated_tokens,
+            request.do_sample,
+            request.seed,
         )
         .await
     {
         Ok(response) => response,
         Err(error) => {
             tracing::error!("yu-infer vlm_generate_stream request failed: {error}");
-            return Some(
-                (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({"status": "error", "message": "VLM generation failed"})),
-                )
-                    .into_response(),
-            );
+            return vlm_error(StatusCode::BAD_GATEWAY, "VLM generation failed");
         }
     };
 
-    Some(stream_sse_from_upstream(upstream))
+    stream_sse_from_upstream(upstream)
+}
+
+fn vlm_error(status: StatusCode, message: &str) -> Response {
+    (status, Json(json!({"status": "error", "message": message}))).into_response()
+}
+
+/// Python's `hailo_vlm_routes.py` caps an uploaded image at this many bytes
+/// (`_MAX_IMAGE_UPLOAD_BYTES`) and answers 413 past it.
+pub(crate) const VLM_MAX_IMAGE_UPLOAD_BYTES: usize = 16 * 1024 * 1024;
+
+/// Python builds the 413 message with `f"file exceeds {max_bytes:,} byte
+/// limit"` (`core/infra_core/upload_limits.py`), so the number carries
+/// thousands separators. Reproduce them rather than emitting a bare integer —
+/// the body is part of the response contract, not just prose.
+fn with_thousands_separators(value: usize) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Mirrors `get_extension_config_value("builtin-hailo-genai", key, default)`
+/// for the numeric generation settings the VLM route reads.
+fn genai_config_number(state: &SharedState, key: &str) -> Option<f64> {
+    read_config_json(state)["extensions"]["builtin-hailo-genai"][key].as_f64()
+}
+
+/// Native counterpart of the Python VLM route's multipart branch. The
+/// extension UI posts `prompt` plus an `image` file part; the other fields are
+/// read from the form as well, because Python's `_get_param` falls back to
+/// `request.form` for any non-JSON request.
+///
+/// Returns `None` — deferring to the Python proxy — when the request carries
+/// no usable `image` part, since yu-infer's VLM cannot serve a frameless
+/// request. That is the same reason text-only generation is not native.
+///
+/// KNOWN DIVERGENCE, deliberately not changed here: the JSON `file_id` path
+/// above does not pre-check that the model's `.hef` is present, so a
+/// missing model surfaces there as a 502 where Python answers 400. This
+/// function does perform the check (Python's `is_hef_available` is simply
+/// "the resolved hef path exists"). The JSON path is shipped and
+/// hardware-verified, and adding the check there could 400 a deployment whose
+/// hef filename does not match `model_name_to_hef_path`'s guess, so closing
+/// that gap is left as separate work rather than folded into this port.
+async fn hailo_genai_vlm_generate_multipart_native(
+    state: &SharedState,
+    infer_client: &crate::infer_client::InferClient,
+    headers: &axum::http::HeaderMap,
+    body: &Bytes,
+) -> Option<Response> {
+    let request = match parse_vlm_multipart(state, headers, body).await? {
+        Ok(request) => request,
+        Err(response) => return Some(response),
+    };
+
+    // Python answers 400 when the model's HEF is not downloaded
+    // (`is_hef_available` is just "the resolved hef path exists"). Checked
+    // here rather than inside the parser so the parser stays a pure mapping
+    // with no filesystem or environment dependency — `model_name_to_hef_path`
+    // resolves through `$HAILO_HEF_DIR`, and a test that had to make that path
+    // exist would have to mutate a process-global env var and race every other
+    // test in the binary.
+    let hef_path = request.hef_path.clone().unwrap_or_default();
+    if !std::path::Path::new(&hef_path).exists() {
+        let model = &request.model;
+        return Some(vlm_error(
+            StatusCode::BAD_REQUEST,
+            &format!("Model '{model}' not downloaded yet"),
+        ));
+    }
+
+    Some(vlm_stream_native(infer_client, request).await)
+}
+
+/// Maps a multipart upload onto a `VlmNativeRequest`. Pure with respect to the
+/// filesystem and the environment: it validates and resolves, but does not ask
+/// whether anything exists on disk.
+///
+/// `None` means "this is not a request the native path can serve" — no usable
+/// image part — and the caller must fall back to the Python proxy, because
+/// yu-infer's VLM rejects a frameless request. `Some(Err(response))` is a
+/// client error the native path owns.
+async fn parse_vlm_multipart(
+    state: &SharedState,
+    headers: &axum::http::HeaderMap,
+    body: &Bytes,
+) -> Option<Result<VlmNativeRequest, Response>> {
+    // Parsed with `multer` directly rather than `axum::extract::Multipart`.
+    // axum's extractor runs the body through `with_limited_body()`, which
+    // reads a `DefaultBodyLimitKind` extension and otherwise applies a 2 MiB
+    // default. That marker type is `pub(crate)`, so a hand-built request
+    // cannot opt out, and every upload above 2 MiB -- an ordinary phone photo
+    // -- would fail to parse and silently fall through to Python, leaving the
+    // 16 MiB cap below unreachable. `multer` is already in the dependency tree
+    // as axum's own multipart backend.
+    let boundary = multer::parse_boundary(
+        headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+    )
+    .ok()?;
+    let owned = body.clone();
+    let stream = futures_util::stream::once(async move { Ok::<_, std::io::Error>(owned) });
+    let mut multipart = multer::Multipart::new(stream, boundary);
+
+    let mut prompt = String::new();
+    let mut model: Option<String> = None;
+    let mut system_prompt: Option<String> = None;
+    let mut temperature: Option<f32> = None;
+    let mut max_generated_tokens: Option<u32> = None;
+    let mut image: Option<Vec<u8>> = None;
+
+    loop {
+        // A malformed part means we cannot claim to have understood the
+        // request; defer to Python rather than answer from a partial read.
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(_) => return None,
+        };
+        let name = field.name().unwrap_or_default().to_string();
+        match name.as_str() {
+            "image" => {
+                let bytes = field.bytes().await.ok()?;
+                if bytes.len() > VLM_MAX_IMAGE_UPLOAD_BYTES {
+                    return Some(Err(vlm_error(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        &format!(
+                            "file exceeds {} byte limit",
+                            with_thousands_separators(VLM_MAX_IMAGE_UPLOAD_BYTES)
+                        ),
+                    )));
+                }
+                if !bytes.is_empty() {
+                    image = Some(bytes.to_vec());
+                }
+            }
+            "prompt" => prompt = field.text().await.ok()?.trim().to_string(),
+            "model" => model = field.text().await.ok(),
+            "system_prompt" => system_prompt = field.text().await.ok(),
+            "temperature" => temperature = field.text().await.ok()?.trim().parse().ok(),
+            "max_generated_tokens" => {
+                max_generated_tokens = field.text().await.ok()?.trim().parse().ok()
+            }
+            _ => {}
+        }
+    }
+
+    // No image: yu-infer would reject the frameless request, so let Python
+    // handle it exactly as before.
+    let image = image?;
+
+    if prompt.is_empty() {
+        return Some(Err(vlm_error(
+            StatusCode::BAD_REQUEST,
+            "prompt is required",
+        )));
+    }
+
+    let model = model
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| default_vlm_model(state));
+    if model.contains('/') || model.contains('\\') || model.contains("..") {
+        return Some(Err(vlm_error(
+            StatusCode::BAD_REQUEST,
+            "invalid model name",
+        )));
+    }
+    let hef_path = model_name_to_hef_path(&model);
+
+    // Python resolves these two from the extension config when the form omits
+    // them (`get_extension_config_value(..., "temperature", 0.7)` and
+    // `..., "max_generated_tokens", 512`), and always sends an explicit value
+    // downstream. Do the same instead of passing `None` and inheriting
+    // yu-infer's own defaults, which are not guaranteed to be these.
+    let temperature = temperature
+        .or_else(|| Some(genai_config_number(state, "temperature").unwrap_or(0.7) as f32));
+    let max_generated_tokens = max_generated_tokens.or_else(|| {
+        Some(genai_config_number(state, "max_generated_tokens").unwrap_or(512.0) as u32)
+    });
+
+    let system_prompt = system_prompt
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "You are a helpful assistant that analyzes images.".to_string());
+
+    use base64::Engine as _;
+    let frame_b64 = base64::engine::general_purpose::STANDARD.encode(&image);
+
+    Some(Ok(VlmNativeRequest {
+        hef_path: Some(hef_path),
+        model,
+        prompt,
+        system_prompt,
+        frame_b64,
+        temperature,
+        top_p: None,
+        top_k: None,
+        frequency_penalty: None,
+        max_generated_tokens,
+        do_sample: None,
+        seed: None,
+    }))
 }
 
 /// Mirrors Python's `get_extension_config_value("builtin-hailo-genai",
@@ -2161,8 +2418,24 @@ pub(crate) fn model_name_to_hef_path(model: &str) -> String {
         .iter()
         .find(|(name, _)| *name == model)
         .map(|(_, hef_filename)| hef_filename.to_string())
-        .unwrap_or_else(|| format!("{model}.hef"));
+        .unwrap_or_else(|| format!("{}.hef", sanitize_model_path_segment(model)));
     hef_dir.join(filename).to_string_lossy().into_owned()
+}
+
+/// `model` reaches here as caller-controlled input (a JSON/multipart field)
+/// from every route that resolves a HEF path -- VLM/LLM generate, chat send,
+/// captioning, and speech2text all funnel through the naive `{model}.hef`
+/// fallback above for names outside `BUNDLED_HEF_FILENAMES`. Without this,
+/// a model name containing a path separator (e.g. `../../../etc/passwd`)
+/// would let `PathBuf::join` re-parse it into parent-directory components
+/// and resolve a `hef_path` outside `hef_dir` -- `/`- and `\`-bearing
+/// segments never appear in any real registry or downloaded HEF filename,
+/// so replacing them can only affect an already-invalid name (which was
+/// always going to 404/400 as "model not downloaded" once the resulting
+/// path failed to exist; sanitizing just makes that failure land inside
+/// `hef_dir` instead of wherever the traversal pointed).
+fn sanitize_model_path_segment(model: &str) -> String {
+    model.replace(['/', '\\'], "_")
 }
 
 fn stream_sse_from_upstream(upstream: reqwest::Response) -> Response {
@@ -2176,72 +2449,8 @@ fn stream_sse_from_upstream(upstream: reqwest::Response) -> Response {
         .body(axum::body::Body::from_stream(stream))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
-pub async fn hailo_genai_chat_search(State(s): State<SharedState>, body: Bytes) -> Response {
-    fwd_ext_post(&s, "/ext/hailo-genai/api/chat/search", body).await
-}
-
-// --- hailo-semantic caption API (intentionally remains Python-backed) ---
-pub async fn hailo_semantic_caption_start(State(s): State<SharedState>, body: Bytes) -> Response {
-    fwd_ext_post(&s, "/ext/hailo-semantic/api/caption/start", body).await
-}
-pub async fn hailo_semantic_caption_status(State(s): State<SharedState>) -> Response {
-    fwd_ext_get(&s, "/ext/hailo-semantic/api/caption/status").await
-}
-pub async fn hailo_semantic_caption_stop(State(s): State<SharedState>, body: Bytes) -> Response {
-    fwd_ext_post(&s, "/ext/hailo-semantic/api/caption/stop", body).await
-}
 
 // --- hailo-genai dynamic path routes ---
-// --- hailo-genai s2t routes ---
-pub async fn hailo_genai_s2t_transcribe(
-    State(s): State<SharedState>,
-    headers: axum::http::HeaderMap,
-    body: Bytes,
-) -> Response {
-    fwd_ext_post_passthrough(
-        &s,
-        "/ext/hailo-genai/api/s2t/transcribe",
-        body,
-        headers.get("content-type"),
-    )
-    .await
-}
-pub async fn hailo_genai_s2t_transcribe_video(
-    State(s): State<SharedState>,
-    headers: axum::http::HeaderMap,
-    body: Bytes,
-) -> Response {
-    fwd_ext_post_passthrough(
-        &s,
-        "/ext/hailo-genai/api/s2t/transcribe-video",
-        body,
-        headers.get("content-type"),
-    )
-    .await
-}
-pub async fn hailo_genai_s2t_batch_transcribe(
-    State(s): State<SharedState>,
-    headers: axum::http::HeaderMap,
-    body: Bytes,
-) -> Response {
-    fwd_ext_post_passthrough(
-        &s,
-        "/ext/hailo-genai/api/s2t/batch-transcribe",
-        body,
-        headers.get("content-type"),
-    )
-    .await
-}
-pub async fn hailo_genai_s2t_transcript(
-    State(s): State<SharedState>,
-    Path(file_id): Path<i64>,
-) -> Response {
-    fwd_ext_get(
-        &s,
-        &format!("/ext/hailo-genai/api/s2t/transcript/{file_id}"),
-    )
-    .await
-}
 
 // --- hailo-genai OpenAI-compatible v1 routes ---
 pub async fn hailo_genai_v1_chat_completions(
@@ -2491,7 +2700,7 @@ async fn hailo_genai_chat_completions_native(
             Some(model_name_to_hef_path(&model)),
             messages,
             tools,
-            None,
+            Some(crate::infer_client::DEFAULT_GENERATE_TIMEOUT_MS),
             Some(temperature),
             None,
             None,
@@ -2661,19 +2870,6 @@ async fn hailo_genai_chat_completions_native(
         .body(axum::body::Body::from_stream(body))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
-pub async fn hailo_genai_v1_audio_transcriptions(
-    State(s): State<SharedState>,
-    headers: axum::http::HeaderMap,
-    body: Bytes,
-) -> Response {
-    fwd_ext_post_passthrough(
-        &s,
-        "/ext/hailo-genai/v1/audio/transcriptions",
-        body,
-        headers.get("content-type"),
-    )
-    .await
-}
 pub async fn hailo_genai_v1_embeddings(
     State(s): State<SharedState>,
     auth_context: Option<Extension<AuthContext>>,
@@ -2826,6 +3022,33 @@ mod hailo_genai_vlm_tests {
         let result = model_name_to_hef_path("llama3.2-1b");
         std::env::remove_var("HAILO_HEF_DIR");
         assert_eq!(result, "/tmp/custom_hailo_hefs/Llama3.2-1B-Instruct.hef");
+    }
+
+    #[test]
+    fn model_name_to_hef_path_rejects_path_traversal_in_unknown_names() {
+        let _guard = crate::ENV_MUTATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("HOME", "/home/pi");
+        std::env::remove_var("HAILO_HEF_DIR");
+        for traversal in [
+            "../../../etc/passwd",
+            "..\\..\\windows\\system32\\config",
+            "foo/../../bar",
+        ] {
+            let result = model_name_to_hef_path(traversal);
+            let resolved = std::path::Path::new(&result);
+            // The resolved path must be a *direct* child of hef_dir: no `..`
+            // path *component* may have survived to walk back out of it (a
+            // literal ".." substring inside an otherwise-separator-free
+            // filename, e.g. "foo_.._.._bar.hef", is harmless -- only a real
+            // path component matters, which is what `.parent()` checks).
+            assert_eq!(
+                resolved.parent(),
+                Some(std::path::Path::new("/home/pi/hailo_models")),
+                "model {traversal:?} escaped hef_dir: {result}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3578,5 +3801,606 @@ mod hailo_genai_vlm_tests {
         );
 
         let _ = std::fs::remove_file(&image_path);
+    }
+
+    // ---- multipart VLM upload (the shape the extension UI actually posts) --
+
+    const VLM_TEST_BOUNDARY: &str = "yu-test-boundary-vlm";
+
+    /// Builds a `multipart/form-data` body. A part with `Some(filename)` is a
+    /// file part; `None` is a plain field.
+    fn vlm_multipart_body(parts: &[(&str, Option<&str>, &[u8])]) -> Bytes {
+        let mut body: Vec<u8> = Vec::new();
+        for (name, filename, data) in parts {
+            body.extend_from_slice(format!("--{VLM_TEST_BOUNDARY}\r\n").as_bytes());
+            let disposition = match filename {
+                Some(file) => format!(
+                    "Content-Disposition: form-data; name=\"{name}\"; filename=\"{file}\"\r\n\
+                     Content-Type: application/octet-stream\r\n\r\n"
+                ),
+                None => format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n"),
+            };
+            body.extend_from_slice(disposition.as_bytes());
+            body.extend_from_slice(data);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{VLM_TEST_BOUNDARY}--\r\n").as_bytes());
+        Bytes::from(body)
+    }
+
+    fn vlm_multipart_headers() -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_str(&format!(
+                "multipart/form-data; boundary={VLM_TEST_BOUNDARY}"
+            ))
+            .unwrap(),
+        );
+        headers
+    }
+
+    async fn vlm_multipart_body_text(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    #[test]
+    fn thousands_separators_match_pythons_comma_format() {
+        assert_eq!(with_thousands_separators(16 * 1024 * 1024), "16,777,216");
+        assert_eq!(with_thousands_separators(0), "0");
+        assert_eq!(with_thousands_separators(999), "999");
+        assert_eq!(with_thousands_separators(1000), "1,000");
+    }
+
+    #[tokio::test]
+    async fn vlm_multipart_defers_to_python_without_an_image_part() {
+        let state = test_state_with_infer_client("http://127.0.0.1:1").await;
+        let infer_client = state.infer_client.as_ref().unwrap();
+        let body = vlm_multipart_body(&[("prompt", None, b"describe this")]);
+        assert!(
+            hailo_genai_vlm_generate_multipart_native(
+                &state,
+                infer_client,
+                &vlm_multipart_headers(),
+                &body
+            )
+            .await
+            .is_none(),
+            "a frameless request must fall through to Python, not be answered natively"
+        );
+    }
+
+    #[tokio::test]
+    async fn vlm_multipart_defers_when_the_image_part_is_empty() {
+        let state = test_state_with_infer_client("http://127.0.0.1:1").await;
+        let infer_client = state.infer_client.as_ref().unwrap();
+        let body = vlm_multipart_body(&[
+            ("prompt", None, b"describe this"),
+            ("image", Some("empty.png"), b""),
+        ]);
+        assert!(
+            hailo_genai_vlm_generate_multipart_native(
+                &state,
+                infer_client,
+                &vlm_multipart_headers(),
+                &body
+            )
+            .await
+            .is_none(),
+            "an empty upload carries no frame; yu-infer would reject it"
+        );
+    }
+
+    #[tokio::test]
+    async fn vlm_multipart_rejects_an_empty_prompt() {
+        let state = test_state_with_infer_client("http://127.0.0.1:1").await;
+        let infer_client = state.infer_client.as_ref().unwrap();
+        let body = vlm_multipart_body(&[
+            ("prompt", None, b"   "),
+            ("image", Some("a.png"), b"\x89PNG-not-really"),
+        ]);
+        let response = hailo_genai_vlm_generate_multipart_native(
+            &state,
+            infer_client,
+            &vlm_multipart_headers(),
+            &body,
+        )
+        .await
+        .expect("an image was supplied, so the native path owns this request");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(vlm_multipart_body_text(response)
+            .await
+            .contains("prompt is required"));
+    }
+
+    #[tokio::test]
+    async fn vlm_multipart_rejects_a_model_name_with_path_separators() {
+        let state = test_state_with_infer_client("http://127.0.0.1:1").await;
+        let infer_client = state.infer_client.as_ref().unwrap();
+        let body = vlm_multipart_body(&[
+            ("prompt", None, b"hi"),
+            ("model", None, b"../../etc/passwd"),
+            ("image", Some("a.png"), b"bytes"),
+        ]);
+        let response = hailo_genai_vlm_generate_multipart_native(
+            &state,
+            infer_client,
+            &vlm_multipart_headers(),
+            &body,
+        )
+        .await
+        .expect("an image was supplied, so the native path owns this request");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(vlm_multipart_body_text(response)
+            .await
+            .contains("invalid model name"));
+    }
+
+    #[tokio::test]
+    async fn vlm_multipart_reports_a_model_whose_hef_is_absent() {
+        let state = test_state_with_infer_client("http://127.0.0.1:1").await;
+        let infer_client = state.infer_client.as_ref().unwrap();
+        let body = vlm_multipart_body(&[
+            ("prompt", None, b"hi"),
+            ("model", None, b"no-such-model-in-any-hef-dir"),
+            ("image", Some("a.png"), b"bytes"),
+        ]);
+        let response = hailo_genai_vlm_generate_multipart_native(
+            &state,
+            infer_client,
+            &vlm_multipart_headers(),
+            &body,
+        )
+        .await
+        .expect("an image was supplied, so the native path owns this request");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(vlm_multipart_body_text(response)
+            .await
+            .contains("not downloaded yet"));
+    }
+
+    #[tokio::test]
+    async fn vlm_multipart_rejects_an_oversized_image() {
+        let state = test_state_with_infer_client("http://127.0.0.1:1").await;
+        let infer_client = state.infer_client.as_ref().unwrap();
+        let oversized = vec![0u8; VLM_MAX_IMAGE_UPLOAD_BYTES + 1];
+        let body = vlm_multipart_body(&[
+            ("prompt", None, b"hi"),
+            ("image", Some("big.png"), &oversized),
+        ]);
+        let response = hailo_genai_vlm_generate_multipart_native(
+            &state,
+            infer_client,
+            &vlm_multipart_headers(),
+            &body,
+        )
+        .await
+        .expect("an oversized upload must be rejected natively, not forwarded");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        // Byte-for-byte the message Python's upload_limits.py produces.
+        assert!(vlm_multipart_body_text(response)
+            .await
+            .contains("file exceeds 16,777,216 byte limit"));
+    }
+
+    /// The test below builds its own router, so it proves the *value* of the
+    /// limit is workable but not that the production registration carries it.
+    /// This one grips that seam: it reads the real `main.rs` and fails if the
+    /// VLM route is registered without a `DefaultBodyLimit`. Delete the layer
+    /// in `main.rs` and this goes red; the router-level test would not.
+    #[test]
+    fn vlm_route_registration_carries_a_body_limit() {
+        const MAIN_RS: &str = include_str!("../main.rs");
+        let route = "\"/ext/hailo-genai/api/vlm/generate\"";
+        let at = MAIN_RS
+            .find(route)
+            .expect("the VLM route must still be registered in main.rs");
+        // The registration block runs from the route literal to the start of
+        // the next `.route(` call.
+        let rest = &MAIN_RS[at..];
+        let block_end = rest.find(".route(").unwrap_or(rest.len());
+        // Strip comments before looking. A fault-injection run caught this
+        // test passing with the layer deleted, because the comment explaining
+        // *why* the layer is there still said "DefaultBodyLimit" -- the check
+        // was matching prose, not code.
+        let block: String = rest[..block_end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            block.contains("DefaultBodyLimit"),
+            "the VLM route must carry a DefaultBodyLimit layer, or axum's 2 MiB \
+             default truncates `body: Bytes` and the handler's 16 MiB image cap \
+             becomes unreachable. Registration block was:\n{block}"
+        );
+    }
+
+    /// Guards the route's body limit, which lives in `main.rs`, not in the
+    /// handler. `body: Bytes` is itself subject to axum's 2 MiB
+    /// `DefaultBodyLimit`, so without the `DefaultBodyLimit::max(...)` layer on
+    /// this route an ordinary phone photo never reaches the handler at all --
+    /// axum answers 413 first -- and every limit inside the handler is
+    /// unreachable code. This was shipped wrong once: the handler was switched
+    /// to `multer` to escape the 2 MiB parse limit, but the outer extractor
+    /// limit was left in place, so 2-16 MiB uploads still could not get in.
+    ///
+    /// The request below is ~3 MiB (over axum's default, under the layer) and
+    /// names a deliberately invalid model, so a body that arrives intact
+    /// produces the handler's own 400. A 413 means the outer limit is missing
+    /// or too small.
+    #[tokio::test]
+    async fn vlm_route_accepts_an_upload_larger_than_axums_default_limit() {
+        use tower::ServiceExt as _;
+
+        let state = test_state_with_infer_client("http://127.0.0.1:1").await;
+        let app = axum::Router::new()
+            .route(
+                "/ext/hailo-genai/api/vlm/generate",
+                axum::routing::post(hailo_genai_vlm_generate).layer(
+                    axum::extract::DefaultBodyLimit::max(VLM_MAX_IMAGE_UPLOAD_BYTES + 1024 * 1024),
+                ),
+            )
+            .with_state(state);
+
+        let image = vec![0u8; 3 * 1024 * 1024];
+        let body = vlm_multipart_body(&[
+            ("prompt", None, b"hi"),
+            ("model", None, b"../../etc/passwd"),
+            ("image", Some("photo.jpg"), &image),
+        ]);
+        assert!(
+            body.len() > 2 * 1024 * 1024,
+            "the fixture must exceed axum's 2 MiB default or it proves nothing"
+        );
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/ext/hailo-genai/api/vlm/generate")
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={VLM_TEST_BOUNDARY}"),
+            )
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a 3 MiB upload was rejected by a body limit before reaching the handler"
+        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(vlm_multipart_body_text(response)
+            .await
+            .contains("invalid model name"));
+    }
+
+    /// The mapping proof, with no filesystem and no environment involved.
+    ///
+    /// An earlier version of this test made the model's HEF exist by setting
+    /// `HAILO_HEF_DIR`, which is process-global: it raced every other test in
+    /// the binary and was flaky both ways. Splitting the pure mapping out of
+    /// the handler removed the need entirely — this asserts the part that
+    /// actually gets dropped in a port, the field-by-field mapping from the
+    /// upload onto the upstream request.
+    #[tokio::test]
+    async fn vlm_multipart_maps_the_upload_onto_the_native_request() {
+        let state = test_state_with_infer_client("http://127.0.0.1:1").await;
+        let image_bytes: &[u8] = b"\x89PNG\r\n\x1a\nthese-exact-bytes-must-arrive";
+        let body = vlm_multipart_body(&[
+            ("prompt", None, b"What color is this?"),
+            ("system_prompt", None, b"You are terse."),
+            ("temperature", None, b"0.25"),
+            ("max_generated_tokens", None, b"16"),
+            ("model", None, b"qwen2-vl-2b-instruct"),
+            ("image", Some("a.png"), image_bytes),
+        ]);
+
+        let parsed = parse_vlm_multipart(&state, &vlm_multipart_headers(), &body)
+            .await
+            .expect("an image was supplied, so the native path owns this request")
+            .expect("the request is well formed");
+
+        use base64::Engine as _;
+        assert_eq!(
+            parsed.frame_b64,
+            base64::engine::general_purpose::STANDARD.encode(image_bytes),
+            "the uploaded bytes must become the frame"
+        );
+        assert_eq!(parsed.prompt, "What color is this?");
+        assert_eq!(parsed.system_prompt, "You are terse.");
+        assert_eq!(parsed.temperature, Some(0.25));
+        assert_eq!(parsed.max_generated_tokens, Some(16));
+        assert_eq!(parsed.model, "qwen2-vl-2b-instruct");
+        assert!(
+            parsed
+                .hef_path
+                .as_deref()
+                .unwrap()
+                .ends_with("Qwen2-VL-2B-Instruct.hef"),
+            "the registry name must resolve to the real hef filename, got {:?}",
+            parsed.hef_path
+        );
+    }
+
+    /// Python resolves `temperature` and `max_generated_tokens` from the
+    /// extension config when the form omits them and always sends an explicit
+    /// value; passing `None` would silently inherit yu-infer's own defaults.
+    #[tokio::test]
+    async fn vlm_multipart_fills_generation_defaults_when_the_form_omits_them() {
+        let state = test_state_with_infer_client("http://127.0.0.1:1").await;
+        let body =
+            vlm_multipart_body(&[("prompt", None, b"hi"), ("image", Some("a.png"), b"bytes")]);
+        let parsed = parse_vlm_multipart(&state, &vlm_multipart_headers(), &body)
+            .await
+            .unwrap()
+            .expect("the request is well formed");
+        assert_eq!(parsed.temperature, Some(0.7));
+        assert_eq!(parsed.max_generated_tokens, Some(512));
+        assert_eq!(
+            parsed.system_prompt,
+            "You are a helpful assistant that analyzes images."
+        );
+    }
+
+    /// Proves the shared upstream call puts the frame on the wire. Driven with
+    /// a hand-built request so no HEF needs to exist and no env var is touched.
+    #[tokio::test]
+    async fn vlm_stream_native_sends_the_frame_to_yu_infer() {
+        let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
+            return;
+        };
+        let address = listener.local_addr().unwrap();
+        let captured: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_in_server = captured.clone();
+        let _server = tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/v1/infer/vlm/generate/stream",
+                axum::routing::post(move |Json(payload): Json<serde_json::Value>| {
+                    let captured = captured_in_server.clone();
+                    async move {
+                        *captured.lock().unwrap() = Some(payload);
+                        "data: {\"token\": \"red\"}\n\ndata: {\"done\": true}\n\n"
+                    }
+                }),
+            );
+            axum::serve(listener, app).await.unwrap()
+        });
+
+        let infer_client =
+            crate::infer_client::InferClient::new(format!("http://{address}"), String::new());
+        let response = vlm_stream_native(
+            &infer_client,
+            VlmNativeRequest {
+                hef_path: Some("/models/Qwen2-VL-2B-Instruct.hef".to_string()),
+                model: "qwen2-vl-2b-instruct".to_string(),
+                prompt: "What color is this?".to_string(),
+                system_prompt: "You are terse.".to_string(),
+                frame_b64: "ZnJhbWUtYnl0ZXM=".to_string(),
+                temperature: Some(0.25),
+                top_p: None,
+                top_k: None,
+                frequency_penalty: None,
+                max_generated_tokens: Some(16),
+                do_sample: None,
+                seed: None,
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("yu-infer must have been called");
+        assert_eq!(payload["frames"][0], "ZnJhbWUtYnl0ZXM=");
+        assert_eq!(payload["prompt"], "What color is this?");
+        assert_eq!(payload["system_prompt"], "You are terse.");
+        assert_eq!(payload["temperature"], 0.25);
+        assert_eq!(payload["max_generated_tokens"], 16);
+    }
+}
+
+#[cfg(test)]
+mod profiles_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    /// Builds a state whose `project_root` is a throwaway directory, so every
+    /// profile file this module writes lands under `<tmp>/profiles`.
+    async fn test_state(root: &TempDir) -> SharedState {
+        let pool = sqlx::pool::Pool::connect_lazy("sqlite::memory:").unwrap();
+        Arc::new(
+            crate::state::AppState::new(
+                crate::state::Config {
+                    db_path: "sqlite::memory:".to_string(),
+                    pin_hash: String::new(),
+                    valid_token: String::new(),
+                    secret: String::new(),
+                    trusted_proxy_enabled: false,
+                    pin_boss_login_ui: false,
+                    trusted_ips: HashSet::new(),
+                    trusted_peer_ips: HashSet::new(),
+                    quick_lock_enabled: false,
+                    pin_auth_enabled: false,
+                    min_pin_length: 4,
+                    python_url: String::new(),
+                    config_path: std::path::PathBuf::from("config.json"),
+                    project_root: root.path().to_path_buf(),
+                    app_config: json!({}),
+                    cache_dir: root.path().to_path_buf(),
+                    server_mode: "full".to_string(),
+                    headless: false,
+                    safe_mode: false,
+                    mcp_native: false,
+                    standalone: true,
+                    infer_standalone: true,
+                    active_profile: None,
+                    python_executable: String::new(),
+                },
+                pool.clone(),
+                pool,
+                Arc::new(crate::logs::ring::LogRingBuffer::new(64)),
+            )
+            .await,
+        )
+    }
+
+    async fn body_json(response: Response) -> serde_json::Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn create_body(name: &str, label: &str) -> CreateProfileBody {
+        serde_json::from_value(json!({"name": name, "label": label})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn profiles_crud_roundtrip() {
+        let root = TempDir::new().unwrap();
+        let state = test_state(&root).await;
+
+        let res = profiles_create(State(state.clone()), Json(create_body("alpha", "Alpha"))).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        // The write must actually land under project_root/profiles; if an
+        // ambient TAGDB_PROFILES_DIR hijacked the path this fails loudly.
+        assert!(root.path().join("profiles/alpha.json").is_file());
+
+        let res = profiles_create(State(state.clone()), Json(create_body("alpha", "Again"))).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        let res = profiles_get(State(state.clone()), Path("alpha".to_string())).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await["label"], "Alpha");
+
+        let update: UpdateProfileBody =
+            serde_json::from_value(json!({"label": "Renamed label"})).unwrap();
+        let res = profiles_update(
+            State(state.clone()),
+            Path("alpha".to_string()),
+            Json(update),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = profiles_favorite(State(state.clone()), Path("alpha".to_string())).await;
+        assert_eq!(body_json(res).await["favorite"], true);
+        let res = profiles_favorite(State(state.clone()), Path("alpha".to_string())).await;
+        assert_eq!(body_json(res).await["favorite"], false);
+
+        let listed = body_json(profiles_list(State(state.clone())).await.into_response()).await;
+        assert_eq!(listed["profiles"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["profiles"][0]["label"], "Renamed label");
+
+        let rename: RenameProfileBody =
+            serde_json::from_value(json!({"new_name": "beta"})).unwrap();
+        let res = profiles_rename(
+            State(state.clone()),
+            Path("alpha".to_string()),
+            Json(rename),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(!root.path().join("profiles/alpha.json").exists());
+        assert!(root.path().join("profiles/beta.json").is_file());
+
+        let dup: DuplicateProfileBody =
+            serde_json::from_value(json!({"new_name": "gamma", "new_label": "Gamma"})).unwrap();
+        let res =
+            profiles_duplicate(State(state.clone()), Path("beta".to_string()), Json(dup)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(root.path().join("profiles/gamma.json").is_file());
+
+        let res = profiles_delete(State(state.clone()), Path("beta".to_string())).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = profiles_delete(State(state.clone()), Path("beta".to_string())).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn profiles_reject_names_that_escape_the_directory() {
+        let root = TempDir::new().unwrap();
+        let state = test_state(&root).await;
+        let long = "x".repeat(65);
+
+        for bad in ["..", "../evil", "a/b", "", long.as_str()] {
+            let res = profiles_get(State(state.clone()), Path(bad.to_string())).await;
+            assert_eq!(
+                res.status(),
+                StatusCode::BAD_REQUEST,
+                "get accepted bad name {bad:?}"
+            );
+            let res = profiles_create(State(state.clone()), Json(create_body(bad, "label"))).await;
+            assert_eq!(
+                res.status(),
+                StatusCode::BAD_REQUEST,
+                "create accepted bad name {bad:?}"
+            );
+        }
+        assert!(!root.path().join("evil.json").exists());
+    }
+
+    #[tokio::test]
+    async fn profiles_export_strips_sensitive_fields() {
+        let root = TempDir::new().unwrap();
+        let state = test_state(&root).await;
+
+        let body: CreateProfileBody = serde_json::from_value(json!({
+            "name": "secretish",
+            "label": "Secretish",
+            "config": {
+                "restart_token": "tok",
+                "api_key": "k",
+                "harmless": "keep",
+                "nested": {"pin": "1234", "also_fine": "keep"},
+            },
+        }))
+        .unwrap();
+        assert_eq!(
+            profiles_create(State(state.clone()), Json(body))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+
+        let exported =
+            body_json(profiles_export(State(state.clone()), Path("secretish".to_string())).await)
+                .await;
+        assert!(exported.get("restart_token").is_none());
+        assert!(exported.get("api_key").is_none());
+        assert_eq!(exported["harmless"], "keep");
+        assert!(exported["nested"].get("pin").is_none());
+        assert_eq!(exported["nested"]["also_fine"], "keep");
+    }
+
+    #[tokio::test]
+    async fn profiles_import_rejects_malformed_payloads() {
+        let root = TempDir::new().unwrap();
+        let state = test_state(&root).await;
+
+        let res = profiles_import(State(state.clone()), Bytes::from_static(b"nope")).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let res = profiles_import(State(state.clone()), Bytes::from_static(b"{}")).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let res = profiles_import_preview(Bytes::from_static(b"{\"name\": \"../x\"}")).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let res = profiles_import(
+            State(state.clone()),
+            Bytes::from(r#"{"name":"imported","label":"Imported"}"#),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(body_json(res).await["profile"]["created_at"].is_string());
+        assert!(root.path().join("profiles/imported.json").is_file());
     }
 }

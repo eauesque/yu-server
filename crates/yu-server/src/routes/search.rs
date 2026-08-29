@@ -1191,7 +1191,8 @@ pub async fn search_count(
         .fetch_one(&state.db_read)
         .await
     {
-        Ok(n) => Json(json!({"ok": true, "total_count": n})).into_response(),
+        // Match Python and this route's {"status": "error", ...} error responses.
+        Ok(n) => Json(json!({"status": "ok", "total_count": n})).into_response(),
         Err(e) => {
             tracing::error!("search_count query failed: {e}");
             (

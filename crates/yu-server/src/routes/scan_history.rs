@@ -81,10 +81,9 @@ pub async fn scan_history(
     Json(json!({
         "ok": true,
         "error": null,
-        "data": {
-            "entries": entries,
-            "limit": limit,
-        }
+        "data": null,
+        "entries": entries,
+        "limit": limit,
     }))
     .into_response()
 }

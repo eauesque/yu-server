@@ -776,8 +776,14 @@ mod tests {
     /// These tests run concurrently in one process, so a shared directory lets one
     /// test's writes and `remove_dir_all` land in another's walk. The name argument
     /// is what keeps them apart -- pass the test's own name.
+    /// Its own base, not source_api's. Both modules define a test called
+    /// walk_search_finds_case_insensitive_with_glob, and under a shared base
+    /// those two resolve to the same directory -- each one's remove_dir_all
+    /// then deletes the other's fixtures mid-run.
     fn tmp_root(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("yu_source_api_test").join(name);
+        let dir = std::env::temp_dir()
+            .join("yu_source_browser_test")
+            .join(name);
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create per-test dir");
         dir
