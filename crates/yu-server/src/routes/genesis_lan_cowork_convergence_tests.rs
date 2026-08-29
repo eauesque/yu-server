@@ -163,7 +163,9 @@ async fn both_orders_agree_on_the_peers_column_set() {
         .connect_with(a_opts)
         .await
         .unwrap();
-    lan_cowork::schema::apply_standalone_schema(&a).await.unwrap();
+    lan_cowork::schema::apply_standalone_schema(&a)
+        .await
+        .unwrap();
     tagdb_core::apply_pending_rust_migrations(&a).await.unwrap();
     let cols_a = peers_columns(&a).await;
     a.close().await;
@@ -172,7 +174,9 @@ async fn both_orders_agree_on_the_peers_column_set() {
     let b_path = dir.path().join("b.db");
     let b = empty_pool(&b_path).await;
     scaffold_core_tables(&b).await;
-    lan_cowork::schema::apply_standalone_schema(&b).await.unwrap();
+    lan_cowork::schema::apply_standalone_schema(&b)
+        .await
+        .unwrap();
     tagdb_core::apply_pending_rust_migrations(&b).await.unwrap();
     let cols_b = peers_columns(&b).await;
     b.close().await;

@@ -22,7 +22,11 @@ fn compat_info_answers_without_a_database() {
         .output()
         .expect("run yu-server");
 
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let text = String::from_utf8(out.stdout).expect("utf8");
     let parsed: serde_json::Value = serde_json::from_str(text.trim()).expect("one JSON line");
     assert!(parsed.get("python_schema_version").is_some());

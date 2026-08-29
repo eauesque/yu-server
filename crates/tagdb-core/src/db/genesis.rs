@@ -108,7 +108,11 @@ pub async fn create_fresh_database_with_sql(
 
     // Claim the file. Losing this race is not an error: whoever won will have a
     // usable database, and the caller falls through to the normal open path.
-    match OpenOptions::new().write(true).create_new(true).open(db_path) {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(db_path)
+    {
         Ok(file) => drop(file),
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
             return Ok(GenesisOutcome::Skipped)

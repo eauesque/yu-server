@@ -105,8 +105,14 @@ impl Default for S2tRunner {
     }
 }
 
-fn admin_or_response(state: &SharedState, auth: Option<&Extension<AuthContext>>) -> Option<Response> {
-    require_admin_scope(state.config.pin_auth_enabled, auth.map(|extension| &extension.0))
+fn admin_or_response(
+    state: &SharedState,
+    auth: Option<&Extension<AuthContext>>,
+) -> Option<Response> {
+    require_admin_scope(
+        state.config.pin_auth_enabled,
+        auth.map(|extension| &extension.0),
+    )
 }
 
 struct StartRequest {
@@ -231,7 +237,8 @@ async fn run_worker(state: SharedState, request: StartRequest) {
             update_progress_and_emit(&state, processed, errors, total).await;
             continue;
         };
-        let outcome = transcribe_one(&state, &hef_path, video_path, &request.language, file_id).await;
+        let outcome =
+            transcribe_one(&state, &hef_path, video_path, &request.language, file_id).await;
         match outcome {
             Ok(()) => processed += 1,
             Err(()) => errors += 1,
@@ -268,7 +275,9 @@ async fn transcribe_one(
         )
         .await
         .map_err(|_| ())?;
-    save_transcript(state, file_id, &result).await.map_err(|_| ())
+    save_transcript(state, file_id, &result)
+        .await
+        .map_err(|_| ())
 }
 
 async fn update_progress_and_emit(state: &SharedState, processed: u64, errors: u64, total: u64) {
@@ -399,7 +408,10 @@ mod tests {
         let complete = complete_data("complete", 1, 2, 5, 3.0);
         assert!(complete.get("elapsed_seconds").is_some());
         assert!(complete.get("elapsed").is_none());
-        assert_eq!(sse_event("video_s2t.progress", progress).source, "video_s2t");
+        assert_eq!(
+            sse_event("video_s2t.progress", progress).source,
+            "video_s2t"
+        );
     }
 
     #[tokio::test]

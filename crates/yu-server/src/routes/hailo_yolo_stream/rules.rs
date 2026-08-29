@@ -758,7 +758,12 @@ mod tests {
             let label = case["label"].as_str().unwrap();
             ids.push(format!("engine_cases/{label}/expected"));
         }
-        for key in ["expected_get", "expected_list", "removed_beta", "removed_missing"] {
+        for key in [
+            "expected_get",
+            "expected_list",
+            "removed_beta",
+            "removed_missing",
+        ] {
             ids.push(format!("crud_case/{key}"));
         }
         ids.push("action_case/expected".to_string());

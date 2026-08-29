@@ -125,7 +125,10 @@ async fn both_paths_agree_on_foreign_keys_and_journal_mode() {
     let enc_pool = tagdb_core::connect_encrypted(enc.to_str().unwrap(), KEY)
         .await
         .unwrap();
-    let (enc_fk, enc_journal) = (foreign_keys_on(&enc_pool).await, journal_mode(&enc_pool).await);
+    let (enc_fk, enc_journal) = (
+        foreign_keys_on(&enc_pool).await,
+        journal_mode(&enc_pool).await,
+    );
     enc_pool.close().await;
 
     let plain = dir.path().join("plain.db");

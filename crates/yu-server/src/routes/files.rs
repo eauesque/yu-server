@@ -2184,8 +2184,7 @@ mod tests {
         let _ = root;
         let source =
             FsPath::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pdf/four_pages.pdf");
-        let rendered =
-            render_pdf_page(&source, &library_dir, false).expect("rendered at 144 DPI");
+        let rendered = render_pdf_page(&source, &library_dir, false).expect("rendered at 144 DPI");
         assert!(rendered.width() > 280 || rendered.height() > 280);
         let cache = tempfile::tempdir().unwrap();
         let generated = save_pdf_thumbnail(rendered, &cache.path().join("preview.webp")).unwrap();

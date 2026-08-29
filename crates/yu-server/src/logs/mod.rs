@@ -1,6 +1,6 @@
-mod scrub;
 pub mod ring;
 pub mod routes;
+mod scrub;
 pub mod tracing_layer;
 
 pub use ring::LogRingBuffer;

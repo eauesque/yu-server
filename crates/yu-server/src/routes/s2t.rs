@@ -33,8 +33,14 @@ pub(crate) const S2T_MAX_AUDIO_UPLOAD_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const DEFAULT_S2T_MODEL: &str = "whisper-base";
 const S2T_TIMEOUT_MS: u32 = 120_000;
 
-fn admin_or_response(state: &SharedState, auth: Option<&Extension<AuthContext>>) -> Option<Response> {
-    require_admin_scope(state.config.pin_auth_enabled, auth.map(|extension| &extension.0))
+fn admin_or_response(
+    state: &SharedState,
+    auth: Option<&Extension<AuthContext>>,
+) -> Option<Response> {
+    require_admin_scope(
+        state.config.pin_auth_enabled,
+        auth.map(|extension| &extension.0),
+    )
 }
 
 fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
@@ -77,7 +83,9 @@ pub(crate) fn segments_json(segments: &[S2tSegment]) -> Value {
     Value::Array(
         segments
             .iter()
-            .map(|segment| json!({"text": segment.text, "start": segment.start, "end": segment.end}))
+            .map(
+                |segment| json!({"text": segment.text, "start": segment.start, "end": segment.end}),
+            )
             .collect(),
     )
 }
@@ -85,7 +93,10 @@ pub(crate) fn segments_json(segments: &[S2tSegment]) -> Value {
 /// Converts arbitrary audio bytes (any container ffmpeg understands) into
 /// base64-encoded WAV. Skips the ffmpeg round trip when the upload is
 /// already `.wav`, matching Python's `_convert_path_to_wav` early-out.
-pub(crate) async fn audio_bytes_to_wav_base64(bytes: &[u8], filename: &str) -> Result<String, String> {
+pub(crate) async fn audio_bytes_to_wav_base64(
+    bytes: &[u8],
+    filename: &str,
+) -> Result<String, String> {
     if filename.to_ascii_lowercase().ends_with(".wav") {
         return Ok(base64::engine::general_purpose::STANDARD.encode(bytes));
     }
@@ -312,7 +323,12 @@ pub async fn transcribe_video(
     };
 
     let result = match infer_client
-        .speech2text_transcribe(Some(hef_path), audio_base64, Some(language.clone()), S2T_TIMEOUT_MS)
+        .speech2text_transcribe(
+            Some(hef_path),
+            audio_base64,
+            Some(language.clone()),
+            S2T_TIMEOUT_MS,
+        )
         .await
     {
         Ok(result) => result,
@@ -496,7 +512,11 @@ pub async fn openai_transcriptions(
         )
             .into_response(),
         Some("verbose_json") => {
-            let duration = result.segments.last().map(|segment| segment.end).unwrap_or(0.0);
+            let duration = result
+                .segments
+                .last()
+                .map(|segment| segment.end)
+                .unwrap_or(0.0);
             Json(json!({
                 "task": "transcribe",
                 "language": request.language,

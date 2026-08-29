@@ -127,7 +127,11 @@ fn api_err(msg: &str, status: StatusCode) -> Response {
 }
 
 fn api_err_code(msg: &str, status: StatusCode, code: &str) -> Response {
-    (status, Json(json!({"ok": false, "error": msg, "code": code}))).into_response()
+    (
+        status,
+        Json(json!({"ok": false, "error": msg, "code": code})),
+    )
+        .into_response()
 }
 
 fn admin_guard(state: &SharedState, auth: Option<&Extension<AuthContext>>) -> Option<Response> {
@@ -215,7 +219,10 @@ fn usage_exhausted(usage: &Value) -> bool {
     // extract_usage, but as_i64 rejects a float like 0.0, which would
     // silently fall back to the "not exhausted" default of 100 below and
     // let a genuinely exhausted (fractional-percent) account through.
-    let percent = usage.get("percent").and_then(Value::as_f64).unwrap_or(100.0);
+    let percent = usage
+        .get("percent")
+        .and_then(Value::as_f64)
+        .unwrap_or(100.0);
     let is_negative = usage
         .get("isNegative")
         .and_then(Value::as_bool)
@@ -1860,7 +1867,8 @@ mod tests {
 
     #[test]
     fn test_extract_usage_present() {
-        let sub = json!({"usage": {"percent": 2, "isNegative": false, "timeUntilNextPercent": 7888}});
+        let sub =
+            json!({"usage": {"percent": 2, "isNegative": false, "timeUntilNextPercent": 7888}});
         let usage = extract_usage(&sub).unwrap();
         assert_eq!(usage["percent"], 2);
     }
@@ -1891,9 +1899,7 @@ mod tests {
 
     #[test]
     fn test_usage_exhausted_by_percent() {
-        assert!(usage_exhausted(
-            &json!({"percent": 0, "isNegative": false})
-        ));
+        assert!(usage_exhausted(&json!({"percent": 0, "isNegative": false})));
         assert!(!usage_exhausted(
             &json!({"percent": 2, "isNegative": false})
         ));
@@ -1917,9 +1923,7 @@ mod tests {
     fn test_usage_exhausted_by_is_negative() {
         // Percent could still read positive while isNegative flags the
         // account as over its limit -- treat either signal as exhausted.
-        assert!(usage_exhausted(
-            &json!({"percent": 5, "isNegative": true})
-        ));
+        assert!(usage_exhausted(&json!({"percent": 5, "isNegative": true})));
     }
 
     #[test]

@@ -9,7 +9,8 @@ pub(crate) const MASK: &str = "***";
 
 /// Keys whose value is a secret wherever it appears. Word-bounded, so
 /// `token_count` and `pinned` survive untouched.
-const SECRET_KEYS: &str = "api_key|apikey|authorization|cookie|db_key|passphrase|password|pin|secret|session_key|token";
+const SECRET_KEYS: &str =
+    "api_key|apikey|authorization|cookie|db_key|passphrase|password|pin|secret|session_key|token";
 
 static KV: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
@@ -48,9 +49,7 @@ pub(crate) fn scrub_secrets(text: &str) -> String {
 /// tracing call site that records `token = %tok` puts the secret there and not
 /// in the message at all -- scrubbing only the message would miss every one.
 pub(crate) fn scrub_value(key: &str, value: &mut Value) {
-    let key_is_secret = SECRET_KEYS
-        .split('|')
-        .any(|k| key.eq_ignore_ascii_case(k));
+    let key_is_secret = SECRET_KEYS.split('|').any(|k| key.eq_ignore_ascii_case(k));
     match value {
         Value::String(s) => {
             if key_is_secret {

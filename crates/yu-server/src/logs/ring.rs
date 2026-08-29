@@ -150,7 +150,10 @@ impl LogRingBuffer {
 mod tests {
     use super::*;
 
-    fn partial(message: &str, fields: Option<serde_json::Map<String, serde_json::Value>>) -> PartialEntry {
+    fn partial(
+        message: &str,
+        fields: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> PartialEntry {
         PartialEntry {
             level: "INFO".into(),
             target: "t".into(),
@@ -180,7 +183,10 @@ mod tests {
     #[test]
     fn push_scrubs_structured_fields_too() {
         let mut fields = serde_json::Map::new();
-        fields.insert("token".into(), serde_json::Value::String("abc123DEF".into()));
+        fields.insert(
+            "token".into(),
+            serde_json::Value::String("abc123DEF".into()),
+        );
         fields.insert("peer".into(), serde_json::Value::String("nas-01".into()));
         let ring = LogRingBuffer::new(4);
         ring.push(partial("peer pull failed", Some(fields)));

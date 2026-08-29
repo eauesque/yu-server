@@ -44,12 +44,18 @@ mod tests {
     #[test]
     fn compat_info_is_a_single_line() {
         let rendered = render_compat_info();
-        assert!(!rendered.trim_end().contains('\n'), "must stay one line: {rendered}");
+        assert!(
+            !rendered.trim_end().contains('\n'),
+            "must stay one line: {rendered}"
+        );
     }
 
     #[test]
     fn compat_info_does_not_leak_the_database_key() {
         let rendered = render_compat_info();
-        assert!(!rendered.contains("cipher"), "key material must never appear: {rendered}");
+        assert!(
+            !rendered.contains("cipher"),
+            "key material must never appear: {rendered}"
+        );
     }
 }
